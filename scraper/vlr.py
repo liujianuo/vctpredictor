@@ -257,6 +257,80 @@ def _parse_player_stats_table(table_el, team_name: str) -> List[PlayerStats]:
     return players
 
 
+def _parse_half_split(team_div_el):
+    """Parse one team's attack/defense half-split round counts from a map header.
+
+    vlr.gg renders each played map's per-team half breakdown as two or
+    three sibling ``<span>`` elements inside the team's ``.team`` div
+    in its ``.vm-stats-game-header`` (e.g. ``<span class="mod-ct">4</span>
+    / <span class="mod-t">2</span>``). Span **DOM order is the half
+    order**: the first span is always the team's first-half round
+    count, the second its second-half count — which side a team
+    started on is not fixed, so the half slot comes from position,
+    never from the class — while each span's class names the side:
+    ``mod-t`` = attacking that half, ``mod-ct`` = defending. A third
+    ``mod-ot`` span (maps that went to overtime) carries the team's
+    total OT rounds; it is read for completeness but not returned,
+    since the header markup exposes OT only as a combined per-team
+    total, not per side — so the returned atk/def totals are
+    regulation-only by design (plan assumption).
+
+    Args:
+        team_div_el: A BeautifulSoup ``Tag`` for one ``.team`` div
+            inside a ``.vm-stats-game-header``, containing the team's
+            ``.score`` div plus the half ``<span>`` siblings.
+
+    Returns:
+        A 4-tuple ``(first_half_rounds, second_half_rounds,
+        atk_rounds, def_rounds)``. The half values are the parsed
+        round counts of the spans at DOM positions 0 and 1 (the
+        regulation halves); ``atk_rounds``/``def_rounds`` are the sums
+        of the ``mod-t``/``mod-ct`` spans (regulation only — a
+        ``mod-ot`` value is excluded). ``(None, None, None, None)``
+        when no span carries a recognized ``mod-t``/``mod-ct`` class
+        — e.g. an upcoming match's TBD placeholder block, whose spans
+        have a bare ``mod-`` class — the same soft-missing treatment
+        ``duration``/``winner`` get elsewhere in ``_parse_map``, not a
+        raise.
+
+    Raises:
+        Nothing; unparseable span text (e.g. ``"-"``) is treated as
+        missing via :func:`_parse_int`'s best-effort-``None``
+        convention, and an unrecognized span class is ignored.
+    """
+    first_half_rounds: Optional[int] = None
+    second_half_rounds: Optional[int] = None
+    atk_rounds = 0
+    def_rounds = 0
+    recognized = 0
+    for idx, span_el in enumerate(team_div_el.select("span")):
+        classes = span_el.get("class") or []
+        if "mod-t" in classes:
+            side = "atk"
+        elif "mod-ct" in classes:
+            side = "def"
+        else:
+            # mod-ot (third span on OT maps) and the upcoming
+            # placeholder's bare "mod-" class contribute to neither
+            # the atk/def totals nor the regulation half slots.
+            continue
+        value = _parse_int(span_el.get_text(strip=True))
+        if value is None:
+            continue
+        recognized += 1
+        if side == "atk":
+            atk_rounds += value
+        else:
+            def_rounds += value
+        if idx == 0:
+            first_half_rounds = value
+        elif idx == 1:
+            second_half_rounds = value
+    if recognized == 0:
+        return None, None, None, None
+    return first_half_rounds, second_half_rounds, atk_rounds, def_rounds
+
+
 def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
     """Parse one played map's result from a ``.vm-stats-game`` block.
 
@@ -286,7 +360,15 @@ def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
         player-map stat line, team1 rows then team2 rows) and
         ``agent_picks`` (a dict mapping each team's resolved name to
         the list of agents its players used, one entry per player in
-        table row order, first-listed agent only). A map block with
+        table row order, first-listed agent only), and the eight
+        half-split fields (``team1_first_half_rounds``,
+        ``team1_second_half_rounds``, ``team1_atk_rounds``,
+        ``team1_def_rounds`` and the team2 counterparts) parsed from
+        the header's per-team ``mod-t``/``mod-ct``/``mod-ot`` spans
+        (regulation-only atk/def totals; see
+        :func:`_parse_half_split`). All eight are ``None`` when the
+        header rendered no recognized half spans (e.g. an
+        upcoming/TBD placeholder block). A map block with
         no ``.ovw-table`` at all (e.g. a future awarded/abandoned map
         that never rendered stats) yields ``player_stats == []`` and
         ``agent_picks is None`` — the same soft-missing treatment
@@ -296,6 +378,9 @@ def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
     Raises:
         VlrParseError: If ``game_el`` has no ``.vm-stats-game-header``,
             or the header has no map name (``.map div span``), or the
+            parsed half-split data violates a round-count invariant
+            (combined first half != 12, or combined second half > 12,
+            propagated from :meth:`MapResult.__post_init__`), or the
             parsed final score is illegal (a winner with fewer than
             13 rounds, or an overtime scoreline with margin < 2), or
             the winner label contradicts the final scores (the
@@ -304,9 +389,9 @@ def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
             (one team's stats missing is a broken render, not a valid
             soft-missing state), or a player row inside a present
             table has no ``.ovw-player-name`` (propagated from
-            :func:`_parse_player_stats_table`). The illegal-score and
-            winner-mismatch cases include the map name and both
-            scores in the message.
+            :func:`_parse_player_stats_table`). The illegal-score,
+            half-split-invariant and winner-mismatch cases include the
+            map name and both scores in the message.
     """
     header_el = game_el.select_one(".vm-stats-game-header")
     if header_el is None:
@@ -329,6 +414,20 @@ def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
     )
     team2_score = (
         _parse_int(score_els[1].get_text(strip=True)) if len(score_els) >= 2 else None
+    )
+
+    # Attack/defense half splits from the header's per-team spans.
+    # One .team div per side in DOM order (team1 first), the same
+    # positional convention used for .team .score above. The
+    # upcoming/TBD placeholder blocks render spans with a bare
+    # "mod-" class; _parse_half_split returns all-None for those, so
+    # placeholder data never reaches MapResult's half invariants.
+    team_divs = header_el.select(".team")
+    team1_half = (
+        _parse_half_split(team_divs[0]) if len(team_divs) >= 1 else (None,) * 4
+    )
+    team2_half = (
+        _parse_half_split(team_divs[1]) if len(team_divs) >= 2 else (None,) * 4
     )
 
     win_el = header_el.select_one(".score.mod-win")
@@ -430,15 +529,24 @@ def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
             duration=duration,
             agent_picks=agent_picks,
             player_stats=player_stats,
+            team1_first_half_rounds=team1_half[0],
+            team1_second_half_rounds=team1_half[1],
+            team1_atk_rounds=team1_half[2],
+            team1_def_rounds=team1_half[3],
+            team2_first_half_rounds=team2_half[0],
+            team2_second_half_rounds=team2_half[1],
+            team2_atk_rounds=team2_half[2],
+            team2_def_rounds=team2_half[3],
         )
     except ValueError as exc:
-        # An illegal final score is a data problem, not a programming
-        # error, so it surfaces through the module's error taxonomy
-        # (VlrParseError) rather than as a raw ValueError. It still
-        # aborts the whole match parse — fail loudly, never silently
-        # skip-and-continue with a wrong label.
+        # An illegal final score or a broken half-split invariant is a
+        # data problem, not a programming error, so it surfaces
+        # through the module's error taxonomy (VlrParseError) rather
+        # than as a raw ValueError. It still aborts the whole match
+        # parse — fail loudly, never silently skip-and-continue with
+        # a wrong label.
         raise VlrParseError(
-            f"illegal final score for map {map_name!r} "
+            f"invalid map data for map {map_name!r} "
             f"({team1_score}-{team2_score}): {exc}"
         ) from exc
 
@@ -570,9 +678,13 @@ def parse_match(html: str, url: str) -> Match:
     per-map results (skipping the "All Maps" overview block and any
     placeholder ``"TBD"`` maps rendered for upcoming matches) — each
     map now also carrying its per-player stats
-    (``MapResult.player_stats``) and agent-pick summary
+    (``MapResult.player_stats``), agent-pick summary
     (``MapResult.agent_picks``) parsed from the map's ``.ovw-table``
-    blocks — and the ordered ban/pick/decider veto sequence parsed
+    blocks, and its attack/defense half-split round counts
+    (``MapResult.team{1,2}_{first,second}_half_rounds`` and
+    ``MapResult.team{1,2}_{atk,def}_rounds``) parsed from the
+    header's per-team ``mod-t``/``mod-ct``/``mod-ot`` spans — and the
+    ordered ban/pick/decider veto sequence parsed
     from the page's ``.match-header-note`` element (see
     :func:`_parse_veto_note`).
 

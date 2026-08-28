@@ -14,17 +14,19 @@ from typing import Any, Optional
 
 
 class IllegalScoreError(ValueError):
-    """A finished map's final score violates standard VCT rules.
+    """A finished map's scoreline or half-split data violates VCT rules.
 
     Raised by :meth:`MapResult.__post_init__` when a finished map's
-    scoreline is impossible: a winner with fewer than 13 rounds, an
-    overtime scoreline (both teams >= 12) with a winning margin below
-    2 rounds, or a regulation scoreline (loser below 12) whose winner
-    exceeds 13 rounds. Subclasses ``ValueError`` so existing ``except
-    ValueError`` handlers keep working, but gives callers a way to
-    distinguish a score-validity failure from unrelated ``ValueError``
-    sources (e.g. a corrupt cache row whose ``date`` field fails
-    ``datetime.fromisoformat``).
+    scoreline is impossible (a winner with fewer than 13 rounds, an
+    overtime scoreline — both teams >= 12 — with a winning margin
+    below 2 rounds, or a regulation scoreline whose winner exceeds 13
+    rounds), or when a parsed half-split invariant is broken (the
+    combined first-half round count is not exactly 12, or the combined
+    second-half count exceeds 12). Subclasses ``ValueError`` so
+    existing ``except ValueError`` handlers keep working, but gives
+    callers a way to distinguish a score/half-split validity failure
+    from unrelated ``ValueError`` sources (e.g. a corrupt cache row
+    whose ``date`` field fails ``datetime.fromisoformat``).
     """
 
 
@@ -213,6 +215,38 @@ class MapResult:
             teams combined, in the order the tables render
             ``(team1 rows..., team2 rows...)``. Empty when the map
             rendered no stats tables.
+        team1_first_half_rounds: Rounds team1 won in the map's first
+            half (regulation only), or ``None`` when the header
+            rendered no recognized half spans (e.g. an upcoming/TBD
+            placeholder block). A regulation first half always runs
+            its full 12 rounds, so team1's and team2's first-half
+            counts always sum to exactly 12.
+        team1_second_half_rounds: Rounds team1 won in the map's
+            second half (regulation only), or ``None`` when
+            unavailable. Unlike the first half, the second half may be
+            truncated — a team reaching 13 rounds ends the game
+            mid-half — so the combined second-half count can fall
+            below 12 (it can never exceed it).
+        team1_atk_rounds: Total regulation rounds team1 won while
+            attacking (the sum of its ``mod-t`` half spans), or
+            ``None`` when no half data parsed. OT rounds are excluded
+            (vlr.gg's header markup reports OT only as a combined
+            per-team total, not per side), so ``atk + def`` always
+            equals ``first + second`` half rounds.
+        team1_def_rounds: Total regulation rounds team1 won while
+            defending (the sum of its ``mod-ct`` half spans), or
+            ``None`` when no half data parsed.
+        team2_first_half_rounds: Rounds team2 won in the map's first
+            half (regulation only), or ``None`` when unavailable.
+        team2_second_half_rounds: Rounds team2 won in the map's
+            second half (regulation only), or ``None`` when
+            unavailable.
+        team2_atk_rounds: Total regulation rounds team2 won while
+            attacking (the sum of its ``mod-t`` half spans), or
+            ``None`` when no half data parsed.
+        team2_def_rounds: Total regulation rounds team2 won while
+            defending (the sum of its ``mod-ct`` half spans), or
+            ``None`` when no half data parsed.
 
     Raises:
         IllegalScoreError (a ``ValueError`` subclass): In
@@ -221,7 +255,10 @@ class MapResult:
             with an illegal scoreline: a winner with fewer than 13
             rounds, an overtime scoreline (both teams >= 12) with a
             winning margin below 2, or a regulation scoreline (loser
-            below 12) whose winner exceeds 13 rounds.
+            below 12) whose winner exceeds 13 rounds; or, whenever
+            both teams' half-split data parsed (even for unfinished
+            maps), if the combined first-half round count is not
+            exactly 12 or the combined second-half count exceeds 12.
     """
 
     map_name: str
@@ -231,15 +268,38 @@ class MapResult:
     duration: Optional[str] = None  # e.g. "59:20" as displayed on vlr.gg
     agent_picks: Optional[dict[str, list[str]]] = None  # team name -> per-player agent list
     player_stats: list[PlayerStats] = field(default_factory=list)
+    team1_first_half_rounds: Optional[int] = None  # regulation first half
+    team1_second_half_rounds: Optional[int] = None  # regulation second half
+    team1_atk_rounds: Optional[int] = None  # regulation rounds attacking
+    team1_def_rounds: Optional[int] = None  # regulation rounds defending
+    team2_first_half_rounds: Optional[int] = None  # regulation first half
+    team2_second_half_rounds: Optional[int] = None  # regulation second half
+    team2_atk_rounds: Optional[int] = None  # regulation rounds attacking
+    team2_def_rounds: Optional[int] = None  # regulation rounds defending
 
     def __post_init__(self) -> None:
-        """Validate a finished map's score after construction.
+        """Validate a finished map's score and half-split data after construction.
 
-        Validation runs only when the map is finished — i.e. when
-        ``team1_score``, ``team2_score`` and ``winner`` are all not
-        ``None`` (unfinished/live/upcoming maps have no final labels
-        yet and are skipped). For finished maps it enforces the
-        standard VCT rules: the winner must have at least 13 rounds
+        Two independent validation layers run here, both raising
+        :class:`IllegalScoreError` (a ``ValueError`` subclass).
+
+        The half-split layer runs whenever *both* teams' half data
+        parsed — it is independent of the finished-map gate, so it
+        also fires on live/unfinished maps whose scores/winner are
+        still ``None``. It enforces the two round-count invariants
+        that hold on every real vlr.gg header: the combined first-half
+        round count of both teams is always exactly 12 (a regulation
+        first half always runs its full 12 rounds), and the combined
+        second-half count never exceeds 12 (the second half *may* be
+        truncated — a team reaching 13 rounds ends the game mid-half,
+        so e.g. a 13-6 map's second half sums to fewer than 12 — but
+        can never exceed it).
+
+        The finished-map layer runs only when ``team1_score``,
+        ``team2_score`` and ``winner`` are all not ``None``
+        (unfinished/live/upcoming maps have no final labels yet and
+        are skipped). For finished maps it enforces the standard VCT
+        rules: the winner must have at least 13 rounds
         (``winner_score >= 13``); when both teams reached 12 rounds
         (overtime), the winning margin must be at least 2 rounds
         (``winner_score - loser_score >= 2``); and a regulation win
@@ -251,17 +311,61 @@ class MapResult:
         milestone against the materialized dataset.
 
         Raises:
-            IllegalScoreError (a ``ValueError`` subclass): If the map
-                is finished and ``winner_score < 13`` (a winner
-                cannot have fewer than 13 rounds), if the map went to
-                overtime (both scores >= 12) and the winning margin
-                is less than 2 rounds (e.g. 13-12, which is not a
-                legal final scoreline), or if the map is a regulation
-                scoreline (loser below 12) whose winner exceeds 13
-                rounds (e.g. 30-3, impossible since a regulation game
-                ends at 13). The message includes ``map_name`` and
-                both scores.
+            IllegalScoreError (a ``ValueError`` subclass): If both
+                teams' half-split data parsed and the combined
+                first-half round count is not exactly 12, or the
+                combined second-half count exceeds 12 (the message
+                includes ``map_name`` and both teams' half values); or
+                if the map is finished and ``winner_score < 13`` (a
+                winner cannot have fewer than 13 rounds), the map went
+                to overtime (both scores >= 12) and the winning
+                margin is less than 2 rounds (e.g. 13-12), or the map
+                is a regulation scoreline (loser below 12) whose
+                winner exceeds 13 rounds (e.g. 30-3). The score
+                messages include ``map_name`` and both scores.
         """
+        # Half-split invariant, independent of the finished-map gate
+        # below: runs whenever both teams' half data parsed, even when
+        # scores/winner are still None. A regulation first half always
+        # runs its full 12 rounds, so the combined first-half count
+        # must be exactly 12. The combined second-half count is capped
+        # at 12 but may be less: a team reaching 13 rounds mid-half
+        # ends the game, so truncated second halves (e.g. a 13-6 map)
+        # sum to under 12 — never over. (The upcoming-placeholder
+        # "TBD" blocks render no recognized half spans, so they parse
+        # to None and skip this check entirely.)
+        if (
+            self.team1_first_half_rounds is not None
+            and self.team2_first_half_rounds is not None
+        ):
+            first_half_sum = (
+                self.team1_first_half_rounds + self.team2_first_half_rounds
+            )
+            if first_half_sum != 12:
+                raise IllegalScoreError(
+                    f"map {self.map_name!r} has an illegal combined "
+                    f"first-half round count {first_half_sum} (team1 "
+                    f"{self.team1_first_half_rounds}, team2 "
+                    f"{self.team2_first_half_rounds}): a regulation "
+                    f"first half is always exactly 12 rounds"
+                )
+        if (
+            self.team1_second_half_rounds is not None
+            and self.team2_second_half_rounds is not None
+        ):
+            second_half_sum = (
+                self.team1_second_half_rounds + self.team2_second_half_rounds
+            )
+            if second_half_sum > 12:
+                raise IllegalScoreError(
+                    f"map {self.map_name!r} has an illegal combined "
+                    f"second-half round count {second_half_sum} (team1 "
+                    f"{self.team1_second_half_rounds}, team2 "
+                    f"{self.team2_second_half_rounds}): a second half "
+                    f"can be truncated (a team reaching 13 ends the "
+                    f"game) but never exceeds 12 rounds"
+                )
+
         if (
             self.team1_score is None
             or self.team2_score is None
@@ -311,10 +415,14 @@ class MapResult:
         Returns:
             A dict with keys ``"map_name"``, ``"team1_score"``,
             ``"team2_score"``, ``"winner"``, ``"duration"``,
-            ``"agent_picks"`` and ``"player_stats"`` (each entry
-            serialized via :meth:`PlayerStats.to_dict`), suitable for
-            ``json.dumps`` and for round-tripping via
-            :meth:`from_dict`.
+            ``"agent_picks"``, ``"player_stats"`` (each entry
+            serialized via :meth:`PlayerStats.to_dict`) and the eight
+            half-split fields (``team1_first_half_rounds``,
+            ``team1_second_half_rounds``, ``team1_atk_rounds``,
+            ``team1_def_rounds``, ``team2_first_half_rounds``,
+            ``team2_second_half_rounds``, ``team2_atk_rounds``,
+            ``team2_def_rounds``), suitable for ``json.dumps`` and for
+            round-tripping via :meth:`from_dict`.
         """
         return {
             "map_name": self.map_name,
@@ -324,6 +432,14 @@ class MapResult:
             "duration": self.duration,
             "agent_picks": self.agent_picks,
             "player_stats": [ps.to_dict() for ps in self.player_stats],
+            "team1_first_half_rounds": self.team1_first_half_rounds,
+            "team1_second_half_rounds": self.team1_second_half_rounds,
+            "team1_atk_rounds": self.team1_atk_rounds,
+            "team1_def_rounds": self.team1_def_rounds,
+            "team2_first_half_rounds": self.team2_first_half_rounds,
+            "team2_second_half_rounds": self.team2_second_half_rounds,
+            "team2_atk_rounds": self.team2_atk_rounds,
+            "team2_def_rounds": self.team2_def_rounds,
         }
 
     @classmethod
@@ -334,12 +450,12 @@ class MapResult:
             data: A dict as produced by :meth:`to_dict`, i.e.
                 containing a required ``"map_name"`` key and optional
                 ``"team1_score"``, ``"team2_score"``, ``"winner"``,
-                ``"duration"``, ``"agent_picks"`` and
-                ``"player_stats"`` (a list of
-                :meth:`PlayerStats.to_dict` dicts) keys.
-                ``"player_stats"`` defaults to an empty list when
-                absent, so cache rows written before stats parsing
-                existed still deserialize.
+                ``"duration"``, ``"agent_picks"``, ``"player_stats"``
+                (a list of :meth:`PlayerStats.to_dict` dicts) and the
+                eight half-split keys. ``"player_stats"`` defaults to
+                an empty list when absent, and each half-split key
+                defaults to ``None``, so cache rows written before
+                stats or half-split parsing existed still deserialize.
 
         Returns:
             The reconstructed ``MapResult``.
@@ -348,7 +464,9 @@ class MapResult:
             KeyError: If ``data`` has no ``"map_name"`` key.
             IllegalScoreError (a ``ValueError`` subclass): If the
                 reconstructed map is finished with an illegal
-                scoreline (propagated from :meth:`__post_init__`).
+                scoreline, or its half-split data violates the
+                round-count invariants (propagated from
+                :meth:`__post_init__`).
         """
         return cls(
             map_name=data["map_name"],
@@ -360,6 +478,14 @@ class MapResult:
             player_stats=[
                 PlayerStats.from_dict(ps) for ps in data.get("player_stats", [])
             ],
+            team1_first_half_rounds=data.get("team1_first_half_rounds"),
+            team1_second_half_rounds=data.get("team1_second_half_rounds"),
+            team1_atk_rounds=data.get("team1_atk_rounds"),
+            team1_def_rounds=data.get("team1_def_rounds"),
+            team2_first_half_rounds=data.get("team2_first_half_rounds"),
+            team2_second_half_rounds=data.get("team2_second_half_rounds"),
+            team2_atk_rounds=data.get("team2_atk_rounds"),
+            team2_def_rounds=data.get("team2_def_rounds"),
         )
 
 
