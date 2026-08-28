@@ -286,12 +286,16 @@ def _parse_half_split(team_div_el):
         round counts of the spans at DOM positions 0 and 1 (the
         regulation halves); ``atk_rounds``/``def_rounds`` are the sums
         of the ``mod-t``/``mod-ct`` spans (regulation only — a
-        ``mod-ot`` value is excluded). ``(None, None, None, None)``
-        when no span carries a recognized ``mod-t``/``mod-ct`` class
-        — e.g. an upcoming match's TBD placeholder block, whose spans
-        have a bare ``mod-`` class — the same soft-missing treatment
-        ``duration``/``winner`` get elsewhere in ``_parse_map``, not a
-        raise.
+        ``mod-ot`` value is excluded), or ``None`` for a side whose
+        span never parsed — e.g. a live match's in-progress half
+        rendering only the currently active side's count — never a
+        fabricated ``0``, which would be indistinguishable from a team
+        genuinely winning zero rounds on that side. ``(None, None,
+        None, None)`` when no span carries a recognized
+        ``mod-t``/``mod-ct`` class — e.g. an upcoming match's TBD
+        placeholder block, whose spans have a bare ``mod-`` class —
+        the same soft-missing treatment ``duration``/``winner`` get
+        elsewhere in ``_parse_map``, not a raise.
 
     Raises:
         Nothing; unparseable span text (e.g. ``"-"``) is treated as
@@ -300,8 +304,8 @@ def _parse_half_split(team_div_el):
     """
     first_half_rounds: Optional[int] = None
     second_half_rounds: Optional[int] = None
-    atk_rounds = 0
-    def_rounds = 0
+    atk_rounds: Optional[int] = None
+    def_rounds: Optional[int] = None
     recognized = 0
     for idx, span_el in enumerate(team_div_el.select("span")):
         classes = span_el.get("class") or []
@@ -319,9 +323,9 @@ def _parse_half_split(team_div_el):
             continue
         recognized += 1
         if side == "atk":
-            atk_rounds += value
+            atk_rounds = value if atk_rounds is None else atk_rounds + value
         else:
-            def_rounds += value
+            def_rounds = value if def_rounds is None else def_rounds + value
         if idx == 0:
             first_half_rounds = value
         elif idx == 1:
@@ -368,7 +372,10 @@ def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
         (regulation-only atk/def totals; see
         :func:`_parse_half_split`). All eight are ``None`` when the
         header rendered no recognized half spans (e.g. an
-        upcoming/TBD placeholder block). A map block with
+        upcoming/TBD placeholder block), and the unparsed side's
+        atk/def field is ``None`` (not a fabricated ``0``) when only
+        one of the two sides' spans parsed (e.g. a live in-progress
+        map mid-half). A map block with
         no ``.ovw-table`` at all (e.g. a future awarded/abandoned map
         that never rendered stats) yields ``player_stats == []`` and
         ``agent_picks is None`` — the same soft-missing treatment
@@ -380,7 +387,9 @@ def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
             or the header has no map name (``.map div span``), or the
             parsed half-split data violates a round-count invariant
             (combined first half != 12, or combined second half > 12,
-            propagated from :meth:`MapResult.__post_init__`), or the
+            propagated from :meth:`MapResult.__post_init__` — checked
+            only on finished maps, since a live in-progress map's
+            partial counts legitimately violate them), or the
             parsed final score is illegal (a winner with fewer than
             13 rounds, or an overtime scoreline with margin < 2), or
             the winner label contradicts the final scores (the

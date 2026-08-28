@@ -32,12 +32,21 @@ hand-transcribed from those real headers (never guessed):
     zeros (which would trip the first-half == 12 invariant with 0+0).
 
 The plan (tasks/007-half-split-parser) requires an invariant check in
-``MapResult.__post_init__``. One deviation is implemented deliberately:
-the plan's literal "combined second half == 12" contradicts the plan's
-own transcribed Split values (2+5=7) and the real fixtures — a second
-half truncates when a team reaches 13 rounds mid-half. The enforced
-invariant is therefore "combined first half == 12, combined second
-half <= 12" (see the regression test below).
+``MapResult.__post_init__``. Two deviations are implemented
+deliberately. First: the plan's literal "combined second half == 12"
+contradicts the plan's own transcribed Split values (2+5=7) and the
+real fixtures — a second half truncates when a team reaches 13 rounds
+mid-half. The enforced invariant is therefore "combined first half ==
+12, combined second half <= 12" (see the regression test below).
+Second (review finding 1): the plan's "independent of the
+finished-map gate" was dropped — the invariant now runs only once the
+map is known-finished (scores + winner all set), because a live
+in-progress map's header renders partial round counts (e.g. a
+mid-first-half 6-3) that legitimately violate it, and vlr.gg only
+renders the winner element (``.score.mod-win``) once a map is
+complete. The mismatch tests below therefore construct *finished*
+maps with valid scorelines so the half-split data is the only
+violation.
 """
 
 from pathlib import Path
@@ -46,7 +55,7 @@ import pytest
 from bs4 import BeautifulSoup
 
 from scraper import vlr
-from scraper.models import IllegalScoreError, MapResult
+from scraper.models import IllegalScoreError, MapResult, Team
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -240,36 +249,126 @@ def test_upcoming_tbd_placeholder_half_spans_parse_to_none():
 
 def test_first_half_sum_mismatch_raises_illegal_score_error():
     # Synthetic broken invariant — no legitimate vlr.gg page can
-    # render it: a combined first half of 7+7=14 is impossible.
-    # Constructing directly with scores/winner None isolates the
-    # half-split check from the finished-map score gate; per plan#2
-    # the check must fire anyway, whenever both teams' half data
-    # parsed.
+    # render it: a combined first half of 7+7=14 is impossible. The
+    # map must be finished (scores + winner set) for the invariant to
+    # run — it never fires on live/unfinished maps (review finding 1:
+    # a live map's partial counts legitimately violate it). The 13-10
+    # scoreline itself is valid, so the half-split data is the only
+    # violation, and the half-split check runs before the score
+    # checks, so the message names the first-half invariant.
     with pytest.raises(IllegalScoreError) as excinfo:
         MapResult(
             map_name="Ascent",
-            team1_score=None,
-            team2_score=None,
-            winner=None,
+            team1_score=13,
+            team2_score=10,
+            winner="Team A",
             team1_first_half_rounds=7,
             team2_first_half_rounds=7,
         )
-    assert "Ascent" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "Ascent" in message
+    assert "combined first-half" in message
 
 
 def test_second_half_over_12_raises_illegal_score_error():
     # A combined second half of 14 is impossible: a second half can be
     # truncated (fewer than 12 rounds, when a team reaches 13
-    # mid-half) but never exceeds 12 rounds.
-    with pytest.raises(IllegalScoreError):
+    # mid-half) but never exceeds 12 rounds. Finished-map scoreline
+    # (13-10) is valid, so the half-split data is the only violation.
+    with pytest.raises(IllegalScoreError) as excinfo:
         MapResult(
             map_name="Split",
-            team1_score=None,
-            team2_score=None,
-            winner=None,
+            team1_score=13,
+            team2_score=10,
+            winner="Team A",
             team1_second_half_rounds=8,
             team2_second_half_rounds=6,
         )
+    assert "combined second-half" in str(excinfo.value)
+
+
+def test_live_map_partial_half_data_does_not_raise():
+    # Review finding 1 regression: a live match's in-progress map
+    # renders partial round counts (mid-first-half 6-3, combined 9 !=
+    # 12) with no winner element yet (vlr.gg only marks .score.mod-win
+    # once a map is complete). The half-split invariant must not fire
+    # on unfinished maps — this MapResult must construct cleanly with
+    # its partial half data intact, not raise IllegalScoreError.
+    result = MapResult(
+        map_name="Ascent",
+        team1_score=6,
+        team2_score=3,
+        winner=None,
+        team1_first_half_rounds=6,
+        team2_first_half_rounds=3,
+        team1_atk_rounds=2,
+        team1_def_rounds=4,
+        team2_atk_rounds=1,
+        team2_def_rounds=2,
+    )
+    assert result.team1_first_half_rounds == 6
+    assert result.team2_first_half_rounds == 3
+
+
+LIVE_MAP_HTML = """
+<div class="vm-stats-game">
+<div class="vm-stats-game-header">
+<div class="team">
+<div class="score">6</div>
+<div>
+<span class="mod-t">6</span>
+</div>
+</div>
+<div class="map">
+<div><span>Ascent</span></div>
+</div>
+<div class="team mod-right">
+<div class="score">3</div>
+<div>
+<span class="mod-ct">3</span>
+</div>
+</div>
+</div>
+</div>
+"""
+
+
+def test_parse_map_live_in_progress_map_parses_partial_half_data():
+    # End-to-end regression for both review findings: a live match's
+    # in-progress map renders partial half spans (team1 mod-t=6,
+    # team2 mod-ct=3 — combined first half 9, no second half) and no
+    # .score.mod-win element. _parse_map must (finding 1) parse it
+    # without raising — the half-split invariant only runs on
+    # finished maps — and (finding 2) report None, not a fabricated
+    # 0, for the side whose span never parsed (team1's def_rounds,
+    # team2's atk_rounds).
+    game_el = BeautifulSoup(LIVE_MAP_HTML, "lxml").select_one(".vm-stats-game")
+    result = vlr._parse_map(game_el, Team(name="Team A"), Team(name="Team B"))
+    assert result.map_name == "Ascent"
+    assert result.team1_score == 6
+    assert result.team2_score == 3
+    assert result.winner is None
+    assert result.team1_first_half_rounds == 6
+    assert result.team1_second_half_rounds is None
+    assert result.team1_atk_rounds == 6
+    assert result.team1_def_rounds is None
+    assert result.team2_first_half_rounds == 3
+    assert result.team2_second_half_rounds is None
+    assert result.team2_atk_rounds is None
+    assert result.team2_def_rounds == 3
+
+
+def test_parse_half_split_partial_side_reports_none_not_zero():
+    # Review finding 2 regression at the unit level: when exactly one
+    # of the mod-t/mod-ct spans is recognized (e.g. a live in-progress
+    # half rendering only the currently active side), the side that
+    # never parsed must report None — 0 is indistinguishable from
+    # "genuinely won zero rounds on that side" even though the value
+    # was never observed.
+    team_div = BeautifulSoup(
+        '<div class="team"><span class="mod-t">6</span></div>', "lxml"
+    ).select_one(".team")
+    assert vlr._parse_half_split(team_div) == (6, None, 6, None)
 
 
 def test_truncated_second_half_does_not_raise():

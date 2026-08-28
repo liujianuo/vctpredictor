@@ -255,10 +255,14 @@ class MapResult:
             with an illegal scoreline: a winner with fewer than 13
             rounds, an overtime scoreline (both teams >= 12) with a
             winning margin below 2, or a regulation scoreline (loser
-            below 12) whose winner exceeds 13 rounds; or, whenever
-            both teams' half-split data parsed (even for unfinished
-            maps), if the combined first-half round count is not
-            exactly 12 or the combined second-half count exceeds 12.
+            below 12) whose winner exceeds 13 rounds; or, on such a
+            finished map, if both teams' half-split data parsed and
+            the combined first-half round count is not exactly 12 or
+            the combined second-half count exceeds 12. Neither
+            validation layer runs on live/in-progress maps (their
+            winner is still ``None``), since those render partial
+            round counts that legitimately violate the finished-map
+            invariants.
     """
 
     map_name: str
@@ -281,12 +285,19 @@ class MapResult:
         """Validate a finished map's score and half-split data after construction.
 
         Two independent validation layers run here, both raising
-        :class:`IllegalScoreError` (a ``ValueError`` subclass).
+        :class:`IllegalScoreError` (a ``ValueError`` subclass). Both
+        run only once the map is known-finished — all three of
+        ``team1_score``, ``team2_score`` and ``winner`` not ``None``
+        (the same gate the score layer historically used). vlr.gg
+        renders the winner element (``.score.mod-win``) only once a
+        map is complete, so a ``None`` winner is the finished signal:
+        a live/in-progress map's header shows partial round counts
+        (e.g. a mid-first-half 6-3 whose combined 9 != 12) that
+        legitimately violate the finished-map invariants below, so
+        running them on unfinished maps would crash an entire
+        ``get_matches_from_event`` fetch over a false positive.
 
-        The half-split layer runs whenever *both* teams' half data
-        parsed — it is independent of the finished-map gate, so it
-        also fires on live/unfinished maps whose scores/winner are
-        still ``None``. It enforces the two round-count invariants
+        The half-split layer enforces the two round-count invariants
         that hold on every real vlr.gg header: the combined first-half
         round count of both teams is always exactly 12 (a regulation
         first half always runs its full 12 rounds), and the combined
@@ -295,10 +306,7 @@ class MapResult:
         so e.g. a 13-6 map's second half sums to fewer than 12 — but
         can never exceed it).
 
-        The finished-map layer runs only when ``team1_score``,
-        ``team2_score`` and ``winner`` are all not ``None``
-        (unfinished/live/upcoming maps have no final labels yet and
-        are skipped). For finished maps it enforces the standard VCT
+        The score layer enforces the standard VCT
         rules: the winner must have at least 13 rounds
         (``winner_score >= 13``); when both teams reached 12 rounds
         (overtime), the winning margin must be at least 2 rounds
@@ -324,16 +332,32 @@ class MapResult:
                 winner exceeds 13 rounds (e.g. 30-3). The score
                 messages include ``map_name`` and both scores.
         """
-        # Half-split invariant, independent of the finished-map gate
-        # below: runs whenever both teams' half data parsed, even when
-        # scores/winner are still None. A regulation first half always
+        # Finished-map gate: the round-count invariants and score
+        # validity below only make sense once the map is known-
+        # finished. vlr.gg renders the winner element (.score.mod-win)
+        # only when a map is complete, so a None winner is the
+        # finished signal — the same gate the score checks use. A
+        # live/in-progress map's header shows partial round counts
+        # (e.g. a mid-first-half 6-3), so running the half-split
+        # invariants on it would be a false positive that aborts the
+        # whole parse; the invariants fire only on finished maps,
+        # where a violation is genuinely broken data and fails loudly.
+        # (The upcoming-placeholder "TBD" blocks render no recognized
+        # half spans and no scores/winner, so they skip this entirely.)
+        if (
+            self.team1_score is None
+            or self.team2_score is None
+            or self.winner is None
+        ):
+            return
+
+        # Half-split invariants: run whenever both teams' half data
+        # parsed on this finished map. A regulation first half always
         # runs its full 12 rounds, so the combined first-half count
         # must be exactly 12. The combined second-half count is capped
         # at 12 but may be less: a team reaching 13 rounds mid-half
         # ends the game, so truncated second halves (e.g. a 13-6 map)
-        # sum to under 12 — never over. (The upcoming-placeholder
-        # "TBD" blocks render no recognized half spans, so they parse
-        # to None and skip this check entirely.)
+        # sum to under 12 — never over.
         if (
             self.team1_first_half_rounds is not None
             and self.team2_first_half_rounds is not None
@@ -366,12 +390,6 @@ class MapResult:
                     f"game) but never exceeds 12 rounds"
                 )
 
-        if (
-            self.team1_score is None
-            or self.team2_score is None
-            or self.winner is None
-        ):
-            return
         winner_score = max(self.team1_score, self.team2_score)
         loser_score = min(self.team1_score, self.team2_score)
         if winner_score < 13:
