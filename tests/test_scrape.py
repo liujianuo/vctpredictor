@@ -9,6 +9,8 @@ testing a root-level module.
 import logging
 from urllib.robotparser import RobotFileParser
 
+import pytest
+
 import scrape
 from scraper import vlr
 from scraper.models import IllegalScoreError
@@ -68,12 +70,15 @@ class _FakeScraper:
         self.fail_url = fail_url
         self.fail_error = fail_error
 
-    def __call__(self, url, use_cache=True):
+    def __call__(self, url, use_cache=True, robots_parser=None):
         """Simulate ``vlr.get_matches_from_event``.
 
         Args:
             url: The event URL being scraped.
             use_cache: The cache flag forwarded by the driver.
+            robots_parser: The robots parser forwarded by the driver
+                (ignored by the fake; the real function uses it to gate
+                individual match pages).
 
         Returns:
             A one-element list of fake match objects for URLs other
@@ -178,57 +183,33 @@ def test_main_happy_path(monkeypatch, caplog):
 # --------------------------------------------------------------------------
 
 
-def test_main_event_fetch_failure_is_isolated(monkeypatch, caplog):
-    # One event's fetch raising VlrFetchError must not abort the run:
-    # the remaining event is still processed, the failure is logged,
-    # and main returns 1.
+@pytest.mark.parametrize(
+    ("fail_error", "message"),
+    [
+        (vlr.VlrFetchError("network down"), "network down"),
+        (vlr.VlrParseError("missing .match-header"), "missing .match-header"),
+        (IllegalScoreError("13-12 illegal"), "13-12 illegal"),
+    ],
+)
+def test_main_event_failure_is_isolated(monkeypatch, caplog, fail_error, message):
+    # One event's scrape raising any member of _RECOVERABLE_EXCEPTIONS
+    # (a fetch error, a parse error, or an illegal-score error — the
+    # tuple is the source of truth this parametrization mirrors) must
+    # not abort the run: the remaining event is still processed, the
+    # failure is logged, main returns 1 (retryable), and the summary
+    # counts the disallowed list as empty so robots policy stops are
+    # never conflated with genuine failures.
     caplog.set_level(logging.INFO)
     monkeypatch.setattr(scrape.config, "ACTIVE", _FakeEventUrls(EVENT_URLS))
     monkeypatch.setattr(scrape.vlr, "fetch_robots_parser", _permissive_robots)
     calls = []
-    fake = _FakeScraper(
-        calls, fail_url=EVENT_URLS[0], fail_error=vlr.VlrFetchError("network down")
-    )
+    fake = _FakeScraper(calls, fail_url=EVENT_URLS[0], fail_error=fail_error)
     monkeypatch.setattr(scrape.vlr, "get_matches_from_event", fake)
     assert scrape.main([]) == 1
     assert [url for url, _ in calls] == [EVENT_URLS[0], EVENT_URLS[1]]
-    assert "network down" in caplog.text
+    assert message in caplog.text
     assert "1/2 events ok" in caplog.text
-
-
-def test_main_event_parse_failure_is_isolated(monkeypatch, caplog):
-    # Same isolation for a parse failure (VlrParseError): caught,
-    # logged, the other event still scraped, return code 1.
-    caplog.set_level(logging.INFO)
-    monkeypatch.setattr(scrape.config, "ACTIVE", _FakeEventUrls(EVENT_URLS))
-    monkeypatch.setattr(scrape.vlr, "fetch_robots_parser", _permissive_robots)
-    calls = []
-    fake = _FakeScraper(
-        calls,
-        fail_url=EVENT_URLS[0],
-        fail_error=vlr.VlrParseError("missing .match-header"),
-    )
-    monkeypatch.setattr(scrape.vlr, "get_matches_from_event", fake)
-    assert scrape.main([]) == 1
-    assert [url for url, _ in calls] == [EVENT_URLS[0], EVENT_URLS[1]]
-    assert "missing .match-header" in caplog.text
-
-
-def test_main_event_illegal_score_failure_is_isolated(monkeypatch, caplog):
-    # The third exception in the recoverable tuple (IllegalScoreError,
-    # a ValueError subclass) must also be caught and isolated rather
-    # than propagating out of main.
-    caplog.set_level(logging.INFO)
-    monkeypatch.setattr(scrape.config, "ACTIVE", _FakeEventUrls(EVENT_URLS))
-    monkeypatch.setattr(scrape.vlr, "fetch_robots_parser", _permissive_robots)
-    calls = []
-    fake = _FakeScraper(
-        calls, fail_url=EVENT_URLS[0], fail_error=IllegalScoreError("13-12 illegal")
-    )
-    monkeypatch.setattr(scrape.vlr, "get_matches_from_event", fake)
-    assert scrape.main([]) == 1
-    assert [url for url, _ in calls] == [EVENT_URLS[0], EVENT_URLS[1]]
-    assert "13-12 illegal" in caplog.text
+    assert "0 disallowed by robots" in caplog.text
 
 
 # --------------------------------------------------------------------------
@@ -238,18 +219,23 @@ def test_main_event_illegal_score_failure_is_isolated(monkeypatch, caplog):
 
 def test_main_robots_disallowed_skips_only_that_event(monkeypatch, caplog):
     # An event disallowed by robots.txt is skipped without being
-    # scraped at all; the allowed event is still processed, the
-    # disallowed one counts as a failure, and main returns 1.
+    # scraped at all; the allowed event is still processed. Disallowed
+    # events are tracked separately from genuine failures: the summary
+    # says "0 failed" and main returns exit code 3 (a policy stop, not
+    # a retryable bug — automation retrying on exit 1 must never retry
+    # a disallowed URL).
     caplog.set_level(logging.INFO)
     monkeypatch.setattr(scrape.config, "ACTIVE", _FakeEventUrls(EVENT_URLS))
     monkeypatch.setattr(scrape.vlr, "fetch_robots_parser", _permissive_robots)
     monkeypatch.setattr(scrape.vlr, "assert_allowed", _disallow_first)
     calls = []
     monkeypatch.setattr(scrape.vlr, "get_matches_from_event", _FakeScraper(calls))
-    assert scrape.main([]) == 1
+    assert scrape.main([]) == 3
     assert [url for url, _ in calls] == [EVENT_URLS[1]]
     assert "robots.txt disallows" in caplog.text
     assert "1/2 events ok" in caplog.text
+    assert "0 failed" in caplog.text
+    assert "1 disallowed by robots" in caplog.text
 
 
 def test_main_robots_fetch_failure_aborts_before_any_event(monkeypatch, caplog):

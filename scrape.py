@@ -2,12 +2,13 @@
 
 The end-to-end entry point tying ``config`` and ``scraper.vlr``
 together: walks every event URL in ``config.ACTIVE.event_urls``,
-checks each against vlr.gg's robots.txt, and fetches/parses every
-match through :func:`scraper.vlr.get_matches_from_event`, writing each
-through the SQLite page/match cache as it goes. Rate limiting
-(``POLITE_DELAY_SECONDS`` between uncached fetches) and disk caching
-already live inside ``scraper.vlr``/``scraper.cache``; this module
-adds the robots.txt gate and the per-event error isolation.
+checks each against vlr.gg's robots.txt (the same parsed file also
+gates every individual match page it fetches), and fetches/parses
+every match through :func:`scraper.vlr.get_matches_from_event`,
+writing each through the SQLite page/match cache as it goes. Rate
+limiting (``POLITE_DELAY_SECONDS`` between uncached fetches) and disk
+caching already live inside ``scraper.vlr``/``scraper.cache``; this
+module adds the robots.txt gate and the per-event error isolation.
 
 Re-running the driver is idempotent at the fetch layer: cached
 pages/matches are served from disk, so the second run makes no HTTP
@@ -16,12 +17,16 @@ requests for already-cached data.
 Exit codes:
 
 - ``0`` — every configured event URL was processed successfully.
-- ``1`` — at least one event failed (fetch, parse, or robots
-  disallowed), but the robots.txt fetch itself succeeded.
+- ``1`` — at least one event failed with a fetch or parse error (a
+  retryable condition), but the robots.txt fetch itself succeeded.
 - ``2`` — the robots.txt fetch failed, so the run aborted before any
   event was touched: scraping without knowing the rules is a hard
   stop (description.txt's scraping-etiquette row lists robots.txt as a
   requirement, not a suggestion).
+- ``3`` — no event failed, but at least one was disallowed by
+  robots.txt: a policy stop for that URL, deliberately distinct from
+  ``1`` so automation retrying on ``1`` never retries a
+  policy-disallowed URL.
 """
 
 from __future__ import annotations
@@ -93,25 +98,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ``2`` before any event is touched. Each configured event URL is
     checked with :func:`scraper.vlr.assert_allowed`; a
     ``VlrRobotsError`` skips that one event only (robots says no — a
-    hard stop for that URL, not a bug to route around). Events that
-    pass are scraped via
+    hard stop for that URL, not a bug to route around) and is tracked
+    separately from genuine failures. Events that pass are scraped via
     :func:`scraper.vlr.get_matches_from_event` (``use_cache`` forwarded
-    from ``--no-cache``) inside a per-event ``try/except`` over
-    ``_RECOVERABLE_EXCEPTIONS``, so one bad event is logged and skipped
-    rather than taking down the remaining events — the same isolation
-    principle ``parse_match`` applies to a single bad veto note. A
-    one-line summary of ok/failed counts and the total match count is
-    logged at the end.
+    from ``--no-cache``; the same robots parser is passed through so
+    every individual match page is gated too) inside a per-event
+    ``try/except`` over ``_RECOVERABLE_EXCEPTIONS``, so one bad event
+    is logged and skipped rather than taking down the remaining events
+    — the same isolation principle ``parse_match`` applies to a single
+    bad veto note. A one-line summary of ok/failed/disallowed counts
+    and the total match count is logged at the end.
 
     Args:
         argv: The argument list to parse (see :func:`parse_args`);
             ``None`` means ``sys.argv[1:]``.
 
     Returns:
-        ``0`` if every configured event succeeded; ``1`` if the robots
-        fetch succeeded but at least one event failed (fetch, parse,
-        or robots-disallowed); ``2`` if the robots.txt fetch itself
-        failed, in which case nothing was scraped.
+        ``0`` if every configured event succeeded; ``1`` if at least
+        one event failed with a fetch or parse error (a retryable
+        condition); ``2`` if the robots.txt fetch itself failed, in
+        which case nothing was scraped; ``3`` if no event failed but at
+        least one was disallowed by robots.txt (a policy stop,
+        deliberately distinct from ``1`` so automation retrying on
+        ``1`` never retries a policy-disallowed URL).
 
     Raises:
         Nothing; all expected failure modes are converted to exit
@@ -141,39 +150,62 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     event_urls = config.ACTIVE.event_urls
     use_cache = not args.no_cache
-    ok_count = 0
     failed_urls: List[str] = []
+    disallowed_urls: List[str] = []
     total_matches = 0
 
     for url in event_urls:
-        # Robots gate: a disallowed event is skipped entirely, logged as
-        # an error, and counts as a failed event for the exit code.
+        # Robots gate: a disallowed event is skipped entirely and
+        # tracked separately from genuine failures — robots says no is
+        # a policy stop for that URL, not a retryable bug, and the two
+        # must not be conflated in the summary/exit code.
         try:
             vlr.assert_allowed(url, robots_parser)
         except vlr.VlrRobotsError as exc:
-            logger.error("robots.txt disallows %s: %s; skipping this event", url, exc)
-            failed_urls.append(url)
+            logger.error(
+                "robots.txt disallows %s: %s; skipping this event", url, exc
+            )
+            disallowed_urls.append(url)
             continue
         try:
-            matches = vlr.get_matches_from_event(url, use_cache=use_cache)
+            matches = vlr.get_matches_from_event(
+                url, use_cache=use_cache, robots_parser=robots_parser
+            )
         except _RECOVERABLE_EXCEPTIONS as exc:
             logger.error("event %s failed: %s; skipping", url, exc)
             failed_urls.append(url)
             continue
-        ok_count += 1
         total_matches += len(matches)
         logger.info("event %s: %d matches", url, len(matches))
 
+    # ok_count is derived from the two failure lists rather than tracked
+    # by hand, so a future failure path that forgets to append to a list
+    # cannot silently desync the printed "ok" count from the actual
+    # complement of failed/disallowed events.
+    ok_count = len(event_urls) - len(failed_urls) - len(disallowed_urls)
     if failed_urls:
+        summary_parts = [f"{ok_count}/{len(event_urls)} events ok"]
+        summary_parts.append(
+            f"{len(failed_urls)} failed ({', '.join(failed_urls)})"
+        )
+        summary_parts.append(
+            f"{len(disallowed_urls)} disallowed by robots"
+            f"{' (' + ', '.join(disallowed_urls) + ')' if disallowed_urls else ''}"
+        )
+        summary_parts.append(f"{total_matches} total matches")
+        logger.warning("summary: %s", "; ".join(summary_parts))
+        return 1
+    if disallowed_urls:
         logger.warning(
-            "summary: %d/%d events ok, %d failed (%s); %d total matches",
+            "summary: %d/%d events ok; 0 failed; %d disallowed by robots (%s); "
+            "%d total matches",
             ok_count,
             len(event_urls),
-            len(failed_urls),
-            ", ".join(failed_urls),
+            len(disallowed_urls),
+            ", ".join(disallowed_urls),
             total_matches,
         )
-        return 1
+        return 3
     logger.info(
         "summary: all %d events ok; %d total matches", ok_count, total_matches
     )

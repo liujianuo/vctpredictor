@@ -2,6 +2,7 @@
 
 from datetime import datetime
 from pathlib import Path
+from urllib.robotparser import RobotFileParser
 
 import pytest
 from bs4 import BeautifulSoup
@@ -499,15 +500,20 @@ def test_fetch_robots_parser_parses_rules(monkeypatch):
 
     monkeypatch.setattr(vlr.requests, "get", fake_get)
     rp = vlr.fetch_robots_parser()
-    assert rp.can_fetch(vlr.USER_AGENT, "https://www.vlr.gg/forums/123/") is False
+    assert (
+        rp.can_fetch(vlr.ROBOTS_USER_AGENT, "https://www.vlr.gg/forums/123/") is False
+    )
     assert (
         rp.can_fetch(
-            vlr.USER_AGENT,
+            vlr.ROBOTS_USER_AGENT,
             "https://www.vlr.gg/event/matches/2863/vct-2026-emea-stage-1/?group=completed",
         )
         is False
     )
-    assert rp.can_fetch(vlr.USER_AGENT, "https://www.vlr.gg/712803/fut-vs-navi") is True
+    assert (
+        rp.can_fetch(vlr.ROBOTS_USER_AGENT, "https://www.vlr.gg/712803/fut-vs-navi")
+        is True
+    )
 
 
 def test_fetch_robots_parser_raises_vlr_fetch_error_on_http_error(monkeypatch):
@@ -570,3 +576,118 @@ def test_assert_allowed_with_provided_parser_does_not_fetch(monkeypatch):
     with pytest.raises(vlr.VlrRobotsError):
         vlr.assert_allowed("https://www.vlr.gg/forums/123/", rp=rp)
     assert calls["n"] == 0
+
+
+def test_fetch_robots_parser_missing_robots_txt_is_allow_all(monkeypatch):
+    # A 404 robots.txt (the site simply does not publish one — a normal,
+    # common case) must NOT abort a scrape run: by standard robots
+    # convention (and urllib.robotparser's own read()) a missing
+    # robots.txt means allow-all. fetch_robots_parser returns an empty
+    # parser whose can_fetch is True for every URL instead of raising.
+    monkeypatch.setattr(
+        vlr.requests,
+        "get",
+        lambda url, **kwargs: _FakeResponse("not found", status_code=404),
+    )
+    rp = vlr.fetch_robots_parser()
+    assert (
+        rp.can_fetch(vlr.ROBOTS_USER_AGENT, "https://www.vlr.gg/forums/123/") is True
+    )
+    assert (
+        rp.can_fetch(vlr.ROBOTS_USER_AGENT, "https://www.vlr.gg/712803/fut-vs-navi")
+        is True
+    )
+
+
+def test_fetch_robots_parser_matches_targeted_user_agent(monkeypatch):
+    # Robots rules are matched under the explicit bot token
+    # (ROBOTS_USER_AGENT), not the browser-spoofing USER_AGENT string:
+    # RobotFileParser only matches the token before the first "/", so
+    # "Mozilla/5.0 ..." would resolve to "mozilla" and never hit a
+    # targeted "User-agent: vct-predictor-scraper" block. A robots.txt
+    # with such a block must gate the scraper's token while leaving the
+    # wildcard default alone for every other agent.
+    ROBOTS_TARGETED = """\
+User-agent: *
+Disallow: /forums/
+
+User-agent: vct-predictor-scraper
+Disallow: /search/
+"""
+    monkeypatch.setattr(
+        vlr.requests, "get", lambda url, **kwargs: _FakeResponse(ROBOTS_TARGETED)
+    )
+    rp = vlr.fetch_robots_parser()
+    # The targeted block applies to our token...
+    assert (
+        rp.can_fetch(vlr.ROBOTS_USER_AGENT, "https://www.vlr.gg/search/auto")
+        is False
+    )
+    # ...while the browser UA string (were it used for matching) would
+    # fall through to the wildcard block and be allowed for /search/.
+    assert rp.can_fetch(vlr.USER_AGENT, "https://www.vlr.gg/search/auto") is True
+    # Unrelated paths stay allowed under our token (default-allow).
+    assert (
+        rp.can_fetch(vlr.ROBOTS_USER_AGENT, "https://www.vlr.gg/712803/fut-vs-navi")
+        is True
+    )
+
+
+def test_get_matches_from_event_skips_robots_disallowed_match(monkeypatch, tmp_path):
+    # The per-match robots gate (review finding): the CLI driver checks
+    # the event URL up front, but that only covers the listing page —
+    # every individual match page fetched afterward must be gated too.
+    # A match URL disallowed by robots.txt is skipped without being
+    # fetched, while the event's other matches still parse.
+    monkeypatch.setattr(cache, "DEFAULT_DB_PATH", tmp_path / "c.sqlite3")
+    monkeypatch.setattr(vlr, "POLITE_DELAY_SECONDS", 0)
+    links = vlr.parse_event_match_links(EVENT_HTML)
+    blocked_id = vlr.extract_match_id(links[0])
+    rp = RobotFileParser()
+    rp.parse(["User-agent: *", f"Disallow: /{blocked_id}/"])
+    calls = {"n": 0}
+
+    def fake_get(url, **kwargs):
+        calls["n"] += 1
+        if "event/matches" in url:
+            return _FakeResponse(EVENT_HTML)
+        return _FakeResponse(MATCH_HTML)
+
+    monkeypatch.setattr(vlr.requests, "get", fake_get)
+    matches = vlr.get_matches_from_event(EVENT_URL, robots_parser=rp)
+    assert blocked_id not in {m.match_id for m in matches}
+    assert len(matches) == len(links) - 1
+    # Event page + one fetch per non-blocked match; the blocked match is
+    # never fetched (the gate runs before any network call for it).
+    assert calls["n"] == len(matches) + 1
+
+
+def test_get_matches_from_event_skips_single_match_failure(
+    monkeypatch, tmp_path, caplog
+):
+    # One match page failing to fetch must not abort the whole event
+    # (review finding): the failure is logged as a warning, that match is
+    # skipped, and the rest of the event's matches still parse — so a
+    # partial run still counts (and caches) everything that succeeded.
+    monkeypatch.setattr(cache, "DEFAULT_DB_PATH", tmp_path / "c.sqlite3")
+    monkeypatch.setattr(vlr, "POLITE_DELAY_SECONDS", 0)
+    links = vlr.parse_event_match_links(EVENT_HTML)
+    bad_id = vlr.extract_match_id(links[0])
+    calls = {"n": 0}
+
+    def fake_get(url, **kwargs):
+        calls["n"] += 1
+        if "event/matches" in url:
+            return _FakeResponse(EVENT_HTML)
+        if bad_id in url:
+            import requests as _r
+
+            raise _r.exceptions.ConnectionError("connection refused")
+        return _FakeResponse(MATCH_HTML)
+
+    monkeypatch.setattr(vlr.requests, "get", fake_get)
+    matches = vlr.get_matches_from_event(EVENT_URL)
+    assert bad_id not in {m.match_id for m in matches}
+    assert len(matches) == len(links) - 1
+    assert "connection refused" in caplog.text
+    assert bad_id in caplog.text

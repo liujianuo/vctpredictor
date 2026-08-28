@@ -29,7 +29,7 @@ from .cache import (
     set_cached_match,
     set_cached_page,
 )
-from .models import MapResult, Match, PlayerStats, Team, VetoAction
+from .models import IllegalScoreError, MapResult, Match, PlayerStats, Team, VetoAction
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,14 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+# The token robots.txt rules are matched against. RobotFileParser matches
+# only the token before the first "/" in the agent string it is given, so
+# passing USER_AGENT ("Mozilla/5.0 ...") would silently resolve to
+# "mozilla" and never hit a targeted "User-agent: <botname>" block. The
+# actual HTTP requests keep the browser UA (USER_AGENT) so vlr.gg's edge
+# layer treats them as ordinary browsing; robots permission is judged
+# under this explicit bot token instead.
+ROBOTS_USER_AGENT = "vct-predictor-scraper"
 REQUEST_TIMEOUT = 15
 # Delay between consecutive uncached match fetches, to be polite to vlr.gg.
 POLITE_DELAY_SECONDS = 1.0
@@ -638,6 +646,65 @@ def _parse_veto_note(note_text: str) -> List[VetoAction]:
 # --------------------------------------------------------------------------
 
 
+def _http_get(url: str) -> requests.Response:
+    """GET ``url`` over HTTP with the standard UA header and timeout.
+
+    Shared by :func:`fetch_page` and :func:`fetch_robots_parser` so the
+    two fetches cannot drift apart in transport-level behavior (header,
+    timeout, network-error conversion). Deliberately does *not* call
+    ``raise_for_status``: status handling differs per caller
+    (``fetch_page`` treats any non-2xx as fatal;
+    ``fetch_robots_parser`` treats 404 as allow-all and any other
+    non-2xx as fatal), so that part stays with the callers via
+    :func:`_raise_for_status`.
+
+    Args:
+        url: The absolute URL to GET.
+
+    Returns:
+        The raw :class:`requests.Response` (status not yet checked).
+
+    Raises:
+        VlrFetchError: If the HTTP request fails at the transport level
+            (network error or timeout — anything
+            ``requests.RequestException`` covers before status
+            checking). Non-2xx status codes are not converted here; see
+            :func:`_raise_for_status`.
+    """
+    try:
+        return requests.get(
+            url, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT
+        )
+    except requests.RequestException as exc:
+        raise VlrFetchError(f"failed to fetch {url}: {exc}") from exc
+
+
+def _raise_for_status(resp: requests.Response, url: str) -> None:
+    """Raise :class:`VlrFetchError` if ``resp``'s status is not 2xx.
+
+    Thin shared wrapper over ``requests.Response.raise_for_status`` used
+    by both :func:`fetch_page` and :func:`fetch_robots_parser`, so the
+    status-code-to-``VlrFetchError`` conversion (and its error-message
+    shape) lives in exactly one place.
+
+    Args:
+        resp: The response whose status is being checked.
+        url: The URL that was fetched, embedded in the error message to
+            keep it identifiable.
+
+    Returns:
+        Nothing; returns normally for 2xx responses.
+
+    Raises:
+        VlrFetchError: If ``resp.raise_for_status()`` raises (a non-2xx
+            status, e.g. 404 or 500).
+    """
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        raise VlrFetchError(f"failed to fetch {url}: {exc}") from exc
+
+
 def fetch_page(url: str, use_cache: bool = True, force_refresh: bool = False) -> str:
     """Return the HTML of ``url``, using the local page cache.
 
@@ -667,13 +734,8 @@ def fetch_page(url: str, use_cache: bool = True, force_refresh: bool = False) ->
         cached = get_cached_page(url)
         if cached is not None:
             return cached
-    try:
-        resp = requests.get(
-            url, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT
-        )
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        raise VlrFetchError(f"failed to fetch {url}: {exc}") from exc
+    resp = _http_get(url)
+    _raise_for_status(resp, url)
     html = resp.text
     if use_cache:
         set_cached_page(url, html)
@@ -689,36 +751,51 @@ def fetch_page(url: str, use_cache: bool = True, force_refresh: bool = False) ->
 # into fetch_page itself would fetch robots.txt on every cache miss and break
 # the exact ``requests.get`` call-count assertions in tests/test_vlr.py, plus
 # raise a recursion question (checking robots permission to fetch robots.txt).
-# These two functions are the reusable primitives; only the CLI driver calls
-# them.
+# These are the reusable primitives: the CLI driver checks each event URL up
+# front, and get_matches_from_event gates every individual match page against
+# the same parser when one is passed in.
 
 
 def fetch_robots_parser() -> RobotFileParser:
     """Fetch vlr.gg's robots.txt and return a parsed ``RobotFileParser``.
 
-    Fetches ``ROBOTS_URL`` over HTTP with ``requests.get`` (the same
-    mockable call path the other fetch functions use) rather than through
-    :func:`fetch_page`, so the robots fetch never touches the page cache
-    and never affects any existing fetch-page call-count assertion. The
-    response body is fed to a fresh :class:`RobotFileParser` via
-    :meth:`RobotFileParser.parse`, which populates its allow/disallow
-    rules for subsequent :meth:`RobotFileParser.can_fetch` checks.
+    Fetches ``ROBOTS_URL`` over HTTP (via :func:`_http_get`) rather than
+    through :func:`fetch_page`, so the robots fetch never touches the
+    page cache and never affects any existing fetch-page call-count
+    assertion. The response body is fed to a fresh
+    :class:`RobotFileParser` via :meth:`RobotFileParser.parse`, which
+    populates its allow/disallow rules for subsequent
+    :meth:`RobotFileParser.can_fetch` checks. Rules are matched under
+    ``ROBOTS_USER_AGENT``, the scraper's explicit bot token.
+
+    A missing robots.txt (HTTP 404) is *not* a fatal condition: by
+    standard robots-exclusion convention (and
+    ``urllib.robotparser.RobotFileParser.read``'s own behavior) a site
+    with no robots.txt allows everything, so an empty parser whose
+    ``can_fetch`` always returns ``True`` is returned instead of raising
+    — a site that simply does not publish a robots.txt must not make the
+    whole scrape run abort.
 
     Returns:
-        A parsed :class:`RobotFileParser` for vlr.gg's robots.txt.
+        A parsed :class:`RobotFileParser` for vlr.gg's robots.txt; an
+        empty (allow-all) parser when vlr.gg returns 404.
 
     Raises:
-        VlrFetchError: If the HTTP request fails (network error, timeout,
-            or non-2xx status via ``raise_for_status``) — the same
+        VlrFetchError: If the HTTP request fails (network error,
+            timeout, or a non-2xx status other than 404) — the same
             conversion :func:`fetch_page` applies.
     """
-    try:
-        resp = requests.get(
-            ROBOTS_URL, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT
-        )
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        raise VlrFetchError(f"failed to fetch {ROBOTS_URL}: {exc}") from exc
+    resp = _http_get(ROBOTS_URL)
+    if resp.status_code == 404:
+        # No robots.txt published: allow-all, not an error. The empty
+        # parser must still be *parsed* (parse([]) sets last_checked):
+        # an unparsed RobotFileParser conservatively denies everything
+        # (mirroring urllib.robotparser's own read(), which treats a 404
+        # as allow-all).
+        parser = RobotFileParser()
+        parser.parse([])
+        return parser
+    _raise_for_status(resp, ROBOTS_URL)
     parser = RobotFileParser()
     parser.parse(resp.text.splitlines())
     return parser
@@ -744,19 +821,24 @@ def assert_allowed(url: str, rp: Optional[RobotFileParser] = None) -> None:
             :func:`fetch_robots_parser` (see Raises).
 
     Returns:
-        Nothing; returns normally when ``rp.can_fetch(USER_AGENT, url)``
-        is ``True`` (including the default-allow case where the robots
-        file has no rule matching the URL).
+        Nothing; returns normally when
+        ``rp.can_fetch(ROBOTS_USER_AGENT, url)`` is ``True`` (including
+        the default-allow case where the robots file has no rule matching
+        the URL). Robots rules are matched under ``ROBOTS_USER_AGENT``,
+        the scraper's explicit bot token, rather than the browser-
+        spoofing ``USER_AGENT`` string: ``RobotFileParser`` only matches
+        the token before the first ``/``, so a targeted
+        ``User-agent: <botname>`` block could never match ``Mozilla/...``.
 
     Raises:
-        VlrRobotsError: If ``rp.can_fetch(USER_AGENT, url)`` is
+        VlrRobotsError: If ``rp.can_fetch(ROBOTS_USER_AGENT, url)`` is
             ``False`` — the URL is disallowed and must not be fetched.
         VlrFetchError: If ``rp`` was ``None`` and the robots.txt fetch
             itself failed (propagated from :func:`fetch_robots_parser`).
     """
     if rp is None:
         rp = fetch_robots_parser()
-    if not rp.can_fetch(USER_AGENT, url):
+    if not rp.can_fetch(ROBOTS_USER_AGENT, url):
         raise VlrRobotsError(f"robots.txt disallows fetching {url}")
 
 
@@ -1008,15 +1090,32 @@ def get_match(url: str, use_cache: bool = True) -> Match:
     return match
 
 
-def get_matches_from_event(event_url: str, use_cache: bool = True) -> List[Match]:
+def get_matches_from_event(
+    event_url: str,
+    use_cache: bool = True,
+    robots_parser: Optional[RobotFileParser] = None,
+) -> List[Match]:
     """Fetch (or load from cache) every match listed on an event page.
 
     Fetches the event page, extracts its match links
     (:func:`parse_event_match_links`), then fetches/parses each match
     in page order (:func:`get_match`). A small delay
     (``POLITE_DELAY_SECONDS``) is inserted between consecutive
-    *uncached* match fetches to be polite to vlr.gg; cached matches
-    incur no delay.
+    *uncached* match fetch attempts to be polite to vlr.gg; cached
+    matches incur no delay. Two per-match gates sit between the event
+    page and each match fetch:
+
+    - When ``robots_parser`` is given, every match URL is checked with
+      :func:`assert_allowed` first and a disallowed match is logged and
+      skipped. (The CLI driver checks the event URL up front, but that
+      only covers the listing page; without this per-match gate the
+      majority of the requests this function makes would go out with
+      zero permission check.)
+    - A match that fails to fetch or parse (``VlrFetchError`` /
+      ``VlrParseError`` / ``IllegalScoreError``) is logged and skipped
+      rather than aborting the whole event, so matches already parsed
+      and durably cached before the failure still count in the caller's
+      run summary.
 
     Args:
         event_url: The vlr.gg event matches page URL.
@@ -1026,25 +1125,34 @@ def get_matches_from_event(event_url: str, use_cache: bool = True) -> List[Match
             fresh and never touch either cache (and every match fetch
             is treated as uncached, so the polite delay applies
             between all of them).
+        robots_parser: An already-parsed :class:`RobotFileParser`
+            (normally the one ``scrape.main`` fetched once up front)
+            to gate every match URL with before fetching it. ``None``
+            (the default) performs no per-match robots check, keeping
+            the function's existing behavior for callers that do not
+            run under the robots gate.
 
     Returns:
         A list of parsed :class:`scraper.models.Match` objects, one
-        per match link found on the event page, in page order.
+        per match link found on the event page that was not skipped,
+        in page order. Matches skipped by the robots gate or by a
+        per-match fetch/parse failure are not included (each skip is
+        logged as a warning).
 
     Raises:
-        VlrFetchError: If fetching the event page or any match page
-            over HTTP fails.
-        VlrParseError: If the event page or any match page is missing
-            expected structure. Unrecognized veto-note phrasing does
-            not raise here — ``parse_match`` catches it, logs a
-            warning, and leaves that match's ``veto_actions`` empty —
-            so a single match's veto note can never discard the other
-            matches already parsed from the event.
-        IllegalScoreError: If a cached row for any match deserializes
-            to an illegal final map score (propagated from
-            :func:`cache.get_cached_match`, either directly or via
-            :func:`get_match`; a ``ValueError`` subclass, so callers
-            catching ``ValueError`` still see it).
+        VlrFetchError: If fetching the *event page* over HTTP fails.
+            Per-match fetch failures no longer raise here: they are
+            logged and the match is skipped.
+        VlrParseError: If the event page is missing expected structure.
+            Unrecognized veto-note phrasing does not raise —
+            ``parse_match`` catches it, logs a warning, and leaves that
+            match's ``veto_actions`` empty — so a single match's veto
+            note can never discard the other matches already parsed
+            from the event.
+        IllegalScoreError: No longer raised from a per-match failure
+            (caught, logged, and skipped like the other two); it can
+            still escape :func:`get_match` when that function is called
+            directly.
     """
     html = fetch_page(event_url, use_cache=use_cache)
     links = parse_event_match_links(html)
@@ -1052,11 +1160,25 @@ def get_matches_from_event(event_url: str, use_cache: bool = True) -> List[Match
     fetched = False
     for link in links:
         url = link if link.startswith("http") else BASE_URL + link
+        if robots_parser is not None:
+            try:
+                assert_allowed(url, robots_parser)
+            except VlrRobotsError as exc:
+                logger.warning(
+                    "robots.txt disallows match %s: %s; skipping", url, exc
+                )
+                continue
         if use_cache and get_cached_match(extract_match_id(url)) is not None:
             matches.append(get_match(url, use_cache=True))
             continue
         if fetched:
             time.sleep(POLITE_DELAY_SECONDS)
-        matches.append(get_match(url, use_cache=use_cache))
         fetched = True
+        try:
+            matches.append(get_match(url, use_cache=use_cache))
+        except (VlrFetchError, VlrParseError, IllegalScoreError) as exc:
+            # One bad match must not discard the matches already
+            # parsed/cached for this event: log and move on, so a
+            # partial run's summary still counts what succeeded.
+            logger.warning("match %s failed: %s; skipping", url, exc)
     return matches
