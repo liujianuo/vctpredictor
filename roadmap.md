@@ -63,7 +63,7 @@ exact action sequence. Mitigates the veto-format-variation risk.
 - Size: **S**
 - Depends on: M3
 
-### M5. Player-map stats parser
+### M5. Player-map stats parser [x]
 Populate `PlayerStats` per player per map (ACS, K/D/A, ADR, KAST, FKPR, FDPR,
 HS%, agent) plus `MapResult.agent_picks`.
 - Size: **M**
