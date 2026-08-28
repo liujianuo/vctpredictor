@@ -75,6 +75,26 @@ def test_module_level_active_matches_real_config():
     assert config.ACTIVE.active_era.name == "2026-abyss"
 
 
+def test_active_is_lazy_and_cached(monkeypatch):
+    # ACTIVE must not be computed at import time: a corrupt config.json
+    # would otherwise abort `import config` and break collection of this
+    # very test file. It should load once, on first access, then cache.
+    calls = []
+    real_load = config.load_config
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(config, "load_config", counting)
+    monkeypatch.setattr(config, "_ACTIVE", None)
+
+    assert config.ACTIVE.region == "emea"
+    assert len(calls) == 1
+    assert config.ACTIVE.region == "emea"
+    assert len(calls) == 1
+
+
 def test_real_config_has_four_eras_and_rotation():
     # The v1 window (Stage 1 + Stage 2) straddles real pool rotations;
     # each era must exist so every match date resolves to its pool.
@@ -187,6 +207,26 @@ def test_error_duplicate_map_after_normalisation(tmp_path):
         load_config(write_json(tmp_path, data))
 
 
+def test_error_non_string_map_pool_entry(tmp_path):
+    # A stray null from a trailing comma must not be coerced into a pool
+    # containing a phantom map named "None".
+    data = base_config_data()
+    data["eras"][1]["map_pool"] = [
+        "Abyss", None, "Ascent", "Haven", "Lotus", "Split", "Summit"
+    ]
+    with pytest.raises(ConfigError, match="must be a string"):
+        load_config(write_json(tmp_path, data))
+
+
+def test_error_nested_list_map_pool_entry(tmp_path):
+    data = base_config_data()
+    data["eras"][1]["map_pool"] = [
+        "Abyss", ["Ascent"], "Haven", "Lotus", "Split", "Summit", "Sunset"
+    ]
+    with pytest.raises(ConfigError, match="must be a string"):
+        load_config(write_json(tmp_path, data))
+
+
 def test_error_empty_map_pool(tmp_path):
     data = base_config_data()
     data["eras"][0]["map_pool"] = []
@@ -222,7 +262,19 @@ def test_error_overlapping_eras(tmp_path):
         load_config(write_json(tmp_path, data))
 
 
+def test_error_gap_between_eras(tmp_path):
+    # A hole between era windows must fail at load time, not later when a
+    # match date lands in it and era_as_of has no answer.
+    data = base_config_data()
+    data["eras"][1]["start"] = "2026-07-20"  # previous era ends 2026-07-15
+    with pytest.raises(ConfigError, match="gap"):
+        load_config(write_json(tmp_path, data))
+
+
 def test_error_two_open_ended_eras(tmp_path):
+    # Rule 4: at most one era open-ended. Caught by the ordering rule — the
+    # first open-ended era is not last, so its window would swallow the
+    # following one.
     data = base_config_data()
     data["eras"][0]["end"] = None
     with pytest.raises(ConfigError, match="open-ended"):
@@ -236,6 +288,22 @@ def test_error_active_era_unknown(tmp_path):
         load_config(write_json(tmp_path, data))
 
 
+def test_error_active_era_not_current(tmp_path):
+    # active_era must cover today, not merely name an existing era: a stale
+    # pointer would silently answer from a retired pool after a rotation.
+    data = base_config_data()
+    data["active_era"] = "2026-s1"  # past era; 2026-abyss covers today
+    with pytest.raises(ConfigError, match="does not cover today"):
+        load_config(write_json(tmp_path, data))
+
+
+def test_error_no_era_covers_today(tmp_path):
+    data = base_config_data()
+    data["eras"][1]["end"] = "2026-08-01"  # bounded in the past; today uncovered
+    with pytest.raises(ConfigError, match="today"):
+        load_config(write_json(tmp_path, data))
+
+
 def test_error_event_urls_empty(tmp_path):
     data = base_config_data()
     data["event_urls"] = []
@@ -246,6 +314,23 @@ def test_error_event_urls_empty(tmp_path):
 def test_error_event_url_not_vlr(tmp_path):
     data = base_config_data()
     data["event_urls"] = ["https://example.com/event/matches/1/foo"]
+    with pytest.raises(ConfigError, match="vlr.gg"):
+        load_config(write_json(tmp_path, data))
+
+
+def test_error_duplicate_event_url(tmp_path):
+    data = base_config_data()
+    url = "https://www.vlr.gg/event/matches/2976/vct-2026-emea-stage-2/?group=completed"
+    data["event_urls"] = [url, url]
+    with pytest.raises(ConfigError, match="duplicate event_urls"):
+        load_config(write_json(tmp_path, data))
+
+
+def test_error_event_url_substring_not_enough(tmp_path):
+    # "/event/" anywhere in the string is not enough — the URL must start
+    # with the https://www.vlr.gg/event/ prefix.
+    data = base_config_data()
+    data["event_urls"] = ["https://www.vlr.gg/eventmatches/../event/x"]
     with pytest.raises(ConfigError, match="vlr.gg"):
         load_config(write_json(tmp_path, data))
 

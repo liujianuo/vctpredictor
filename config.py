@@ -83,6 +83,11 @@ def _normalize_pool(pool, era_name: str) -> tuple[str, ...]:
     seen: set[str] = set()
     normalized = []
     for entry in pool:
+        if not isinstance(entry, str):
+            raise ConfigError(
+                f"era {era_name!r}: map_pool entry must be a string, "
+                f"got {type(entry).__name__}: {entry!r}"
+            )
         name = normalize_map_name(entry)
         if not name:
             raise ConfigError(
@@ -213,7 +218,10 @@ def load_config(path: _PATH_T = None) -> Config:
 
         eras.append(Era(name=name, start=start, end=end, map_pool=pool))
 
-    # Rule 4: windows do not overlap; at most one era is open-ended.
+    # Rule 4: windows do not overlap and are contiguous (no gaps); at most
+    # one era is open-ended — which follows from the loop below, since an
+    # open-ended era that is not last would swallow the following era, and
+    # the eras are sorted, so at most one can be last.
     eras.sort(key=lambda e: e.start)
     for prev, cur in zip(eras, eras[1:]):
         if prev.end is None:
@@ -226,8 +234,11 @@ def load_config(path: _PATH_T = None) -> Config:
                 f"era windows overlap: {prev.name!r} [{prev.start.isoformat()}, "
                 f"{prev.end.isoformat()}) vs {cur.name!r} [{cur.start.isoformat()}, ...)"
             )
-    if len([e for e in eras if e.end is None]) > 1:
-        raise ConfigError("at most one era may be open-ended (end: null)")
+        if cur.start > prev.end:
+            raise ConfigError(
+                f"era windows have a gap: {prev.name!r} ends {prev.end.isoformat()} "
+                f"but {cur.name!r} starts {cur.start.isoformat()}"
+            )
 
     # Rule 5: active_era names an era that exists.
     active_name = raw["active_era"]
@@ -240,21 +251,40 @@ def load_config(path: _PATH_T = None) -> Config:
             f"{[e.name for e in eras]}"
         )
 
+    # Rule 5 (cont.): active_era must be the era covering today, so a
+    # rotation that appends a new era without bumping active_era fails at
+    # load time instead of silently serving the retired pool.
+    today = date.today()
+    covering_today = next(
+        (e for e in eras if e.start <= today and (e.end is None or today < e.end)),
+        None,
+    )
+    if covering_today is None:
+        raise ConfigError(
+            f"no era covers today ({today.isoformat()}); eras are stale: "
+            f"{[e.name for e in eras]}"
+        )
+    if active is not covering_today:
+        raise ConfigError(
+            f"active_era {active_name!r} does not cover today "
+            f"({today.isoformat()}); the era covering today is {covering_today.name!r}"
+        )
+
     # Rule 6: non-empty event_urls, all absolute vlr.gg URLs with /event/.
     urls = raw["event_urls"]
     if not isinstance(urls, list) or len(urls) == 0:
         raise ConfigError("event_urls must be a non-empty list")
     event_urls: list[str] = []
+    seen_urls: set[str] = set()
     for u in urls:
-        if (
-            not isinstance(u, str)
-            or not u.startswith("https://www.vlr.gg/")
-            or "/event/" not in u
-        ):
+        if not isinstance(u, str) or not u.startswith("https://www.vlr.gg/event/"):
             raise ConfigError(
-                "event_urls entry must be an absolute vlr.gg URL containing "
-                f"/event/: {u!r}"
+                "event_urls entry must be an absolute vlr.gg event URL "
+                f"starting with https://www.vlr.gg/event/: {u!r}"
             )
+        if u in seen_urls:
+            raise ConfigError(f"duplicate event_urls entry: {u!r}")
+        seen_urls.add(u)
         event_urls.append(u)
 
     return Config(
@@ -266,4 +296,19 @@ def load_config(path: _PATH_T = None) -> Config:
 
 
 # Module-level convenience: from config import ACTIVE
-ACTIVE = load_config()
+#
+# Lazy on purpose (PEP 562 module __getattr__): an eager load would make a
+# bad config.json abort ``import config`` — and with it pytest collection
+# of tests/test_config.py, the very tests written to assert that invalid
+# configs raise cleanly. The ConfigError instead surfaces on first ACTIVE
+# *use*, still "at load time" from any consumer's point of view.
+_ACTIVE: Optional[Config] = None
+
+
+def __getattr__(name: str) -> Config:
+    if name == "ACTIVE":
+        global _ACTIVE
+        if _ACTIVE is None:
+            _ACTIVE = load_config()
+        return _ACTIVE
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
