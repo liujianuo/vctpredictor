@@ -57,7 +57,7 @@ unrecognised phrasing rather than skipping the action.
 - Size: **M**
 - Depends on: —
 
-### M4. Veto parser fixture suite
+### M4. Veto parser fixture suite [x]
 Fixtures covering Bo1/Bo3/Bo5 veto formats and phrasing variants, asserting the
 exact action sequence. Mitigates the veto-format-variation risk.
 - Size: **S**
