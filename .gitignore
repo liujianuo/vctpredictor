@@ -7,6 +7,10 @@ plan.md
 review.md
 status.md
 roadmap.md
+description.txt
+/tasks
+/.ruff_cache
+run-loop.sh
 
 # local cache (SQLite DB files)
 cache/
