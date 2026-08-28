@@ -1,0 +1,16 @@
+status/
+AGENTS.md
+CLAUDE.md
+.env
+.envrc
+plan.md
+review.md
+status.md
+
+# local cache (SQLite DB files)
+cache/
+
+# python artifacts
+__pycache__/
+*.pyc
+.pytest_cache/
