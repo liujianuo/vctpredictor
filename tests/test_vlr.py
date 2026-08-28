@@ -518,9 +518,10 @@ def test_fetch_robots_parser_parses_rules(monkeypatch):
 
 
 def test_fetch_robots_parser_raises_vlr_fetch_error_on_http_error(monkeypatch):
-    # A non-2xx robots.txt response must surface as VlrFetchError, the
-    # same conversion fetch_page applies, so the CLI driver can abort the
-    # run on it.
+    # A 5xx robots.txt response must surface as VlrFetchError, the same
+    # conversion fetch_page applies, so the CLI driver can abort the run
+    # on it (4xx statuses are mapped to allow/disallow-all parsers
+    # instead, mirroring RobotFileParser.read() — see the tests below).
     monkeypatch.setattr(
         vlr.requests,
         "get",
@@ -598,6 +599,46 @@ def test_fetch_robots_parser_missing_robots_txt_is_allow_all(monkeypatch):
         rp.can_fetch(vlr.ROBOTS_USER_AGENT, "https://www.vlr.gg/712803/fut-vs-navi")
         is True
     )
+
+
+def test_fetch_robots_parser_401_403_is_disallow_all(monkeypatch):
+    # 401/403 (the file exists but we may not read it) mirror
+    # RobotFileParser.read()'s disallow-all handling: can_fetch must
+    # return False for every URL rather than raising, so a
+    # WAF/bot-detection 403 on the robots endpoint cannot abort the
+    # whole scrape run.
+    for status in (401, 403):
+        monkeypatch.setattr(
+            vlr.requests,
+            "get",
+            lambda url, status=status, **kwargs: _FakeResponse(
+                "denied", status_code=status
+            ),
+        )
+        rp = vlr.fetch_robots_parser()
+        assert (
+            rp.can_fetch(vlr.ROBOTS_USER_AGENT, "https://www.vlr.gg/712803/fut-vs-navi")
+            is False
+        )
+        assert rp.can_fetch(vlr.ROBOTS_USER_AGENT, "https://www.vlr.gg/forums/123/") is False
+
+
+def test_fetch_robots_parser_other_4xx_is_allow_all(monkeypatch):
+    # Any other 4xx (429 rate-limited, 410 gone, ...) mirrors read()'s
+    # allow-all handling: a transient rate-limit response for the robots
+    # endpoint must not abort the run while the event/match pages may
+    # still be perfectly fetchable.
+    monkeypatch.setattr(
+        vlr.requests,
+        "get",
+        lambda url, **kwargs: _FakeResponse("slow down", status_code=429),
+    )
+    rp = vlr.fetch_robots_parser()
+    assert (
+        rp.can_fetch(vlr.ROBOTS_USER_AGENT, "https://www.vlr.gg/712803/fut-vs-navi")
+        is True
+    )
+    assert rp.can_fetch(vlr.ROBOTS_USER_AGENT, "https://www.vlr.gg/forums/123/") is True
 
 
 def test_fetch_robots_parser_matches_targeted_user_agent(monkeypatch):

@@ -87,6 +87,70 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _build_summary(
+    ok_count: int,
+    total_events: int,
+    failed_urls: Sequence[str],
+    disallowed_urls: Sequence[str],
+    total_matches: int,
+) -> str:
+    """Build the one-line run summary shared by every exit path of main.
+
+    The three summary branches in :func:`main` (all events ok; at least
+    one failed event; no failures but some robots-disallowed events) all
+    funnel through this single builder so the wording and count
+    formatting live in exactly one place — a future change to the
+    summary (e.g. adding a counted category) cannot silently drift
+    between independently-formatted branches.
+
+    Args:
+        ok_count: Number of events processed successfully (derived by
+            the caller as the complement of ``failed_urls`` and
+            ``disallowed_urls`` over ``total_events``).
+        total_events: Number of configured event URLs for the run.
+        failed_urls: URLs of events that failed with a fetch/parse
+            error. Rendered as a parenthesized list when non-empty; when
+            empty but ``disallowed_urls`` is non-empty, rendered as
+            ``0 failed`` so the summary stays explicit about both
+            counters; omitted entirely when both lists are empty.
+        disallowed_urls: URLs of events skipped because robots.txt
+            disallows them. Rendered as a parenthesized list when
+            non-empty; when empty but ``failed_urls`` is non-empty,
+            rendered as ``0 disallowed by robots`` so the summary never
+            looks like a robots stop was silently swallowed by the
+            failure list; omitted entirely when both lists are empty.
+        total_matches: Total number of matches scraped across all
+            succeeded events.
+
+    Returns:
+        The formatted summary string, e.g. ``"2/3 events ok; 1 failed
+        (http://...); 0 disallowed by robots; 98 total matches"``.
+
+    Raises:
+        Nothing; pure string formatting.
+    """
+    parts = [f"{ok_count}/{total_events} events ok"]
+    if failed_urls:
+        parts.append(f"{len(failed_urls)} failed ({', '.join(failed_urls)})")
+    elif disallowed_urls:
+        # No failures but robots stops happened: say "0 failed"
+        # explicitly so the summary never looks like the failed count
+        # was simply forgotten.
+        parts.append("0 failed")
+    if disallowed_urls:
+        parts.append(
+            f"{len(disallowed_urls)} disallowed by robots"
+            f" ({', '.join(disallowed_urls)})"
+        )
+    elif failed_urls:
+        # No robots stops but genuine failures happened: say "0
+        # disallowed by robots" explicitly so the summary never looks
+        # like a robots stop was silently swallowed by the failure list.
+        parts.append("0 disallowed by robots")
+    parts.append(f"{total_matches} total matches")
+    return "; ".join(parts)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Run the scrape driver end to end.
 
@@ -182,32 +246,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # cannot silently desync the printed "ok" count from the actual
     # complement of failed/disallowed events.
     ok_count = len(event_urls) - len(failed_urls) - len(disallowed_urls)
+    summary = _build_summary(
+        ok_count, len(event_urls), failed_urls, disallowed_urls, total_matches
+    )
     if failed_urls:
-        summary_parts = [f"{ok_count}/{len(event_urls)} events ok"]
-        summary_parts.append(
-            f"{len(failed_urls)} failed ({', '.join(failed_urls)})"
-        )
-        summary_parts.append(
-            f"{len(disallowed_urls)} disallowed by robots"
-            f"{' (' + ', '.join(disallowed_urls) + ')' if disallowed_urls else ''}"
-        )
-        summary_parts.append(f"{total_matches} total matches")
-        logger.warning("summary: %s", "; ".join(summary_parts))
+        logger.warning("summary: %s", summary)
         return 1
     if disallowed_urls:
-        logger.warning(
-            "summary: %d/%d events ok; 0 failed; %d disallowed by robots (%s); "
-            "%d total matches",
-            ok_count,
-            len(event_urls),
-            len(disallowed_urls),
-            ", ".join(disallowed_urls),
-            total_matches,
-        )
+        logger.warning("summary: %s", summary)
         return 3
-    logger.info(
-        "summary: all %d events ok; %d total matches", ok_count, total_matches
-    )
+    logger.info("summary: %s", summary)
     return 0
 
 

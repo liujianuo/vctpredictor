@@ -673,8 +673,9 @@ def _http_get(url: str) -> requests.Response:
     timeout, network-error conversion). Deliberately does *not* call
     ``raise_for_status``: status handling differs per caller
     (``fetch_page`` treats any non-2xx as fatal;
-    ``fetch_robots_parser`` treats 404 as allow-all and any other
-    non-2xx as fatal), so that part stays with the callers via
+    ``fetch_robots_parser`` maps 4xx responses to allow-all/disallow-all
+    parsers per ``RobotFileParser.read``'s convention and treats only
+    5xx as fatal), so that part stays with the callers via
     :func:`_raise_for_status`.
 
     Args:
@@ -787,22 +788,38 @@ def fetch_robots_parser() -> RobotFileParser:
     :meth:`RobotFileParser.can_fetch` checks. Rules are matched under
     ``ROBOTS_USER_AGENT``, the scraper's explicit bot token.
 
-    A missing robots.txt (HTTP 404) is *not* a fatal condition: by
-    standard robots-exclusion convention (and
-    ``urllib.robotparser.RobotFileParser.read``'s own behavior) a site
-    with no robots.txt allows everything, so an empty parser whose
-    ``can_fetch`` always returns ``True`` is returned instead of raising
-    — a site that simply does not publish a robots.txt must not make the
-    whole scrape run abort.
+    Status handling mirrors ``urllib.robotparser.RobotFileParser.read``
+    (verified against the CPython source):
+
+    - ``2xx``: the body is parsed into rules normally.
+    - ``404`` (no robots.txt published): allow-all — an empty parser
+      whose ``can_fetch`` always returns ``True``. A site that simply
+      does not publish a robots.txt must not make the whole scrape run
+      abort; the empty parser is still *parsed* (``parse([])`` sets
+      ``last_checked``), since an unparsed ``RobotFileParser``
+      conservatively denies everything.
+    - ``401``/``403`` (the file exists but we may not read it):
+      disallow-all — a parser whose ``can_fetch`` always returns
+      ``False``, matching ``read()``'s handling of these statuses
+      rather than aborting the run.
+    - Any other ``4xx`` (e.g. ``429`` rate-limited): allow-all, again
+      matching ``read()``: a transient rate-limit or WAF response on
+      the robots endpoint must not abort the run while the event/match
+      pages may still be perfectly fetchable.
+    - ``5xx``/network failure: fatal (``VlrFetchError``) — deliberately
+      stricter than ``read()``, which silently disallow-alls on a 5xx;
+      a server error on the robots endpoint fails loudly rather than
+      silently skipping every event with a misleading "robots.txt
+      disallows" message.
 
     Returns:
         A parsed :class:`RobotFileParser` for vlr.gg's robots.txt; an
-        empty (allow-all) parser when vlr.gg returns 404.
+        allow-all parser for ``404``/other ``4xx``; a disallow-all
+        parser for ``401``/``403``.
 
     Raises:
-        VlrFetchError: If the HTTP request fails (network error,
-            timeout, or a non-2xx status other than 404) — the same
-            conversion :func:`fetch_page` applies.
+        VlrFetchError: If the HTTP request fails at the transport level
+            (network error or timeout), or the response is ``5xx``.
     """
     resp = _http_get(ROBOTS_URL)
     if resp.status_code == 404:
@@ -814,6 +831,26 @@ def fetch_robots_parser() -> RobotFileParser:
         parser = RobotFileParser()
         parser.parse([])
         return parser
+    if resp.status_code in (401, 403):
+        # The file exists but we may not read it: read() maps these to
+        # disallow-all (can_fetch always False) rather than raising, so
+        # a WAF/bot-detection 403 on the robots endpoint cannot abort
+        # the whole run. can_fetch checks disallow_all first, before any
+        # rule matching, so no parse() call is needed.
+        parser = RobotFileParser()
+        parser.disallow_all = True
+        return parser
+    if 400 <= resp.status_code < 500:
+        # Any other 4xx (429 rate-limited, 410 gone, ...): read() maps
+        # these to allow-all, same as a missing file. A rate-limit
+        # response for the robots endpoint must not abort the run while
+        # the event/match pages may still be fetchable.
+        parser = RobotFileParser()
+        parser.parse([])
+        return parser
+    # 2xx: parse the body. 5xx: fatal — see the docstring's status table
+    # for why this is deliberately stricter than read()'s silent
+    # disallow-all.
     _raise_for_status(resp, ROBOTS_URL)
     parser = RobotFileParser()
     parser.parse(resp.text.splitlines())

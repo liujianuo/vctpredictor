@@ -174,7 +174,7 @@ def test_main_happy_path(monkeypatch, caplog):
     assert scrape.main([]) == 0
     assert [url for url, _ in calls] == list(EVENT_URLS)
     assert all(use_cache for _, use_cache in calls)
-    assert "all 2 events ok" in caplog.text
+    assert "2/2 events ok" in caplog.text
     assert "2 total matches" in caplog.text
 
 
@@ -267,6 +267,28 @@ def test_main_no_cache_forwards_use_cache_false(monkeypatch, caplog):
     monkeypatch.setattr(scrape.vlr, "get_matches_from_event", _FakeScraper(calls))
     assert scrape.main(["--no-cache"]) == 0
     assert calls == [(EVENT_URLS[0], False), (EVENT_URLS[1], False)]
+
+
+def test_build_summary_single_format_across_branches():
+    # Round-4 review finding regression: all three summary branches must
+    # share one builder so the wording cannot drift (the disallowed-only
+    # branch used to hard-code "0 failed" with different formatting from
+    # the failed branch's list-based builder). The builder is the single
+    # source of truth for every summary line main() emits.
+    assert (
+        scrape._build_summary(2, 3, [], [], 98)
+        == "2/3 events ok; 98 total matches"
+    )
+    assert (
+        scrape._build_summary(2, 3, ["http://e1"], [], 98)
+        == "2/3 events ok; 1 failed (http://e1); 0 disallowed by robots; "
+        "98 total matches"
+    )
+    assert (
+        scrape._build_summary(2, 3, [], ["http://e2"], 98)
+        == "2/3 events ok; 0 failed; 1 disallowed by robots (http://e2); "
+        "98 total matches"
+    )
 
 
 # --------------------------------------------------------------------------
