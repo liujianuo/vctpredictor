@@ -252,10 +252,13 @@ def test_first_half_sum_mismatch_raises_illegal_score_error():
     # render it: a combined first half of 7+7=14 is impossible. The
     # map must be finished (scores + winner set) for the invariant to
     # run — it never fires on live/unfinished maps (review finding 1:
-    # a live map's partial counts legitimately violate it). The 13-10
-    # scoreline itself is valid, so the half-split data is the only
-    # violation, and the half-split check runs before the score
-    # checks, so the message names the first-half invariant.
+    # a live map's partial counts legitimately violate it). Both
+    # teams' half-split data is filled in full and atk+def is kept
+    # consistent with first+second for each team, so the completeness
+    # and cross-pair checks pass cleanly and the first-half sum is the
+    # only violation; the 13-10 scoreline itself is valid too, and the
+    # half-split check runs before the score checks, so the message
+    # names the first-half invariant.
     with pytest.raises(IllegalScoreError) as excinfo:
         MapResult(
             map_name="Ascent",
@@ -263,7 +266,13 @@ def test_first_half_sum_mismatch_raises_illegal_score_error():
             team2_score=10,
             winner="Team A",
             team1_first_half_rounds=7,
+            team1_second_half_rounds=3,
+            team1_atk_rounds=7,
+            team1_def_rounds=3,
             team2_first_half_rounds=7,
+            team2_second_half_rounds=3,
+            team2_atk_rounds=7,
+            team2_def_rounds=3,
         )
     message = str(excinfo.value)
     assert "Ascent" in message
@@ -273,16 +282,25 @@ def test_first_half_sum_mismatch_raises_illegal_score_error():
 def test_second_half_over_12_raises_illegal_score_error():
     # A combined second half of 14 is impossible: a second half can be
     # truncated (fewer than 12 rounds, when a team reaches 13
-    # mid-half) but never exceeds 12 rounds. Finished-map scoreline
-    # (13-10) is valid, so the half-split data is the only violation.
+    # mid-half) but never exceeds 12 rounds. Both teams' half-split
+    # data is filled in full (first-half sum 12, atk+def consistent
+    # with first+second per team) so completeness and cross-pair pass
+    # cleanly and the second-half sum is the only violation; the 13-10
+    # scoreline itself is valid too.
     with pytest.raises(IllegalScoreError) as excinfo:
         MapResult(
             map_name="Split",
             team1_score=13,
             team2_score=10,
             winner="Team A",
+            team1_first_half_rounds=6,
             team1_second_half_rounds=8,
+            team1_atk_rounds=8,
+            team1_def_rounds=6,
+            team2_first_half_rounds=6,
             team2_second_half_rounds=6,
+            team2_atk_rounds=6,
+            team2_def_rounds=6,
         )
     assert "combined second-half" in str(excinfo.value)
 
@@ -317,9 +335,9 @@ def test_partial_team_half_data_with_full_other_team_raises():
     # the per-team presence test, so a team with only one of its four
     # half-split fields set (e.g. atk only) counted as "present", and
     # when the other team was fully populated the "exactly one team
-    # parsed" guard never fired. all() must treat the 3-of-4-None team
-    # as absent, so the mismatch raises IllegalScoreError (fails on the
-    # pre-fix code, which let the partial team slip through silently).
+    # parsed" guard never fired. The dedicated per-team partial check
+    # now catches this directly (fails on the pre-round-6 code, which
+    # let the partial team slip through silently).
     with pytest.raises(IllegalScoreError) as excinfo:
         MapResult(
             map_name="Ascent",
@@ -334,7 +352,31 @@ def test_partial_team_half_data_with_full_other_team_raises():
         )
     message = str(excinfo.value)
     assert "Ascent" in message
-    assert "half-split data for team2 only" in message
+    assert "partial half-split data for team1" in message
+
+
+def test_partial_team_half_data_with_absent_other_team_raises():
+    # Round-7 finding 1: switching the completeness check's per-team
+    # presence test from any() to all() fixed the case above, but a
+    # partial team (some but not all of its four values set) paired
+    # with a fully-absent team (all four None) still slipped through —
+    # both compared equal under "not present", so the presence-mismatch
+    # guard never fired. A team's half-split data is all-or-nothing in
+    # practice, so a partial row is invalid on its own regardless of
+    # what the other team looks like, and must fail loudly (fails on
+    # the pre-fix code, which raised nothing for this input).
+    with pytest.raises(IllegalScoreError) as excinfo:
+        MapResult(
+            map_name="Ascent",
+            team1_score=13,
+            team2_score=10,
+            winner="Team A",
+            team1_atk_rounds=7,  # partial: first/second/def all None
+            # team2's half-split fields are all left None (absent)
+        )
+    message = str(excinfo.value)
+    assert "Ascent" in message
+    assert "partial half-split data for team1" in message
 
 
 def test_atk_def_mismatch_with_half_splits_raises_illegal_score_error():

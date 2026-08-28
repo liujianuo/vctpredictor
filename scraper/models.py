@@ -256,12 +256,14 @@ class MapResult:
             rounds, an overtime scoreline (both teams >= 12) with a
             winning margin below 2, or a regulation scoreline (loser
             below 12) whose winner exceeds 13 rounds; or, on such a
-            finished map, if half-split data parsed for exactly one
-            team (partial data is itself invalid), if both teams'
-            half-split data parsed and the combined first-half round
-            count is not exactly 12 or the combined second-half count
-            exceeds 12, or if a team's ``atk + def`` totals disagree
-            with its ``first + second`` half rounds. Neither
+            finished map, if a team's half-split data parsed only
+            partially (some but not all of its four values — invalid
+            on its own, regardless of the other team's state), if
+            half-split data parsed in full for exactly one team, if
+            both teams' half-split data parsed and the combined
+            first-half round count is not exactly 12 or the combined
+            second-half count exceeds 12, or if a team's ``atk + def``
+            totals disagree with its ``first + second`` half rounds. Neither
             validation layer runs on live/in-progress maps (their
             winner is still ``None``), since those render partial
             round counts that legitimately violate the finished-map
@@ -303,10 +305,15 @@ class MapResult:
         The half-split layer enforces three properties that hold on
         every real vlr.gg header. Completeness: a finished map's
         header must render both teams' half-split data or neither —
-        exactly one team parsing (e.g. malformed markup with a single
-        ``.team`` div) is partial data, as invalid as a bad sum, and
-        must fail loudly rather than silently skipping validation.
-        Round counts: the combined first-half round count of both
+        exactly one team parsing in full (e.g. malformed markup with a
+        single ``.team`` div) is partial data, as invalid as a bad
+        sum, and must fail loudly rather than silently skipping
+        validation; likewise, a single team whose own four values
+        parsed only partially (e.g. an atk total with no matching
+        first/second/def) is invalid on its own regardless of what the
+        other team looks like, since ``_parse_half_split`` derives all
+        four values from the same recognized spans and can never
+        legitimately produce a partial row. Round counts: the combined first-half round count of both
         teams is always exactly 12 (a regulation first half always
         runs its full 12 rounds), and the combined second-half count
         never exceeds 12 (the second half *may* be truncated — a team
@@ -332,10 +339,13 @@ class MapResult:
         milestone against the materialized dataset.
 
         Raises:
-            IllegalScoreError (a ``ValueError`` subclass): If half-split
-                data parsed for exactly one team (the message includes
-                ``map_name`` and both teams' values); if both teams'
-                half-split data parsed and the combined first-half
+            IllegalScoreError (a ``ValueError`` subclass): If a team's
+                half-split data parsed only partially — some but not
+                all of its four values (the message includes
+                ``map_name`` and that team's values); if half-split
+                data parsed in full for exactly one team (the message
+                includes ``map_name`` and both teams' values); if both
+                teams' half-split data parsed and the combined first-half
                 round count is not exactly 12, or the combined
                 second-half count exceeds 12 (the message includes
                 ``map_name`` and both teams' half values); if a team's
@@ -373,11 +383,19 @@ class MapResult:
         # map. The four values per team are the (first, second) halves
         # and the (atk, def) side totals; ``_parse_half_split`` derives
         # both pairs from the same recognized spans, so a team's data
-        # is all-or-nothing in practice. A team counts as present only
-        # when all four of its values parsed (``all``, not ``any``): a
-        # 3-of-4-None partial row is treated as absent, so the
-        # mismatch guard below still fires when the other team is fully
-        # populated instead of silently skipping every invariant.
+        # is all-or-nothing in practice: it is "present" only when all
+        # four values parsed, "absent" only when none did, and
+        # anything in between ("partial") is itself invalid regardless
+        # of what the other team looks like — a 1-of-4 or 3-of-4 row
+        # can never legitimately occur, so it must fail loudly on its
+        # own rather than only when it happens to be paired with a
+        # fully-populated other team. The partial checks below run
+        # before the presence-mismatch check, since collapsing
+        # "partial" and "absent" into a single not-present boolean (as
+        # a bare ``all()`` comparison would) lets a partial team paired
+        # with a fully-absent team slip through — both read as
+        # not-present and compare equal, so the mismatch guard never
+        # fires.
         team1_halves = (
             self.team1_first_half_rounds,
             self.team1_second_half_rounds,
@@ -392,6 +410,20 @@ class MapResult:
         )
         team1_half_present = all(value is not None for value in team1_halves)
         team2_half_present = all(value is not None for value in team2_halves)
+        team1_half_absent = all(value is None for value in team1_halves)
+        team2_half_absent = all(value is None for value in team2_halves)
+        if not team1_half_present and not team1_half_absent:
+            raise IllegalScoreError(
+                f"map {self.map_name!r} has partial half-split data for "
+                f"team1 {team1_halves}: a finished map's header must "
+                f"render all four of a team's half-split values or none"
+            )
+        if not team2_half_present and not team2_half_absent:
+            raise IllegalScoreError(
+                f"map {self.map_name!r} has partial half-split data for "
+                f"team2 {team2_halves}: a finished map's header must "
+                f"render all four of a team's half-split values or none"
+            )
         if team1_half_present != team2_half_present:
             # Completeness: a finished map's header must render both
             # teams' half-split data or neither. Exactly one team
