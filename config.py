@@ -25,7 +25,14 @@ Design rules:
   :meth:`Config.era_as_of`; era windows are half-open ``[start, end)``
   and ``end=None`` means open-ended. A date with no matching era
   raises :class:`ConfigError` — a match from outside the configured
-  window must not silently inherit today's pool.
+  window must not silently inherit today's pool. Dates and era
+  boundaries are UTC calendar dates: ``Match.date`` is naive UTC and
+  an aware ``datetime`` is converted to UTC before deciding its era.
+- **Validation is wall-clock independent by default.** ``load_config``
+  checks ``active_era`` against an explicit ``as_of`` date only; with
+  ``as_of=None`` no "covers today" check runs, so archived configs
+  load for backtesting and pre-registering the next rotation does not
+  break a nightly run at midnight.
 - This module imports nothing from ``scraper/`` and ``scraper/`` must
   not import it: parsers stay pure and fixture-testable.
 """
@@ -34,7 +41,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional, Union
 
@@ -56,9 +63,16 @@ def normalize_map_name(name: str) -> str:
     """Normalise a map name: strip and collapse whitespace, title-case.
 
     vlr.gg markup mixes cases (the fixtures contain both ``Sunset``
-    and ``sunset``); comparisons always go through this.
+    and ``sunset``); comparisons always go through this. Non-strings
+    are rejected rather than coerced, so a missing scraped name cannot
+    silently become a map literally called ``'None'``.
     """
-    return " ".join(str(name).split()).title()
+    if not isinstance(name, str):
+        raise ConfigError(
+            f"normalize_map_name expects a string, got "
+            f"{type(name).__name__}: {name!r}"
+        )
+    return " ".join(name.split()).title()
 
 
 def _parse_iso_date(value, era_name: str, field: str) -> date:
@@ -135,9 +149,28 @@ class Config:
 
         This is what lets a 2026-07-15 match be scored against the
         pool that was live then rather than today's.
+
+        ``d`` may be a ``date`` or a ``datetime``. Era boundaries and
+        ``Match.date`` (``scraper.models``) are UTC calendar dates: a
+        naive ``datetime`` is treated as UTC and narrowed to its UTC
+        date; a timezone-aware ``datetime`` is converted to UTC first,
+        so the UTC calendar date decides the era. Any other type
+        (e.g. ``None`` for an upcoming match, or a string) raises
+        :class:`ConfigError` rather than an opaque ``TypeError``.
         """
+        if not isinstance(d, date):
+            raise ConfigError(
+                f"era_as_of expects a date or datetime, got "
+                f"{type(d).__name__}: {d!r}"
+            )
         if isinstance(d, datetime):
+            if d.tzinfo is not None:
+                d = d.astimezone(timezone.utc)
             d = d.date()
+        if not self.eras:
+            raise ConfigError(
+                "no eras configured; cannot resolve a date to an era"
+            )
         for era in self.eras:
             if era.start <= d and (era.end is None or d < era.end):
                 return era
@@ -148,23 +181,41 @@ class Config:
         )
 
     def is_active_map(self, name: str) -> bool:
-        """True if ``name`` is in the *active* (current) era's pool."""
-        return self.active_era.contains_map(name)
+        """True if ``name`` is in the pool live today.
+
+        Derived from :meth:`era_as_of` at call time rather than from the
+        frozen ``active_era`` field, so a long-running process (a looped
+        scrape driver, a notebook kernel) that crosses a rotation
+        midnight keeps answering from the pool that actually covers
+        today instead of the one it started with.
+        """
+        return self.era_as_of(date.today()).contains_map(name)
 
 
-def load_config(path: _PATH_T = None) -> Config:
+def load_config(path: _PATH_T = None, as_of: Optional[date] = None) -> Config:
     """Load and validate ``config.json``.
 
     ``path=None`` falls back to the module-level ``DEFAULT_CONFIG_PATH``
     (``<project root>/config.json``). Accepts ``str | Path | None`` so
     tests can point it at a temp file.
+
+    ``as_of`` is the date (or datetime) against which rule 5's
+    "active_era covers the date" check runs. When ``as_of`` is None the
+    check is skipped entirely: loading is wall-clock independent, so an
+    archived config loads for backtesting and a config that
+    pre-declares the next rotation does not start failing at midnight.
+    Pass ``as_of`` (e.g. ``date.today()``) when you specifically want to
+    assert the declared ``active_era`` is current for that date.
     """
     if path is None:
         path = DEFAULT_CONFIG_PATH
     path = Path(path)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:
+        # OSError: unreadable/missing file. ValueError: JSONDecodeError
+        # and UnicodeDecodeError (a stray non-UTF-8 byte from an editor
+        # saving UTF-16 or Latin-1) both subclass it.
         raise ConfigError(f"could not read config file {path}: {exc}") from exc
     if not isinstance(raw, dict):
         raise ConfigError(
@@ -251,24 +302,36 @@ def load_config(path: _PATH_T = None) -> Config:
             f"{[e.name for e in eras]}"
         )
 
-    # Rule 5 (cont.): active_era must be the era covering today, so a
-    # rotation that appends a new era without bumping active_era fails at
-    # load time instead of silently serving the retired pool.
-    today = date.today()
-    covering_today = next(
-        (e for e in eras if e.start <= today and (e.end is None or today < e.end)),
-        None,
-    )
-    if covering_today is None:
-        raise ConfigError(
-            f"no era covers today ({today.isoformat()}); eras are stale: "
-            f"{[e.name for e in eras]}"
+    # Rule 5 (cont.): when as_of is given, active_era must be the era
+    # covering it, so a stale pointer fails here instead of silently
+    # serving a retired pool. Opt-in by design: a config valid for
+    # backtesting (or pre-declaring the next rotation) must not start
+    # failing at a future midnight, so with as_of=None no wall-clock
+    # check runs.
+    if as_of is not None:
+        if not isinstance(as_of, date):
+            raise ConfigError(
+                f"as_of must be a date or datetime, got "
+                f"{type(as_of).__name__}: {as_of!r}"
+            )
+        if isinstance(as_of, datetime):
+            if as_of.tzinfo is not None:
+                as_of = as_of.astimezone(timezone.utc)
+            as_of = as_of.date()
+        covering = next(
+            (e for e in eras if e.start <= as_of and (e.end is None or as_of < e.end)),
+            None,
         )
-    if active is not covering_today:
-        raise ConfigError(
-            f"active_era {active_name!r} does not cover today "
-            f"({today.isoformat()}); the era covering today is {covering_today.name!r}"
-        )
+        if covering is None:
+            raise ConfigError(
+                f"no era covers {as_of.isoformat()}; eras are stale: "
+                f"{[e.name for e in eras]}"
+            )
+        if active is not covering:
+            raise ConfigError(
+                f"active_era {active_name!r} does not cover "
+                f"{as_of.isoformat()}; the era covering it is {covering.name!r}"
+            )
 
     # Rule 6: non-empty event_urls, all absolute vlr.gg URLs with /event/.
     urls = raw["event_urls"]

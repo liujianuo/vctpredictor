@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 import config
-from config import ConfigError, Era, load_config, normalize_map_name
+from config import Config, ConfigError, Era, load_config, normalize_map_name
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_CONFIG = REPO_ROOT / "config.json"
@@ -289,19 +289,20 @@ def test_error_active_era_unknown(tmp_path):
 
 
 def test_error_active_era_not_current(tmp_path):
-    # active_era must cover today, not merely name an existing era: a stale
-    # pointer would silently answer from a retired pool after a rotation.
+    # Rule 5 (as_of): active_era must cover the as_of date, not merely name
+    # an existing era: a stale pointer would silently answer from a retired
+    # pool after a rotation.
     data = base_config_data()
-    data["active_era"] = "2026-s1"  # past era; 2026-abyss covers today
-    with pytest.raises(ConfigError, match="does not cover today"):
-        load_config(write_json(tmp_path, data))
+    data["active_era"] = "2026-s1"  # past era; 2026-abyss covers 2026-08-23
+    with pytest.raises(ConfigError, match="does not cover"):
+        load_config(write_json(tmp_path, data), as_of=date(2026, 8, 23))
 
 
-def test_error_no_era_covers_today(tmp_path):
+def test_error_no_era_covers_as_of(tmp_path):
     data = base_config_data()
-    data["eras"][1]["end"] = "2026-08-01"  # bounded in the past; today uncovered
-    with pytest.raises(ConfigError, match="today"):
-        load_config(write_json(tmp_path, data))
+    data["eras"][1]["end"] = "2026-08-01"  # bounded in the past; as_of uncovered
+    with pytest.raises(ConfigError, match="no era covers"):
+        load_config(write_json(tmp_path, data), as_of=date(2026, 8, 23))
 
 
 def test_error_event_urls_empty(tmp_path):
@@ -348,3 +349,110 @@ def test_valid_temp_config_loads(tmp_path):
     assert cfg.active_era.name == "2026-abyss"
     assert cfg.active_era.map_pool == EXPECTED_ACTIVE_POOL
     assert cfg.eras[0].name == "2026-s1"
+
+
+def test_load_config_skips_wall_clock_check_without_as_of(tmp_path):
+    # The "covers today" check is opt-in via as_of: a config whose eras are
+    # entirely in the past must still load, so an archived config can be
+    # backtested and pre-registering the next rotation does not start
+    # failing at a future midnight.
+    data = base_config_data()
+    data["eras"][1]["end"] = "2026-08-01"
+    data["active_era"] = "2026-s1"
+    cfg = load_config(write_json(tmp_path, data))
+    assert cfg.era_as_of(date(2026, 5, 1)).name == "2026-s1"
+    # Same file, validated against an uncovered date, fails cleanly.
+    with pytest.raises(ConfigError, match="no era covers"):
+        load_config(write_json(tmp_path, data), as_of=date(2026, 8, 23))
+
+
+def test_load_config_as_of_valid_active_era(tmp_path):
+    data = base_config_data()
+    cfg = load_config(write_json(tmp_path, data), as_of=date(2026, 8, 23))
+    assert cfg.active_era.name == "2026-abyss"
+
+
+def test_load_config_as_of_rejects_non_date(tmp_path):
+    data = base_config_data()
+    with pytest.raises(ConfigError, match="as_of"):
+        load_config(write_json(tmp_path, data), as_of="2026-08-23")
+
+
+def test_error_unicode_decode(tmp_path):
+    # A stray non-UTF-8 byte (editor saving UTF-16/Latin-1) must surface as
+    # ConfigError, not a raw UnicodeDecodeError.
+    path = tmp_path / "config.json"
+    path.write_bytes(b'{"region": "emea",\xff}')
+    with pytest.raises(ConfigError, match="read config"):
+        load_config(path)
+
+
+def test_era_as_of_none_raises_configerror():
+    # Upcoming/TBD matches carry date=None; must be ConfigError, not TypeError.
+    cfg = load_config()
+    with pytest.raises(ConfigError, match="expects a date or datetime"):
+        cfg.era_as_of(None)
+
+
+def test_era_as_of_string_raises_configerror():
+    cfg = load_config()
+    with pytest.raises(ConfigError, match="expects a date or datetime"):
+        cfg.era_as_of("2026-08-17")
+
+
+def test_era_as_of_aware_datetime_uses_utc_date():
+    # Era boundaries and Match.date are UTC calendar dates: an aware
+    # datetime is converted to UTC before deciding its era.
+    from datetime import datetime, timedelta, timezone
+
+    cfg = load_config()
+    # 23:30 CEST Aug 16 == 21:30 UTC Aug 16 -> still Breeze pool.
+    late_evening_local = datetime(2026, 8, 16, 23, 30, tzinfo=timezone(timedelta(hours=2)))
+    assert cfg.era_as_of(late_evening_local).name == "2026-s2-breeze"
+    # 02:30 CEST Aug 17 == 00:30 UTC Aug 17 -> Abyss pool.
+    early_local = datetime(2026, 8, 17, 2, 30, tzinfo=timezone(timedelta(hours=2)))
+    assert cfg.era_as_of(early_local).name == "2026-abyss"
+
+
+def test_era_as_of_empty_eras_raises_configerror():
+    # A directly-built Config with no eras must raise ConfigError from
+    # era_as_of, not IndexError on self.eras[0].
+    empty = Config(
+        region="emea",
+        eras=(),
+        active_era=Era(name="2026-abyss", start=date(2026, 8, 17), end=None, map_pool=("Abyss",)),
+        event_urls=(),
+    )
+    with pytest.raises(ConfigError, match="no eras configured"):
+        empty.era_as_of(date(2026, 8, 23))
+
+
+def test_normalize_map_name_rejects_non_string():
+    # The read path must reject phantom names too: a missing scraped map
+    # name must not become a map literally called "None".
+    with pytest.raises(ConfigError, match="expects a string"):
+        normalize_map_name(None)
+    with pytest.raises(ConfigError, match="expects a string"):
+        normalize_map_name(["Ascent"])
+
+
+def test_is_active_map_tracks_rotation_across_midnight(monkeypatch, tmp_path):
+    # A long-running process crossing a rotation must not keep answering
+    # from the pool it started with: is_active_map derives the era covering
+    # date.today() on every call instead of trusting the frozen active_era.
+    data = base_config_data()
+    cfg = load_config(write_json(tmp_path, data))
+
+    class FakeDate(date):
+        _today = None
+
+        @classmethod
+        def today(cls):
+            return cls._today
+
+    FakeDate._today = FakeDate(2026, 5, 1)  # inside 2026-s1 (no Abyss)
+    monkeypatch.setattr(config, "date", FakeDate)
+    assert cfg.is_active_map("Abyss") is False
+
+    FakeDate._today = FakeDate(2026, 8, 23)  # inside 2026-abyss
+    assert cfg.is_active_map("Abyss") is True
