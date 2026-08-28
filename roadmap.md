@@ -69,7 +69,7 @@ HS%, agent) plus `MapResult.agent_picks`.
 - Size: **M**
 - Depends on: —
 
-### M6. Attack/defense half-split parsing
+### M6. Attack/defense half-split parsing [x]
 Extract per-map first/second half and side (atk/def) round counts onto
 `MapResult`. Feeds closeness features later.
 - Size: **S**
