@@ -39,15 +39,40 @@ _DB_PATH_T = Union[str, Path, None]
 
 
 def _now_iso() -> str:
+    """Return the current UTC time as an ISO-8601 string.
+
+    Returns:
+        The current time (timezone-aware, UTC) formatted via
+        ``datetime.isoformat()``.
+    """
     return datetime.now(timezone.utc).isoformat()
 
 
 def get_connection(db_path: _DB_PATH_T = None) -> sqlite3.Connection:
     """Open (creating if needed) the cache DB and ensure tables exist.
 
-    ``db_path=None`` falls back to the module-level
-    ``DEFAULT_DB_PATH``, resolved at call time so tests can
-    monkeypatch it.
+    Creates the parent directory of ``db_path`` if it does not exist,
+    opens (or creates) the SQLite database file, and issues
+    ``CREATE TABLE IF NOT EXISTS`` for both the ``pages`` and
+    ``matches`` tables before returning the connection.
+
+    Args:
+        db_path: Path to the SQLite database file. ``None`` (the
+            default) falls back to the module-level
+            ``DEFAULT_DB_PATH``, resolved at call time (not import
+            time) so tests can monkeypatch it. Accepts
+            ``str | Path | None``.
+
+    Returns:
+        An open ``sqlite3.Connection`` with the ``pages`` and
+        ``matches`` tables guaranteed to exist. The caller is
+        responsible for closing it.
+
+    Raises:
+        sqlite3.OperationalError: If the database file cannot be
+            opened or the schema cannot be created (e.g. permissions
+            or disk errors).
+        OSError: If the parent directory cannot be created.
     """
     if db_path is None:
         db_path = DEFAULT_DB_PATH
@@ -61,7 +86,26 @@ def get_connection(db_path: _DB_PATH_T = None) -> sqlite3.Connection:
 
 
 def get_cached_page(url: str, db_path: _DB_PATH_T = None) -> Optional[str]:
-    """Return cached raw HTML for ``url``, or None on a cache miss."""
+    """Look up the raw HTML previously cached for a URL.
+
+    Opens its own connection (via :func:`get_connection`) and closes
+    it before returning, so it is safe to call repeatedly without
+    connection leaks.
+
+    Args:
+        url: The page URL to look up, exactly as it was cached (the
+            ``pages`` table keys on it verbatim; no normalisation).
+        db_path: Path to the SQLite database file, forwarded to
+            :func:`get_connection`. ``None`` uses the default path.
+
+    Returns:
+        The cached HTML string for ``url``, or ``None`` if there is no
+        cache entry for it (a cache miss).
+
+    Raises:
+        sqlite3.OperationalError: If the database cannot be opened or
+            queried.
+    """
     conn = get_connection(db_path)
     try:
         row = conn.execute(
@@ -73,7 +117,27 @@ def get_cached_page(url: str, db_path: _DB_PATH_T = None) -> Optional[str]:
 
 
 def set_cached_page(url: str, html: str, db_path: _DB_PATH_T = None) -> None:
-    """Store raw HTML for ``url``, overwriting any previous entry."""
+    """Store raw HTML for a URL, overwriting any previous entry.
+
+    Upserts into the ``pages`` table (``INSERT ... ON CONFLICT DO
+    UPDATE``), so calling this twice for the same ``url`` replaces the
+    old HTML and ``fetched_at`` timestamp rather than erroring or
+    duplicating rows.
+
+    Args:
+        url: The page URL to cache under. Used verbatim as the primary
+            key of the ``pages`` table.
+        html: The raw HTML content to store.
+        db_path: Path to the SQLite database file, forwarded to
+            :func:`get_connection`. ``None`` uses the default path.
+
+    Returns:
+        None.
+
+    Raises:
+        sqlite3.OperationalError: If the database cannot be opened or
+            written to.
+    """
     conn = get_connection(db_path)
     try:
         conn.execute(
@@ -88,10 +152,25 @@ def set_cached_page(url: str, html: str, db_path: _DB_PATH_T = None) -> None:
 
 
 def get_cached_match(match_id: str, db_path: _DB_PATH_T = None) -> Optional[Match]:
-    """Return cached Match for ``match_id``, or None on a miss.
+    """Look up a previously cached, parsed match by its id.
 
-    A corrupted/unparseable cached row is treated as a miss (return
-    None) so the caller re-fetches rather than crashing.
+    A corrupted/unparseable cached row is treated as a miss (returns
+    ``None``) so the caller re-fetches rather than crashing.
+
+    Args:
+        match_id: The vlr.gg numeric match id to look up (see
+            :func:`scraper.vlr.extract_match_id`).
+        db_path: Path to the SQLite database file, forwarded to
+            :func:`get_connection`. ``None`` uses the default path.
+
+    Returns:
+        The cached :class:`scraper.models.Match`, or ``None`` if there
+        is no entry for ``match_id`` or the stored JSON fails to parse
+        or deserialize.
+
+    Raises:
+        sqlite3.OperationalError: If the database cannot be opened or
+            queried.
     """
     conn = get_connection(db_path)
     try:
@@ -109,7 +188,27 @@ def get_cached_match(match_id: str, db_path: _DB_PATH_T = None) -> Optional[Matc
 
 
 def set_cached_match(match: Match, db_path: _DB_PATH_T = None) -> None:
-    """Store a parsed Match, overwriting any previous entry for its id."""
+    """Store a parsed match, overwriting any previous entry for its id.
+
+    Serializes ``match`` via :meth:`scraper.models.Match.to_dict` and
+    upserts into the ``matches`` table (``INSERT ... ON CONFLICT DO
+    UPDATE``), so calling this twice for the same ``match.match_id``
+    replaces the old row rather than erroring or duplicating it.
+
+    Args:
+        match: The :class:`scraper.models.Match` to cache. Its
+            ``match_id`` is used as the primary key and ``url`` is
+            stored alongside the serialized data.
+        db_path: Path to the SQLite database file, forwarded to
+            :func:`get_connection`. ``None`` uses the default path.
+
+    Returns:
+        None.
+
+    Raises:
+        sqlite3.OperationalError: If the database cannot be opened or
+            written to.
+    """
     conn = get_connection(db_path)
     try:
         conn.execute(
@@ -124,11 +223,30 @@ def set_cached_match(match: Match, db_path: _DB_PATH_T = None) -> None:
 
 
 def is_stale(timestamp: Optional[Union[datetime, str]], ttl_seconds: Optional[int]) -> bool:
-    """True if ``timestamp`` is older than ``ttl_seconds``.
+    """Check whether a cached timestamp is older than a TTL.
 
     - ``ttl_seconds is None`` -> never stale (no expiry configured).
     - ``timestamp is None`` -> stale (no freshness information).
     - Naive datetimes are assumed to be UTC.
+
+    Args:
+        timestamp: When the cached data was fetched/stored. Accepts a
+            ``datetime`` (naive datetimes are treated as UTC) or an
+            ISO-8601 string, or ``None`` if unknown.
+        ttl_seconds: The freshness window in seconds. ``None`` means
+            no expiry is configured (data is never considered stale).
+
+    Returns:
+        ``True`` if ``timestamp`` is more than ``ttl_seconds`` in the
+        past, or if ``timestamp`` is ``None`` while ``ttl_seconds`` is
+        not; ``False`` otherwise (including whenever ``ttl_seconds``
+        is ``None``).
+
+    Raises:
+        TypeError: If ``timestamp`` is neither ``None``, a
+            ``datetime``, nor a ``str``.
+        ValueError: If ``timestamp`` is a ``str`` that is not valid
+            ISO-8601 (propagated from ``datetime.fromisoformat``).
     """
     if ttl_seconds is None:
         return False

@@ -67,6 +67,19 @@ def extract_match_id(url: str) -> str:
     A bare numeric id (``"712803"``) is accepted as-is. Event-page
     URLs (which also contain a numeric id, the event id) are rejected
     so a wrong id never becomes a cache key.
+
+    Args:
+        url: A vlr.gg match URL (absolute or relative), a bare numeric
+            match id string, or an event-page URL. Any query string
+            (``?...``) or fragment (``#...``) is stripped before
+            parsing.
+
+    Returns:
+        The numeric match id as a string, e.g. ``"712803"``.
+
+    Raises:
+        VlrParseError: If ``url`` is an event page (contains
+            ``"/event/"``), or if no numeric id can be found in it.
     """
     url = url.split("?", 1)[0].split("#", 1)[0]
     if "/event/" in url:
@@ -80,6 +93,16 @@ def extract_match_id(url: str) -> str:
 
 
 def _parse_int(text: str) -> Optional[int]:
+    """Best-effort parse of a stripped string as an integer.
+
+    Args:
+        text: The text to parse, e.g. text scraped from a score span.
+            Leading/trailing whitespace is stripped before parsing.
+
+    Returns:
+        The parsed ``int``, or ``None`` if ``text`` (after stripping)
+        is not a valid integer literal (e.g. ``""``, ``"-"``, ``"TBD"``).
+    """
     text = text.strip()
     try:
         return int(text)
@@ -88,6 +111,23 @@ def _parse_int(text: str) -> Optional[int]:
 
 
 def _parse_team(link_el) -> Team:
+    """Parse a team from a ``.match-header-link`` element.
+
+    Args:
+        link_el: A BeautifulSoup ``Tag`` for one ``.match-header-link``
+            element from a match header, containing the team name
+            (``.wf-title-med``) and, in its ``href``, the team's vlr.gg
+            page URL.
+
+    Returns:
+        A :class:`scraper.models.Team` with the parsed name and, when
+        the ``href`` matches ``/team/<id>``, its numeric ``team_id``
+        (``None`` if the id could not be extracted).
+
+    Raises:
+        VlrParseError: If no team name (``.wf-title-med``) is found,
+            or it is empty.
+    """
     name_el = link_el.select_one(".wf-title-med")
     name = name_el.get_text(strip=True) if name_el is not None else ""
     if not name:
@@ -98,6 +138,32 @@ def _parse_team(link_el) -> Team:
 
 
 def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
+    """Parse one played map's result from a ``.vm-stats-game`` block.
+
+    Args:
+        game_el: A BeautifulSoup ``Tag`` for one ``.vm-stats-game``
+            element, expected to contain a ``.vm-stats-game-header``
+            with the map name, per-team score, win indicator and
+            duration.
+        team1: The match's team1, used to resolve the map winner's
+            name when the ``.score.mod-win`` element is on the
+            left-hand (``mod-1``) side.
+        team2: The match's team2, used to resolve the map winner's
+            name when the ``.score.mod-win`` element is on the
+            right-hand (``mod-right``) side.
+
+    Returns:
+        A :class:`scraper.models.MapResult` with the parsed map name,
+        both teams' scores (``None`` for any that could not be parsed
+        as an integer), the winner's team name (``None`` if no
+        ``.score.mod-win`` element was found), and the map duration.
+        ``agent_picks`` is always ``None`` (not yet parsed from stats
+        tables).
+
+    Raises:
+        VlrParseError: If ``game_el`` has no ``.vm-stats-game-header``,
+            or the header has no map name (``.map div span``).
+    """
     header_el = game_el.select_one(".vm-stats-game-header")
     if header_el is None:
         raise VlrParseError("vm-stats-game block without .vm-stats-game-header")
@@ -155,6 +221,23 @@ def fetch_page(url: str, use_cache: bool = True, force_refresh: bool = False) ->
     True, otherwise fetches over HTTP with a real User-Agent header,
     raises :class:`VlrFetchError` on non-200/network failure, and
     stores the result in the cache (when ``use_cache``).
+
+    Args:
+        url: The absolute URL to fetch.
+        use_cache: When ``True`` (the default), read from and write to
+            the local page cache. When ``False``, always fetch over
+            HTTP and never touch the cache.
+        force_refresh: When ``True``, skip the cache read and always
+            fetch over HTTP, even if ``use_cache`` is ``True`` (the
+            result is still written back to the cache when
+            ``use_cache`` is ``True``).
+
+    Returns:
+        The page's HTML as a string.
+
+    Raises:
+        VlrFetchError: If the HTTP request fails (network error,
+            timeout, or non-2xx status via ``raise_for_status``).
     """
     if use_cache and not force_refresh:
         cached = get_cached_page(url)
@@ -181,7 +264,29 @@ def fetch_page(url: str, use_cache: bool = True, force_refresh: bool = False) ->
 def parse_match(html: str, url: str) -> Match:
     """Parse a vlr.gg match page HTML string into a :class:`Match`.
 
-    Raises :class:`VlrParseError` when expected selectors are missing.
+    Pure function: does no network I/O, so it can be run against saved
+    HTML fixtures in tests. Extracts the event name, both teams, the
+    scheduled/played date, match status (``"completed"``/``"live"``/
+    ``"upcoming"``), best-of format, overall scores, and the list of
+    per-map results (skipping the "All Maps" overview block and any
+    placeholder ``"TBD"`` maps rendered for upcoming matches).
+
+    Args:
+        html: The full HTML of a vlr.gg match page.
+        url: The URL the HTML was fetched from. Used to derive
+            ``match_id`` (via :func:`extract_match_id`) and stored
+            verbatim on the returned ``Match``.
+
+    Returns:
+        The parsed :class:`scraper.models.Match`.
+
+    Raises:
+        VlrParseError: If ``url`` is not a parseable match URL, or if
+            any expected element is missing from ``html`` — no
+            ``div.match-header``, no ``.match-header-event`` (and no
+            fallback event slug), fewer than two
+            ``.match-header-link`` team elements, or a per-map block
+            with no map name.
     """
     soup = BeautifulSoup(html, "lxml")
     header = soup.select_one("div.match-header")
@@ -275,8 +380,18 @@ def parse_match(html: str, url: str) -> Match:
 def parse_event_match_links(html: str) -> List[str]:
     """Extract the list of match URLs from an event's matches page.
 
-    Returns relative URLs (e.g. ``/712833/fnatic-vs-team-heretics-...``)
-    in page order, deduplicated.
+    Pure function: does no network I/O, so it can be run against saved
+    HTML fixtures in tests.
+
+    Args:
+        html: The full HTML of a vlr.gg event matches page.
+
+    Returns:
+        Relative match URLs (e.g.
+        ``/712833/fnatic-vs-team-heretics-...``) in page order, with
+        duplicates removed (first occurrence kept). An empty list if
+        no match links are found — this is not treated as an error,
+        since an event with no matches yet is a valid state.
     """
     soup = BeautifulSoup(html, "lxml")
     links: List[str] = []
@@ -295,7 +410,32 @@ def parse_event_match_links(html: str) -> List[str]:
 
 
 def get_match(url: str, use_cache: bool = True) -> Match:
-    """Fetch (or load from cache) and parse a single match."""
+    """Fetch (or load from cache) and parse a single match.
+
+    Checks the parsed-match cache first (keyed by match id); on a
+    miss, fetches the page HTML (:func:`fetch_page`), parses it
+    (:func:`parse_match`), and stores the result in the match cache
+    before returning it.
+
+    Args:
+        url: The vlr.gg match page URL to fetch and parse.
+        use_cache: When ``True`` (the default), read from and write to
+            both the page cache and the parsed-match cache. When
+            ``False``, always fetch and parse fresh and never touch
+            either cache.
+
+    Returns:
+        The parsed :class:`scraper.models.Match`, either from cache or
+        freshly fetched.
+
+    Raises:
+        VlrParseError: If ``url`` is not a parseable match URL, or if
+            the fetched page is missing expected structure
+            (propagated from :func:`extract_match_id` /
+            :func:`parse_match`).
+        VlrFetchError: If fetching the page over HTTP fails
+            (propagated from :func:`fetch_page`).
+    """
     match_id = extract_match_id(url)
     if use_cache:
         cached = get_cached_match(match_id)
@@ -311,8 +451,31 @@ def get_match(url: str, use_cache: bool = True) -> Match:
 def get_matches_from_event(event_url: str, use_cache: bool = True) -> List[Match]:
     """Fetch (or load from cache) every match listed on an event page.
 
-    A small delay is inserted between consecutive *uncached* match
-    fetches to be polite to vlr.gg; cached matches incur no delay.
+    Fetches the event page, extracts its match links
+    (:func:`parse_event_match_links`), then fetches/parses each match
+    in page order (:func:`get_match`). A small delay
+    (``POLITE_DELAY_SECONDS``) is inserted between consecutive
+    *uncached* match fetches to be polite to vlr.gg; cached matches
+    incur no delay.
+
+    Args:
+        event_url: The vlr.gg event matches page URL.
+        use_cache: When ``True`` (the default), read from and write to
+            the page and match caches for both the event page and
+            every individual match. When ``False``, always fetch
+            fresh and never touch either cache (and every match fetch
+            is treated as uncached, so the polite delay applies
+            between all of them).
+
+    Returns:
+        A list of parsed :class:`scraper.models.Match` objects, one
+        per match link found on the event page, in page order.
+
+    Raises:
+        VlrFetchError: If fetching the event page or any match page
+            over HTTP fails.
+        VlrParseError: If the event page or any match page is missing
+            expected structure.
     """
     html = fetch_page(event_url, use_cache=use_cache)
     links = parse_event_match_links(html)

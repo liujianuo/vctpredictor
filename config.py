@@ -66,6 +66,18 @@ def normalize_map_name(name: str) -> str:
     and ``sunset``); comparisons always go through this. Non-strings
     are rejected rather than coerced, so a missing scraped name cannot
     silently become a map literally called ``'None'``.
+
+    Args:
+        name: The raw map name to normalise. Must be a ``str``.
+
+    Returns:
+        The normalised name: leading/trailing whitespace stripped,
+        internal runs of whitespace collapsed to single spaces, and
+        the result title-cased (e.g. ``"  sunset "`` -> ``"Sunset"``).
+
+    Raises:
+        ConfigError: If ``name`` is not a ``str`` (a non-string is
+            never coerced, only rejected).
     """
     if not isinstance(name, str):
         raise ConfigError(
@@ -76,6 +88,23 @@ def normalize_map_name(name: str) -> str:
 
 
 def _parse_iso_date(value, era_name: str, field: str) -> date:
+    """Parse and validate one ISO-8601 date field of an era entry.
+
+    Args:
+        value: The raw value read from ``config.json`` for this field.
+            Must be a non-empty ``str`` in ``YYYY-MM-DD`` format.
+        era_name: Name of the era this field belongs to, used only to
+            make error messages identify which era is malformed.
+        field: Name of the field being parsed (``"start"`` or
+            ``"end"``), used only to make error messages specific.
+
+    Returns:
+        The parsed ``date``.
+
+    Raises:
+        ConfigError: If ``value`` is not a non-empty string, or is a
+            string that does not parse as an ISO-8601 date.
+    """
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(
             f"era {era_name!r}: {field} must be an ISO date string "
@@ -90,6 +119,27 @@ def _parse_iso_date(value, era_name: str, field: str) -> date:
 
 
 def _normalize_pool(pool, era_name: str) -> tuple[str, ...]:
+    """Validate and normalise one era's ``map_pool`` list.
+
+    Every entry is passed through :func:`normalize_map_name`, and the
+    result is checked for post-normalisation duplicates (e.g.
+    ``"Sunset"`` and ``"sunset"`` colliding into the same map).
+
+    Args:
+        pool: The raw ``map_pool`` value read from ``config.json`` for
+            this era. Must be a non-empty ``list`` of ``str``.
+        era_name: Name of the era this pool belongs to, used only to
+            make error messages identify which era is malformed.
+
+    Returns:
+        A ``tuple`` of normalised map names, in the same order as
+        ``pool``, with no duplicates.
+
+    Raises:
+        ConfigError: If ``pool`` is not a non-empty list, if any entry
+            is not a string, if an entry normalises to an empty
+            string, or if two entries normalise to the same name.
+    """
     if not isinstance(pool, list) or len(pool) == 0:
         raise ConfigError(
             f"era {era_name!r}: map_pool must be a non-empty list of map names"
@@ -131,7 +181,21 @@ class Era:
     map_pool: tuple[str, ...]
 
     def contains_map(self, name: str) -> bool:
-        """True if ``name`` (any case/whitespace) is in this era's pool."""
+        """Check whether a map is in this era's pool.
+
+        Args:
+            name: The map name to check. Normalised via
+                :func:`normalize_map_name` before comparison, so case
+                and whitespace differences do not affect the result.
+
+        Returns:
+            ``True`` if the normalised ``name`` is in ``self.map_pool``,
+            ``False`` otherwise.
+
+        Raises:
+            ConfigError: If ``name`` is not a ``str`` (propagated from
+                :func:`normalize_map_name`).
+        """
         return normalize_map_name(name) in self.map_pool
 
 
@@ -145,18 +209,32 @@ class Config:
     event_urls: tuple[str, ...]
 
     def era_as_of(self, d: date) -> Era:
-        """The era whose window contains ``d``; raises ConfigError if none.
+        """Find the era whose window contains a given date.
 
         This is what lets a 2026-07-15 match be scored against the
-        pool that was live then rather than today's.
+        pool that was live then rather than today's. Era boundaries
+        are half-open (``start <= d < end``), so a date exactly on an
+        era's ``start`` belongs to that era, not the previous one.
 
-        ``d`` may be a ``date`` or a ``datetime``. Era boundaries and
-        ``Match.date`` (``scraper.models``) are UTC calendar dates: a
-        naive ``datetime`` is treated as UTC and narrowed to its UTC
-        date; a timezone-aware ``datetime`` is converted to UTC first,
-        so the UTC calendar date decides the era. Any other type
-        (e.g. ``None`` for an upcoming match, or a string) raises
-        :class:`ConfigError` rather than an opaque ``TypeError``.
+        Args:
+            d: The date to resolve to an era. May be a ``date`` or a
+                ``datetime``. Era boundaries and ``Match.date``
+                (``scraper.models``) are UTC calendar dates: a naive
+                ``datetime`` is treated as already UTC and narrowed to
+                its UTC date; a timezone-aware ``datetime`` is
+                converted to UTC first. Either way, the UTC calendar
+                date is what decides the era.
+
+        Returns:
+            The :class:`Era` whose ``[start, end)`` window contains
+            ``d``.
+
+        Raises:
+            ConfigError: If ``d`` is not a ``date``/``datetime`` (e.g.
+                ``None`` for an upcoming match, or a string) — raised
+                here rather than letting an opaque ``TypeError``
+                propagate. Also raised if ``self.eras`` is empty, or
+                if no configured era's window covers ``d``.
         """
         if not isinstance(d, date):
             raise ConfigError(
@@ -181,31 +259,70 @@ class Config:
         )
 
     def is_active_map(self, name: str) -> bool:
-        """True if ``name`` is in the pool live today.
+        """Check whether a map is in the pool live today.
 
         Derived from :meth:`era_as_of` at call time rather than from the
         frozen ``active_era`` field, so a long-running process (a looped
         scrape driver, a notebook kernel) that crosses a rotation
         midnight keeps answering from the pool that actually covers
         today instead of the one it started with.
+
+        Args:
+            name: The map name to check (any case/whitespace).
+
+        Returns:
+            ``True`` if ``name`` is in the pool of the era covering
+            today's date, ``False`` otherwise.
+
+        Raises:
+            ConfigError: If no configured era covers today's date, or
+                if ``name`` is not a ``str`` (propagated from
+                :meth:`era_as_of` / :func:`normalize_map_name`).
         """
         return self.era_as_of(date.today()).contains_map(name)
 
 
 def load_config(path: _PATH_T = None, as_of: Optional[date] = None) -> Config:
-    """Load and validate ``config.json``.
+    """Load, parse and validate ``config.json`` into a :class:`Config`.
 
-    ``path=None`` falls back to the module-level ``DEFAULT_CONFIG_PATH``
-    (``<project root>/config.json``). Accepts ``str | Path | None`` so
-    tests can point it at a temp file.
+    Reads the JSON file at ``path``, then runs it through six
+    validation rules in order (required keys present; each era has a
+    non-empty, duplicate-free map pool; each era's dates parse and
+    ``end`` is strictly after ``start``; era windows are contiguous
+    and non-overlapping with at most one open-ended era; ``active_era``
+    names a real era, optionally checked against ``as_of``; and
+    ``event_urls`` is a non-empty list of unique absolute vlr.gg event
+    URLs). Any rule failing raises :class:`ConfigError` immediately —
+    this function never returns a partially-valid ``Config``.
 
-    ``as_of`` is the date (or datetime) against which rule 5's
-    "active_era covers the date" check runs. When ``as_of`` is None the
-    check is skipped entirely: loading is wall-clock independent, so an
-    archived config loads for backtesting and a config that
-    pre-declares the next rotation does not start failing at midnight.
-    Pass ``as_of`` (e.g. ``date.today()``) when you specifically want to
-    assert the declared ``active_era`` is current for that date.
+    Args:
+        path: Path to the config JSON file. ``None`` (the default)
+            falls back to the module-level ``DEFAULT_CONFIG_PATH``
+            (``<project root>/config.json``). Accepts ``str | Path |
+            None`` so tests can point it at a temp file.
+        as_of: The date (or datetime) against which the "active_era
+            covers this date" check runs. When ``None`` (the default)
+            that check is skipped entirely: loading is wall-clock
+            independent, so an archived config loads for backtesting
+            and a config that pre-declares the next rotation does not
+            start failing at midnight. Pass ``as_of`` (e.g.
+            ``date.today()``) when you specifically want to assert the
+            declared ``active_era`` is current for that date.
+
+    Returns:
+        A fully validated :class:`Config`, with ``eras`` sorted by
+        start date and all map names normalised.
+
+    Raises:
+        ConfigError: If the file cannot be read or decoded, if the
+            JSON root is not an object, if any required key is
+            missing, if any era's dates/map pool are malformed, if era
+            windows overlap or have gaps, if more than one era is
+            open-ended, if ``active_era`` does not name a configured
+            era, if ``as_of`` is given and is not a
+            ``date``/``datetime`` or does not fall within
+            ``active_era``'s window, or if ``event_urls`` is empty,
+            malformed, or contains duplicates.
     """
     if path is None:
         path = DEFAULT_CONFIG_PATH
@@ -369,6 +486,30 @@ _ACTIVE: Optional[Config] = None
 
 
 def __getattr__(name: str) -> Config:
+    """Module-level attribute hook implementing lazy ``config.ACTIVE``.
+
+    PEP 562 hook: Python calls this only when a normal attribute
+    lookup on the module fails, i.e. only for ``config.ACTIVE`` here.
+    The config is loaded (via :func:`load_config`) on first access and
+    cached in the module-level ``_ACTIVE`` global for subsequent
+    accesses, so a bad ``config.json`` fails at first *use* of
+    ``ACTIVE`` rather than aborting ``import config`` (which would also
+    break pytest collection of tests asserting that invalid configs
+    raise cleanly).
+
+    Args:
+        name: The attribute name Python failed to find on this module.
+
+    Returns:
+        The cached (or newly loaded) :class:`Config` when
+        ``name == "ACTIVE"``.
+
+    Raises:
+        AttributeError: If ``name`` is anything other than
+            ``"ACTIVE"``.
+        ConfigError: If ``name == "ACTIVE"`` and ``config.json`` fails
+            validation (propagated from :func:`load_config`).
+    """
     if name == "ACTIVE":
         global _ACTIVE
         if _ACTIVE is None:
