@@ -27,7 +27,7 @@ from .cache import (
     set_cached_match,
     set_cached_page,
 )
-from .models import MapResult, Match, Team
+from .models import MapResult, Match, Team, VetoAction
 
 BASE_URL = "https://www.vlr.gg"
 USER_AGENT = (
@@ -41,6 +41,14 @@ POLITE_DELAY_SECONDS = 1.0
 _MATCH_ID_RE = re.compile(r"/(\d+)/")
 _BO_RE = re.compile(r"Bo\d+")
 _TEAM_ID_RE = re.compile(r"/team/(\d+)")
+# A veto-note segment naming an acting team and an action, e.g.
+# "NAVI ban Haven" / "FUT pick Split". The team token is any
+# non-empty run of characters before the action keyword (vlr.gg uses
+# short abbreviations like "NAVI"/"FUT"/"KRX"); the map is everything
+# after it. "ban|pick" is matched before the decider pattern below.
+_VETO_BAN_PICK_RE = re.compile(r"^(?P<team>.+?) (?P<action>ban|pick) (?P<map>.+)$")
+# A veto-note segment naming the decider map, e.g. "Sunset remains".
+_VETO_DECIDER_RE = re.compile(r"^(?P<map>.+) remains$")
 
 
 class VlrError(Exception):
@@ -267,6 +275,71 @@ def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
         ) from exc
 
 
+def _parse_veto_note(note_text: str) -> List[VetoAction]:
+    """Parse a match page's veto log free text into structured actions.
+
+    vlr.gg renders a Bo3 match's bans/picks/decider as a single
+    semicolon-separated string in the ``.match-header-note`` element,
+    e.g. ``"NAVI ban Haven; FUT ban Breeze; NAVI pick Split; ...;
+    Sunset remains"``. Each non-empty segment is matched against the
+    ban/pick pattern (``"<team> ban <map>"`` / ``"<team> pick <map>"``)
+    first, then the decider pattern (``"<map> remains"``); anything
+    matching neither fails loudly via :class:`VlrParseError` rather
+    than being silently skipped, so an unrecognized phrasing (e.g. a
+    new vlr.gg wording) never turns into a silently wrong or missing
+    veto action.
+
+    Args:
+        note_text: The stripped text of the ``.match-header-note``
+            element, semicolon-separated. May be empty or contain
+            empty/whitespace-only segments (e.g. a stray trailing
+            ``";"``); those are dropped, not errors.
+
+    Returns:
+        A list of :class:`scraper.models.VetoAction` in segment order,
+        with ``step_index`` numbered 0, 1, 2, ... over the emitted
+        actions (empty segments do not consume an index). An empty or
+        all-whitespace ``note_text`` yields an empty list.
+
+    Raises:
+        VlrParseError: If any non-empty segment matches neither the
+            ban/pick pattern nor the decider pattern. The message
+            includes the raw segment text and its 0-based index within
+            the semicolon-separated note.
+    """
+    actions: List[VetoAction] = []
+    for idx, segment in enumerate(note_text.split(";")):
+        segment = segment.strip()
+        if not segment:
+            continue
+        m = _VETO_BAN_PICK_RE.match(segment)
+        if m is not None:
+            actions.append(
+                VetoAction(
+                    step_index=len(actions),
+                    team=m.group("team"),
+                    action=m.group("action"),
+                    map_name=m.group("map"),
+                )
+            )
+            continue
+        m = _VETO_DECIDER_RE.match(segment)
+        if m is not None:
+            actions.append(
+                VetoAction(
+                    step_index=len(actions),
+                    team=None,  # forced, not chosen by either team
+                    action="decider",
+                    map_name=m.group("map"),
+                )
+            )
+            continue
+        raise VlrParseError(
+            f"unrecognized veto note segment #{idx}: {segment!r}"
+        )
+    return actions
+
+
 # --------------------------------------------------------------------------
 # Fetching
 # --------------------------------------------------------------------------
@@ -325,9 +398,11 @@ def parse_match(html: str, url: str) -> Match:
     Pure function: does no network I/O, so it can be run against saved
     HTML fixtures in tests. Extracts the event name, both teams, the
     scheduled/played date, match status (``"completed"``/``"live"``/
-    ``"upcoming"``), best-of format, overall scores, and the list of
+    ``"upcoming"``), best-of format, overall scores, the list of
     per-map results (skipping the "All Maps" overview block and any
-    placeholder ``"TBD"`` maps rendered for upcoming matches).
+    placeholder ``"TBD"`` maps rendered for upcoming matches), and the
+    ordered ban/pick/decider veto sequence parsed from the page's
+    ``.match-header-note`` element (see :func:`_parse_veto_note`).
 
     Args:
         html: The full HTML of a vlr.gg match page.
@@ -336,7 +411,9 @@ def parse_match(html: str, url: str) -> Match:
             verbatim on the returned ``Match``.
 
     Returns:
-        The parsed :class:`scraper.models.Match`.
+        The parsed :class:`scraper.models.Match`, including a
+        ``veto_actions`` list (empty when the page has no
+        ``.match-header-note`` element, e.g. upcoming matches).
 
     Raises:
         VlrParseError: If ``url`` is not a parseable match URL, or if
@@ -344,7 +421,12 @@ def parse_match(html: str, url: str) -> Match:
             ``div.match-header``, no ``.match-header-event`` (and no
             fallback event slug), fewer than two
             ``.match-header-link`` team elements, or a per-map block
-            with no map name.
+            with no map name. Also raised when a non-empty
+            ``.match-header-note`` contains a segment matching neither
+            the ban/pick pattern nor the decider pattern
+            (``"<map> remains"``) — unrecognized veto phrasing fails
+            loudly instead of being silently skipped (propagated from
+            :func:`_parse_veto_note`).
     """
     soup = BeautifulSoup(html, "lxml")
     header = soup.select_one("div.match-header")
@@ -420,6 +502,21 @@ def parse_match(html: str, url: str) -> Match:
             continue
         maps.append(map_result)
 
+    # Veto log: free text in a single .match-header-note element, a
+    # direct child of div.match-header. Most completed matches render
+    # it; upcoming matches (and a few completed ones, e.g.
+    # match_page_single_ot.html) have no such element at all. An
+    # absent or empty note yields an empty list, matching the existing
+    # convention for maps/scores that aren't available yet —
+    # _parse_veto_note raises VlrParseError on unrecognized phrasing
+    # rather than silently dropping an action.
+    note_el = header.select_one(".match-header-note")
+    veto_actions = (
+        _parse_veto_note(note_el.get_text(strip=True))
+        if note_el is not None
+        else []
+    )
+
     return Match(
         match_id=match_id,
         url=url,
@@ -431,6 +528,7 @@ def parse_match(html: str, url: str) -> Match:
         team2_score=team2_score,
         best_of=best_of,
         maps=maps,
+        veto_actions=veto_actions,
         status=status,
     )
 

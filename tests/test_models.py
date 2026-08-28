@@ -1,8 +1,10 @@
 """Tests for scraper.models — pure dataclass models, no scraping."""
 
+from datetime import datetime
+
 import pytest
 
-from scraper.models import IllegalScoreError, MapResult
+from scraper.models import IllegalScoreError, MapResult, Match, Team, VetoAction
 
 # --------------------------------------------------------------------------
 # MapResult score validity assertions
@@ -102,3 +104,74 @@ def test_partially_none_scores_do_not_raise():
     # validation applies until all three fields are present.
     MapResult(map_name="Ascent", team1_score=None, team2_score=8, winner="Team A")
     MapResult(map_name="Ascent", team1_score=8, team2_score=None, winner="Team A")
+
+
+# --------------------------------------------------------------------------
+# VetoAction / Match serialization round-trips
+# --------------------------------------------------------------------------
+
+
+def test_veto_action_dict_round_trip():
+    # A regular ban/pick action serializes to a JSON-compatible dict
+    # and back without losing any field.
+    action = VetoAction(step_index=2, team="FUT", action="pick", map_name="Ascent")
+    assert VetoAction.from_dict(action.to_dict()) == action
+
+
+def test_veto_action_decider_dict_round_trip():
+    # A decider action (team None, action "decider") round-trips too:
+    # the optional team key must deserialize back to None.
+    action = VetoAction(step_index=6, team=None, action="decider", map_name="Sunset")
+    assert VetoAction.from_dict(action.to_dict()) == action
+
+
+def test_match_dict_round_trip_with_veto_actions():
+    # A full Match (teams, maps, veto_actions) round-trips through
+    # to_dict/from_dict; a non-empty veto_actions list must survive.
+    m = Match(
+        match_id="712803",
+        url="https://www.vlr.gg/712803/x",
+        event_name="VCT 2026: EMEA Stage 2",
+        date=datetime(2026, 7, 15, 11, 0, 0),
+        team1=Team(name="FUT Esports", team_id="1184"),
+        team2=Team(name="Natus Vincere", team_id="4915"),
+        team1_score=0,
+        team2_score=2,
+        best_of="Bo3",
+        maps=[
+            MapResult(
+                map_name="Split",
+                team1_score=6,
+                team2_score=13,
+                winner="Natus Vincere",
+                duration="59:20",
+            )
+        ],
+        veto_actions=[
+            VetoAction(step_index=0, team="NAVI", action="ban", map_name="Haven"),
+            VetoAction(step_index=6, team=None, action="decider", map_name="Sunset"),
+        ],
+        status="completed",
+    )
+    assert Match.from_dict(m.to_dict()) == m
+
+
+def test_match_dict_round_trip_without_veto_actions_key():
+    # Cache rows written before veto parsing existed have no
+    # "veto_actions" key; from_dict must default to an empty list
+    # rather than raising KeyError.
+    d = {
+        "match_id": "1",
+        "url": "https://www.vlr.gg/1/x",
+        "event_name": "E",
+        "date": None,
+        "team1": {"name": "A"},
+        "team2": {"name": "B"},
+        "team1_score": None,
+        "team2_score": None,
+        "best_of": "Bo3",
+        "maps": [],
+        "status": "upcoming",
+    }
+    m = Match.from_dict(d)
+    assert m.veto_actions == []

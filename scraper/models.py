@@ -288,6 +288,76 @@ class MapResult:
 
 
 @dataclass
+class VetoAction:
+    """One step of a match's veto/bans-and-picks sequence.
+
+    Parsed from the free-text ``.match-header-note`` element on a
+    vlr.gg match page (see :func:`scraper.vlr._parse_veto_note`). The
+    action sequence is ordered: two bans, two picks, two bans and a
+    decider in a standard Bo3 (``ban, ban, pick, pick, ban, ban,
+    decider``), with different shapes for Bo1/Bo5 formats.
+
+    Attributes:
+        step_index: 0-based position of this action in the veto
+            sequence (0 for the first ban, 1 for the second, etc.).
+        team: The acting team's token exactly as it appears in the
+            note (e.g. ``"NAVI"``, ``"FUT"``) — a vlr.gg
+            abbreviation, *not* resolved to a ``Team.name`` (the
+            short forms are not mechanically derivable from the full
+            names, so resolving them risks silently mislabeling the
+            acting team). ``None`` for a decider action, which is
+            forced rather than chosen.
+        action: One of ``"ban"``, ``"pick"`` or ``"decider"``.
+        map_name: The map named in the segment (e.g. ``"Haven"``).
+    """
+
+    step_index: int
+    team: Optional[str]
+    action: str
+    map_name: str
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize this veto action to a JSON-compatible dict.
+
+        Returns:
+            A dict with keys ``"step_index"``, ``"team"``,
+            ``"action"`` and ``"map_name"``, suitable for
+            ``json.dumps`` and for round-tripping via
+            :meth:`from_dict`.
+        """
+        return {
+            "step_index": self.step_index,
+            "team": self.team,
+            "action": self.action,
+            "map_name": self.map_name,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "VetoAction":
+        """Reconstruct a ``VetoAction`` from :meth:`to_dict` output.
+
+        Args:
+            data: A dict as produced by :meth:`to_dict`, i.e.
+                containing required ``"step_index"``, ``"action"``
+                and ``"map_name"`` keys and an optional ``"team"``
+                key (``None`` for a decider action).
+
+        Returns:
+            The reconstructed ``VetoAction``.
+
+        Raises:
+            KeyError: If ``data`` has no ``"step_index"``,
+                ``"action"`` or ``"map_name"`` key.
+        """
+        return cls(
+            step_index=data["step_index"],
+            team=data.get("team"),
+            action=data["action"],
+            map_name=data["map_name"],
+        )
+
+
+@dataclass
 class Match:
     """A single vlr.gg match (completed, live or upcoming).
 
@@ -309,6 +379,11 @@ class Match:
             ``None`` if not shown.
         maps: Per-map results in the order they were played. Defaults
             to an empty list.
+        veto_actions: The ordered ban/pick/decider sequence parsed
+            from the page's ``.match-header-note`` element (see
+            :class:`VetoAction`). Defaults to an empty list — the
+            value for matches whose page renders no note (e.g.
+            upcoming matches).
         status: One of ``"completed"``, ``"live"``, ``"upcoming"``.
             Defaults to ``"upcoming"``.
     """
@@ -323,23 +398,25 @@ class Match:
     team2_score: Optional[int]
     best_of: Optional[str]  # e.g. "Bo3", "Bo5"
     maps: list[MapResult] = field(default_factory=list)
+    veto_actions: list[VetoAction] = field(default_factory=list)
     status: str = "upcoming"
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize this match to a JSON-compatible dict.
 
-        ``team1``/``team2`` and each entry of ``maps`` are recursively
-        serialized via their own ``to_dict``, and ``date`` is rendered
-        as an ISO-8601 string (or ``None``), so the result is safe to
-        pass to ``json.dumps`` — this is exactly what
-        ``scraper.cache.set_cached_match`` does before storing a match.
+        ``team1``/``team2``, each entry of ``maps`` and each entry of
+        ``veto_actions`` are recursively serialized via their own
+        ``to_dict``, and ``date`` is rendered as an ISO-8601 string
+        (or ``None``), so the result is safe to pass to ``json.dumps``
+        — this is exactly what ``scraper.cache.set_cached_match`` does
+        before storing a match.
 
         Returns:
             A dict with keys ``"match_id"``, ``"url"``,
             ``"event_name"``, ``"date"``, ``"team1"``, ``"team2"``,
             ``"team1_score"``, ``"team2_score"``, ``"best_of"``,
-            ``"maps"`` and ``"status"``, suitable for round-tripping
-            via :meth:`from_dict`.
+            ``"maps"``, ``"veto_actions"`` and ``"status"``,
+            suitable for round-tripping via :meth:`from_dict`.
         """
         return {
             "match_id": self.match_id,
@@ -352,6 +429,7 @@ class Match:
             "team2_score": self.team2_score,
             "best_of": self.best_of,
             "maps": [m.to_dict() for m in self.maps],
+            "veto_actions": [v.to_dict() for v in self.veto_actions],
             "status": self.status,
         }
 
@@ -366,12 +444,14 @@ class Match:
                 and optional ``"date"`` (an ISO-8601 string or
                 ``None``), ``"team1_score"``, ``"team2_score"``,
                 ``"best_of"``, ``"maps"`` (a list of
-                :meth:`MapResult.to_dict` dicts) and ``"status"`` keys.
+                :meth:`MapResult.to_dict` dicts), ``"veto_actions"`` (a
+                list of :meth:`VetoAction.to_dict` dicts) and
+                ``"status"`` keys.
 
         Returns:
             The reconstructed ``Match``, with nested ``team1``/
-            ``team2``/``maps`` reconstructed via their own
-            ``from_dict``.
+            ``team2``/``maps``/``veto_actions`` reconstructed via
+            their own ``from_dict``.
 
         Raises:
             KeyError: If ``data`` is missing ``"match_id"``, ``"url"``,
@@ -397,5 +477,8 @@ class Match:
             team2_score=data.get("team2_score"),
             best_of=data.get("best_of"),
             maps=[MapResult.from_dict(m) for m in data.get("maps", [])],
+            veto_actions=[
+                VetoAction.from_dict(v) for v in data.get("veto_actions", [])
+            ],
             status=data.get("status", "upcoming"),
         )

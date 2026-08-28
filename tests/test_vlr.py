@@ -7,17 +7,27 @@ import pytest
 from bs4 import BeautifulSoup
 
 from scraper import cache, vlr
-from scraper.models import Match, Team
+from scraper.models import Match, Team, VetoAction
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
 MATCH_HTML = (FIXTURES / "match_page.html").read_text(encoding="utf-8")
 UPCOMING_HTML = (FIXTURES / "match_page_upcoming.html").read_text(encoding="utf-8")
 EVENT_HTML = (FIXTURES / "event_page.html").read_text(encoding="utf-8")
+CLOSE_HTML = (FIXTURES / "match_page_close.html").read_text(encoding="utf-8")
+SINGLE_OT_HTML = (FIXTURES / "match_page_single_ot.html").read_text(encoding="utf-8")
 
 MATCH_URL = "https://www.vlr.gg/712803/fut-esports-vs-natus-vincere-vct-2026-emea-stage-2-w1"
 UPCOMING_URL = "https://www.vlr.gg/731400/fut-esports-vs-karmine-corp-vct-2026-emea-stage-2-ubf"
 EVENT_URL = "https://www.vlr.gg/event/matches/2976/vct-2026-emea-stage-2/?group=completed"
+CLOSE_URL = (
+    "https://www.vlr.gg/742478/gen-g-vs-nongshim-redforce-"
+    "vct-2026-pacific-stage-2-ubsf"
+)
+SINGLE_OT_URL = (
+    "https://www.vlr.gg/731773/team-liquid-brazil-vs-evil-geniuses-gc-"
+    "game-changers-2026-brazil-finals-ubsf"
+)
 
 
 # --------------------------------------------------------------------------
@@ -216,6 +226,106 @@ def test_parse_match_rejects_non_match_page():
 def test_parse_match_extracts_match_id_from_url_not_html():
     m = vlr.parse_match(MATCH_HTML, "https://www.vlr.gg/999999/some-other-slug")
     assert m.match_id == "999999"
+
+
+# --------------------------------------------------------------------------
+# _parse_veto_note
+# --------------------------------------------------------------------------
+
+# The exact (stripped) .match-header-note text from match_page.html:
+# a standard Bo3 shape of ban, ban, pick, pick, ban, ban, decider.
+VETO_NOTE = (
+    "NAVI ban Haven; FUT ban Breeze; NAVI pick Split; FUT pick Ascent; "
+    "NAVI ban Lotus; FUT ban Summit; Sunset remains"
+)
+
+
+def test_parse_veto_note_happy_path():
+    # The full 7-segment Bo3 veto log parses into 7 VetoActions in
+    # order: ban, ban, pick, pick, ban, ban, decider — each with the
+    # right team token, action and map, and sequential step_index.
+    actions = vlr._parse_veto_note(VETO_NOTE)
+    assert len(actions) == 7
+    assert [a.step_index for a in actions] == [0, 1, 2, 3, 4, 5, 6]
+    assert [(a.team, a.action) for a in actions] == [
+        ("NAVI", "ban"),
+        ("FUT", "ban"),
+        ("NAVI", "pick"),
+        ("FUT", "pick"),
+        ("NAVI", "ban"),
+        ("FUT", "ban"),
+        (None, "decider"),
+    ]
+    assert [a.map_name for a in actions] == [
+        "Haven",
+        "Breeze",
+        "Split",
+        "Ascent",
+        "Lotus",
+        "Summit",
+        "Sunset",
+    ]
+    # Spot-check full equality on the first and last actions.
+    assert actions[0] == VetoAction(step_index=0, team="NAVI", action="ban", map_name="Haven")
+    assert actions[6] == VetoAction(step_index=6, team=None, action="decider", map_name="Sunset")
+
+
+def test_parse_veto_note_unrecognized_segment_raises():
+    # A segment matching neither the ban/pick nor the decider pattern
+    # must fail loudly with the raw segment text in the message, not
+    # be silently skipped.
+    with pytest.raises(vlr.VlrParseError) as excinfo:
+        vlr._parse_veto_note("NAVI ban Haven; NAVI swaps Haven")
+    assert "NAVI swaps Haven" in str(excinfo.value)
+
+
+def test_parse_veto_note_empty_or_whitespace_returns_empty():
+    # An empty or all-whitespace note yields no actions rather than
+    # raising.
+    assert vlr._parse_veto_note("") == []
+    assert vlr._parse_veto_note("   ") == []
+
+
+def test_parse_veto_note_stray_trailing_semicolon_is_dropped():
+    # A stray trailing ';' produces an empty final segment which is
+    # dropped; the remaining segment still parses with step_index 0.
+    actions = vlr._parse_veto_note("NAVI ban Haven;")
+    assert actions == [VetoAction(step_index=0, team="NAVI", action="ban", map_name="Haven")]
+
+
+# --------------------------------------------------------------------------
+# parse_match — veto_actions end to end
+# --------------------------------------------------------------------------
+
+
+def test_parse_match_veto_actions_populated():
+    # match_page.html carries a real .match-header-note; parse_match
+    # must surface it as 7 structured actions on the Match.
+    m = vlr.parse_match(MATCH_HTML, MATCH_URL)
+    assert len(m.veto_actions) == 7
+    assert m.veto_actions[0] == VetoAction(step_index=0, team="NAVI", action="ban", map_name="Haven")
+    assert m.veto_actions[2] == VetoAction(step_index=2, team="NAVI", action="pick", map_name="Split")
+    assert m.veto_actions[6] == VetoAction(step_index=6, team=None, action="decider", map_name="Sunset")
+
+
+def test_parse_match_veto_actions_populated_second_fixture():
+    # A second real Bo3 fixture (match_page_close.html, GEN vs NS)
+    # also renders a note; the parser must populate it too.
+    m = vlr.parse_match(CLOSE_HTML, CLOSE_URL)
+    assert len(m.veto_actions) == 7
+    assert m.veto_actions[0] == VetoAction(step_index=0, team="NS", action="ban", map_name="Lotus")
+    assert m.veto_actions[5] == VetoAction(step_index=5, team="GEN", action="ban", map_name="Abyss")
+    assert m.veto_actions[6] == VetoAction(step_index=6, team=None, action="decider", map_name="Sunset")
+
+
+def test_parse_match_veto_actions_empty_when_no_note():
+    # match_page_single_ot.html and match_page_upcoming.html have no
+    # .match-header-note element; veto_actions must be an empty list,
+    # not an error (same convention as unavailable maps/scores).
+    m = vlr.parse_match(SINGLE_OT_HTML, SINGLE_OT_URL)
+    assert m.veto_actions == []
+    m = vlr.parse_match(UPCOMING_HTML, UPCOMING_URL)
+    assert m.veto_actions == []
 
 
 # --------------------------------------------------------------------------
