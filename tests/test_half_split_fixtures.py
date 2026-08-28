@@ -371,6 +371,22 @@ def test_parse_half_split_partial_side_reports_none_not_zero():
     assert vlr._parse_half_split(team_div) == (6, None, 6, None)
 
 
+def test_parse_half_split_extra_span_does_not_shift_halves():
+    # Round-3 review finding regression: the half slots come from
+    # position among the recognized mod-t/mod-ct spans only, never the
+    # raw DOM index — an unrelated <span> rendered ahead of the two
+    # half spans (e.g. a seed number or flag icon added to the
+    # template) must not shift the first half's count into the
+    # second-half slot or null it. (Fails on the pre-fix code, which
+    # keyed the slots off enumerate() position over all spans.)
+    team_div = BeautifulSoup(
+        '<div class="team"><span class="mod-seed">1</span>'
+        '<span class="mod-t">4</span><span class="mod-ct">2</span></div>',
+        "lxml",
+    ).select_one(".team")
+    assert vlr._parse_half_split(team_div) == (4, 2, 4, 2)
+
+
 def test_truncated_second_half_does_not_raise():
     # Deviation from plan#2's literal "combined second half == 12":
     # the real Split fixture's second half sums to 7 (2+5) because

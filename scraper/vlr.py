@@ -82,6 +82,15 @@ class VlrRobotsError(VlrError):
     """A URL is disallowed by the site's robots.txt."""
 
 
+# The failure types that mean "this one match/event went wrong", not
+# "the whole run is broken": ``get_matches_from_event`` catches these
+# per match (log and skip) and ``scrape.main`` catches the same set
+# per event (log and skip). Defined once here — rather than duplicated
+# at each catch site — so the two error-isolation layers cannot
+# silently diverge when a new recoverable exception type is added.
+RECOVERABLE_EXCEPTIONS = (VlrFetchError, VlrParseError, IllegalScoreError)
+
+
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
@@ -280,11 +289,12 @@ def _parse_half_split(team_div_el):
     three sibling ``<span>`` elements inside the team's ``.team`` div
     in its ``.vm-stats-game-header`` (e.g. ``<span class="mod-ct">4</span>
     / <span class="mod-t">2</span>``). Span **DOM order is the half
-    order**: the first span is always the team's first-half round
-    count, the second its second-half count — which side a team
-    started on is not fixed, so the half slot comes from position,
-    never from the class — while each span's class names the side:
-    ``mod-t`` = attacking that half, ``mod-ct`` = defending. A third
+    order**: the first recognized ``mod-t``/``mod-ct`` span is always
+    the team's first-half round count, the second its second-half
+    count — which side a team started on is not fixed, so the half
+    slot comes from position among the recognized half spans, never
+    from the class — while each span's class names the side: ``mod-t``
+    = attacking that half, ``mod-ct`` = defending. A third
     ``mod-ot`` span (maps that went to overtime) carries the team's
     total OT rounds; it is read for completeness but not returned,
     since the header markup exposes OT only as a combined per-team
@@ -299,8 +309,11 @@ def _parse_half_split(team_div_el):
     Returns:
         A 4-tuple ``(first_half_rounds, second_half_rounds,
         atk_rounds, def_rounds)``. The half values are the parsed
-        round counts of the spans at DOM positions 0 and 1 (the
-        regulation halves); ``atk_rounds``/``def_rounds`` are the sums
+        round counts of the first two recognized ``mod-t``/``mod-ct``
+        spans in DOM order (the regulation halves) — position among
+        the recognized spans only, so an unrelated span rendered ahead
+        of them cannot shift a half's count into the wrong slot;
+        ``atk_rounds``/``def_rounds`` are the sums
         of the ``mod-t``/``mod-ct`` spans (regulation only — a
         ``mod-ot`` value is excluded), or ``None`` for a side whose
         span never parsed — e.g. a live match's in-progress half
@@ -322,8 +335,14 @@ def _parse_half_split(team_div_el):
     second_half_rounds: Optional[int] = None
     atk_rounds: Optional[int] = None
     def_rounds: Optional[int] = None
+    # ``recognized`` is the span's position among the mod-t/mod-ct
+    # spans only (incremented before the parse check, so an unparseable
+    # first-half value does not shift the second half into the
+    # first-half slot). The raw DOM index is deliberately not used: an
+    # unrelated <span> rendered ahead of the two half spans (e.g. a
+    # seed number or flag icon) must not swap or null a half's count.
     recognized = 0
-    for idx, span_el in enumerate(team_div_el.select("span")):
+    for span_el in team_div_el.select("span"):
         classes = span_el.get("class") or []
         if "mod-t" in classes:
             side = "atk"
@@ -334,17 +353,17 @@ def _parse_half_split(team_div_el):
             # placeholder's bare "mod-" class contribute to neither
             # the atk/def totals nor the regulation half slots.
             continue
+        recognized += 1
         value = _parse_int(span_el.get_text(strip=True))
         if value is None:
             continue
-        recognized += 1
         if side == "atk":
             atk_rounds = value if atk_rounds is None else atk_rounds + value
         else:
             def_rounds = value if def_rounds is None else def_rounds + value
-        if idx == 0:
+        if recognized == 1:
             first_half_rounds = value
-        elif idx == 1:
+        elif recognized == 2:
             second_half_rounds = value
     if recognized == 0:
         return None, None, None, None
@@ -1183,7 +1202,7 @@ def get_matches_from_event(
                 time.sleep(POLITE_DELAY_SECONDS)
             fetched = True
             matches.append(get_match(url, use_cache=use_cache))
-        except (VlrFetchError, VlrParseError, IllegalScoreError) as exc:
+        except RECOVERABLE_EXCEPTIONS as exc:
             # One bad match must not discard the matches already
             # parsed/cached for this event: log and move on, so a
             # partial run's summary still counts what succeeded. The

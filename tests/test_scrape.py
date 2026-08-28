@@ -267,3 +267,25 @@ def test_main_no_cache_forwards_use_cache_false(monkeypatch, caplog):
     monkeypatch.setattr(scrape.vlr, "get_matches_from_event", _FakeScraper(calls))
     assert scrape.main(["--no-cache"]) == 0
     assert calls == [(EVENT_URLS[0], False), (EVENT_URLS[1], False)]
+
+
+# --------------------------------------------------------------------------
+# _RECOVERABLE_EXCEPTIONS — single source of truth
+# --------------------------------------------------------------------------
+
+
+def test_recoverable_exceptions_single_source_of_truth():
+    # Round-3 review finding regression: scrape.py must not maintain
+    # its own copy of the recoverable-exception set — the per-event
+    # isolation in scrape.main and the per-match isolation in
+    # vlr.get_matches_from_event share one tuple
+    # (vlr.RECOVERABLE_EXCEPTIONS), so adding a recoverable exception
+    # type in one place can never silently leave the other layer
+    # swallowing a different set. (Fails on the pre-fix code, which
+    # hard-coded a second copy here.)
+    assert scrape._RECOVERABLE_EXCEPTIONS is vlr.RECOVERABLE_EXCEPTIONS
+    assert set(scrape._RECOVERABLE_EXCEPTIONS) == {
+        vlr.VlrFetchError,
+        vlr.VlrParseError,
+        IllegalScoreError,
+    }

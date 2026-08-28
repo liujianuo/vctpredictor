@@ -38,7 +38,6 @@ from typing import List, Optional, Sequence
 
 import config
 from scraper import vlr
-from scraper.models import IllegalScoreError
 
 logger = logging.getLogger(__name__)
 
@@ -46,11 +45,11 @@ logger = logging.getLogger(__name__)
 # run is broken": a bad event is logged and skipped so the remaining
 # configured events still get scraped. Anything not listed here (a
 # programming error) propagates instead of being silently swallowed.
-_RECOVERABLE_EXCEPTIONS = (
-    vlr.VlrFetchError,
-    vlr.VlrParseError,
-    IllegalScoreError,
-)
+# The tuple itself is defined once in scraper.vlr
+# (RECOVERABLE_EXCEPTIONS), which uses the same set for its per-match
+# isolation in get_matches_from_event; this module only aliases it, so
+# the two error-isolation layers cannot silently diverge.
+_RECOVERABLE_EXCEPTIONS = vlr.RECOVERABLE_EXCEPTIONS
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
