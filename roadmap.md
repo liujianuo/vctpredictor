@@ -36,7 +36,7 @@ and target event URLs.
 - Size: **S**
 - Depends on: —
 
-### M1. Exact score parsing + validity assertions
+### M1. Exact score parsing + validity assertions [x]
 Capture the full final map score including OT rounds, and assert validity on
 parse: winner ≥ 13, both teams ≥ 12 implies overtime, margin ≥ 2 in OT. Fail
 loudly rather than storing a silently wrong label.
