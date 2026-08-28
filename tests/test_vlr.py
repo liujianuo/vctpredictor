@@ -1,5 +1,6 @@
 """Tests for scraper.vlr against saved HTML fixtures (no live network)."""
 
+import json
 from datetime import datetime
 from pathlib import Path
 from urllib.robotparser import RobotFileParser
@@ -691,3 +692,78 @@ def test_get_matches_from_event_skips_single_match_failure(
     assert len(matches) == len(links) - 1
     assert "connection refused" in caplog.text
     assert bad_id in caplog.text
+
+
+def test_get_matches_from_event_skips_cached_illegal_score_row(
+    monkeypatch, tmp_path, caplog
+):
+    # Round-2 review finding: the cached fast path called get_match
+    # (and get_cached_match) outside the per-match try/except, so a
+    # cached row that deserializes to an illegal final score raised
+    # IllegalScoreError out of get_matches_from_event, discarding every
+    # match already parsed for the event. It must instead be logged and
+    # skipped like any other per-match failure, with the event's other
+    # matches still parsed.
+    monkeypatch.setattr(cache, "DEFAULT_DB_PATH", tmp_path / "c.sqlite3")
+    monkeypatch.setattr(vlr, "POLITE_DELAY_SECONDS", 0)
+    links = vlr.parse_event_match_links(EVENT_HTML)
+    bad_id = vlr.extract_match_id(links[0])
+
+    # Seed the cache with a row that deserializes but fails score
+    # validity (13-12 with a declared winner is an illegal OT
+    # scoreline), which get_cached_match propagates loudly as
+    # IllegalScoreError rather than treating as a miss.
+    conn = cache.get_connection(tmp_path / "c.sqlite3")
+    try:
+        conn.execute(
+            "INSERT INTO matches (match_id, url, data, cached_at) VALUES (?, ?, ?, ?)",
+            (
+                bad_id,
+                "https://www.vlr.gg/" + bad_id + "/x",
+                json.dumps(
+                    {
+                        "match_id": bad_id,
+                        "url": "https://www.vlr.gg/" + bad_id + "/x",
+                        "event_name": "Test Event",
+                        "date": None,
+                        "team1": {"name": "Alpha", "team_id": "1"},
+                        "team2": {"name": "Beta", "team_id": "2"},
+                        "team1_score": 1,
+                        "team2_score": 0,
+                        "best_of": "Bo3",
+                        "maps": [
+                            {
+                                "map_name": "Ascent",
+                                "team1_score": 13,
+                                "team2_score": 12,
+                                "winner": "Alpha",
+                                "duration": "41:10",
+                            }
+                        ],
+                        "status": "completed",
+                    }
+                ),
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    calls = {"n": 0}
+
+    def fake_get(url, **kwargs):
+        calls["n"] += 1
+        if "event/matches" in url:
+            return _FakeResponse(EVENT_HTML)
+        return _FakeResponse(MATCH_HTML)
+
+    monkeypatch.setattr(vlr.requests, "get", fake_get)
+    matches = vlr.get_matches_from_event(EVENT_URL)
+    assert bad_id not in {m.match_id for m in matches}
+    assert len(matches) == len(links) - 1
+    assert bad_id in caplog.text
+    assert "skipping" in caplog.text
+    # Event page + one fetch per non-bad match; the bad cached match is
+    # skipped without any network call.
+    assert calls["n"] == len(matches) + 1

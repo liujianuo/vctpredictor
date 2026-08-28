@@ -1115,7 +1115,11 @@ def get_matches_from_event(
       ``VlrParseError`` / ``IllegalScoreError``) is logged and skipped
       rather than aborting the whole event, so matches already parsed
       and durably cached before the failure still count in the caller's
-      run summary.
+      run summary. The cached fast path is covered by the same
+      isolation: a cached row that deserializes to an illegal final map
+      score (``IllegalScoreError`` raised by
+      :func:`cache.get_cached_match`) is logged and skipped too, not
+      propagated to the caller.
 
     Args:
         event_url: The vlr.gg event matches page URL.
@@ -1149,10 +1153,13 @@ def get_matches_from_event(
             match's ``veto_actions`` empty — so a single match's veto
             note can never discard the other matches already parsed
             from the event.
-        IllegalScoreError: No longer raised from a per-match failure
-            (caught, logged, and skipped like the other two); it can
-            still escape :func:`get_match` when that function is called
-            directly.
+        IllegalScoreError: No longer raised from a per-match failure on
+            either the uncached path or the cached fast path — a
+            cached row deserializing to an illegal final map score
+            (raised by :func:`cache.get_cached_match`) is caught,
+            logged, and skipped like the other two per-match failures.
+            It can still escape :func:`get_match` when that function is
+            called directly.
     """
     html = fetch_page(event_url, use_cache=use_cache)
     links = parse_event_match_links(html)
@@ -1168,17 +1175,21 @@ def get_matches_from_event(
                     "robots.txt disallows match %s: %s; skipping", url, exc
                 )
                 continue
-        if use_cache and get_cached_match(extract_match_id(url)) is not None:
-            matches.append(get_match(url, use_cache=True))
-            continue
-        if fetched:
-            time.sleep(POLITE_DELAY_SECONDS)
-        fetched = True
         try:
+            if use_cache and get_cached_match(extract_match_id(url)) is not None:
+                matches.append(get_match(url, use_cache=True))
+                continue
+            if fetched:
+                time.sleep(POLITE_DELAY_SECONDS)
+            fetched = True
             matches.append(get_match(url, use_cache=use_cache))
         except (VlrFetchError, VlrParseError, IllegalScoreError) as exc:
             # One bad match must not discard the matches already
             # parsed/cached for this event: log and move on, so a
-            # partial run's summary still counts what succeeded.
+            # partial run's summary still counts what succeeded. The
+            # same catch covers the cached fast path, where a corrupt
+            # cached row deserializing to an illegal score raises
+            # IllegalScoreError from get_cached_match (both the
+            # condition check above and the call inside get_match).
             logger.warning("match %s failed: %s; skipping", url, exc)
     return matches
