@@ -72,40 +72,84 @@ class Team:
 
 @dataclass
 class PlayerStats:
-    """Minimal per-player stats.
+    """Per-player, per-map statistics from a vlr.gg stats table.
 
-    Reserved for future stats scraping (not populated by the current
-    parsers). Kept in the model so the schema exists before the
-    stats tables on vlr.gg get parsed.
+    One instance per player row in a map's ``.ovw-table`` block (see
+    :func:`scraper.vlr._parse_player_stats_table`). All numeric
+    fields are parsed best-effort from the table's ``.side.mod-both``
+    cells — the map-total values, not the per-half ``mod-t``/``mod-ct``
+    splits, which belong to a later milestone — and are ``None`` when
+    the cell is empty or unparseable (e.g. a future ``"-"`` value).
+    ``kast`` and ``hs_pct`` are percentages stored without the ``%``
+    sign (``74.0`` for ``"74%"``).
 
     Attributes:
         player_name: The player's in-game name.
         team_name: Name of the team the player was on for this stat
             line (matches a ``Team.name``, not a foreign key).
-        rating: The player's vlr.gg "Rating" stat, or ``None`` if not
-            yet populated.
-        acs: The player's Average Combat Score, or ``None`` if not yet
-            populated.
+        rating: The player's vlr.gg "Rating 2.0" stat, or ``None`` if
+            unavailable/unparseable.
+        acs: The player's Average Combat Score, or ``None`` if
+            unavailable/unparseable.
+        kills: Kills on this map, or ``None`` if unavailable.
+        deaths: Deaths on this map, or ``None`` if unavailable.
+        assists: Assists on this map, or ``None`` if unavailable.
+        adr: Average Damage per Round, or ``None`` if unavailable.
+        kast: KAST percentage as a plain float (``74.0`` for
+            ``"74%"``), or ``None`` if unavailable.
+        hs_pct: Headshot percentage as a plain float (``27.0`` for
+            ``"27%"``), or ``None`` if unavailable.
+        first_kills: First-kill count on this map, or ``None`` if
+            unavailable. The raw count vlr.gg renders under its "FK"
+            column — not a per-round rate (plan assumption 2).
+        first_deaths: First-death count on this map, or ``None`` if
+            unavailable. The raw count from vlr.gg's "FD" column —
+            not a per-round rate (plan assumption 2).
+        agents: The agents this player used on the map, in the order
+            vlr.gg lists them (an agent swap mid-map yields more than
+            one entry, in swap order — plan assumption 1). Defaults
+            to an empty list.
     """
 
     player_name: str
     team_name: str
     rating: Optional[float] = None
     acs: Optional[float] = None
+    kills: Optional[int] = None
+    deaths: Optional[int] = None
+    assists: Optional[int] = None
+    adr: Optional[float] = None
+    kast: Optional[float] = None
+    hs_pct: Optional[float] = None
+    first_kills: Optional[int] = None
+    first_deaths: Optional[int] = None
+    agents: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize these stats to a JSON-compatible dict.
 
         Returns:
             A dict with keys ``"player_name"``, ``"team_name"``,
-            ``"rating"`` and ``"acs"``, suitable for ``json.dumps`` and
-            for round-tripping via :meth:`from_dict`.
+            ``"rating"``, ``"acs"``, ``"kills"``, ``"deaths"``,
+            ``"assists"``, ``"adr"``, ``"kast"``, ``"hs_pct"``,
+            ``"first_kills"``, ``"first_deaths"`` and ``"agents"``
+            (a copy of the agents list), suitable for ``json.dumps``
+            and for round-tripping via :meth:`from_dict`.
         """
         return {
             "player_name": self.player_name,
             "team_name": self.team_name,
             "rating": self.rating,
             "acs": self.acs,
+            "kills": self.kills,
+            "deaths": self.deaths,
+            "assists": self.assists,
+            "adr": self.adr,
+            "kast": self.kast,
+            "hs_pct": self.hs_pct,
+            "first_kills": self.first_kills,
+            "first_deaths": self.first_deaths,
+            "agents": list(self.agents),
         }
 
     @classmethod
@@ -115,8 +159,10 @@ class PlayerStats:
         Args:
             data: A dict as produced by :meth:`to_dict`, i.e.
                 containing required ``"player_name"`` and
-                ``"team_name"`` keys and optional ``"rating"`` and
-                ``"acs"`` keys.
+                ``"team_name"`` keys and optional keys for every
+                other field (``"agents"`` defaults to an empty list
+                when absent, so rows cached before this task parsed
+                stats still deserialize).
 
         Returns:
             The reconstructed ``PlayerStats``.
@@ -130,6 +176,15 @@ class PlayerStats:
             team_name=data["team_name"],
             rating=data.get("rating"),
             acs=data.get("acs"),
+            kills=data.get("kills"),
+            deaths=data.get("deaths"),
+            assists=data.get("assists"),
+            adr=data.get("adr"),
+            kast=data.get("kast"),
+            hs_pct=data.get("hs_pct"),
+            first_kills=data.get("first_kills"),
+            first_deaths=data.get("first_deaths"),
+            agents=list(data.get("agents", [])),
         )
 
 
@@ -147,8 +202,17 @@ class MapResult:
             is a team *name* string, not a ``Team`` reference).
         duration: Map duration as displayed on vlr.gg, e.g.
             ``"59:20"``, or ``None`` if not shown.
-        agent_picks: Reserved for future agent-pick data; not
-            populated by the current parsers.
+        agent_picks: Composition-summary of each team's agent picks
+            on this map: a dict mapping each team's resolved name to
+            the list of agents its players used, one entry per player
+            in table row order (only the first-listed agent for a
+            player who swapped mid-map — the full swap history stays
+            on that player's ``PlayerStats.agents``). ``None`` when
+            the map rendered no stats tables at all.
+        player_stats: Every player-map stat line for this map, both
+            teams combined, in the order the tables render
+            ``(team1 rows..., team2 rows...)``. Empty when the map
+            rendered no stats tables.
 
     Raises:
         IllegalScoreError (a ``ValueError`` subclass): In
@@ -165,7 +229,8 @@ class MapResult:
     team2_score: Optional[int]
     winner: Optional[str]  # name of the winning team (None if unknown)
     duration: Optional[str] = None  # e.g. "59:20" as displayed on vlr.gg
-    agent_picks: Optional[dict[str, Any]] = None  # reserved; not populated yet
+    agent_picks: Optional[dict[str, list[str]]] = None  # team name -> per-player agent list
+    player_stats: list[PlayerStats] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Validate a finished map's score after construction.
@@ -245,9 +310,11 @@ class MapResult:
 
         Returns:
             A dict with keys ``"map_name"``, ``"team1_score"``,
-            ``"team2_score"``, ``"winner"``, ``"duration"`` and
-            ``"agent_picks"``, suitable for ``json.dumps`` and for
-            round-tripping via :meth:`from_dict`.
+            ``"team2_score"``, ``"winner"``, ``"duration"``,
+            ``"agent_picks"`` and ``"player_stats"`` (each entry
+            serialized via :meth:`PlayerStats.to_dict`), suitable for
+            ``json.dumps`` and for round-tripping via
+            :meth:`from_dict`.
         """
         return {
             "map_name": self.map_name,
@@ -256,6 +323,7 @@ class MapResult:
             "winner": self.winner,
             "duration": self.duration,
             "agent_picks": self.agent_picks,
+            "player_stats": [ps.to_dict() for ps in self.player_stats],
         }
 
     @classmethod
@@ -266,7 +334,12 @@ class MapResult:
             data: A dict as produced by :meth:`to_dict`, i.e.
                 containing a required ``"map_name"`` key and optional
                 ``"team1_score"``, ``"team2_score"``, ``"winner"``,
-                ``"duration"`` and ``"agent_picks"`` keys.
+                ``"duration"``, ``"agent_picks"`` and
+                ``"player_stats"`` (a list of
+                :meth:`PlayerStats.to_dict` dicts) keys.
+                ``"player_stats"`` defaults to an empty list when
+                absent, so cache rows written before stats parsing
+                existed still deserialize.
 
         Returns:
             The reconstructed ``MapResult``.
@@ -284,6 +357,9 @@ class MapResult:
             winner=data.get("winner"),
             duration=data.get("duration"),
             agent_picks=data.get("agent_picks"),
+            player_stats=[
+                PlayerStats.from_dict(ps) for ps in data.get("player_stats", [])
+            ],
         )
 
 

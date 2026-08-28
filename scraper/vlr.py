@@ -28,7 +28,7 @@ from .cache import (
     set_cached_match,
     set_cached_page,
 )
-from .models import MapResult, Match, Team, VetoAction
+from .models import MapResult, Match, PlayerStats, Team, VetoAction
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +121,33 @@ def _parse_int(text: str) -> Optional[int]:
         return None
 
 
+def _parse_float(text: str) -> Optional[float]:
+    """Best-effort parse of a stripped string as a float.
+
+    Mirrors :func:`_parse_int`'s best-effort-``None`` convention, with
+    one extra accommodation: vlr.gg renders percentage columns (KAST,
+    HS%) as ``"74%"`` / ``"27%"``, so an optional trailing ``%``
+    sign is stripped before parsing. Whole numbers parse to floats
+    (``"171"`` -> ``171.0``) so callers can rely on a uniform float
+    type for all continuous stats.
+
+    Args:
+        text: The text to parse, e.g. text scraped from a stats cell.
+            Leading/trailing whitespace and one optional trailing
+            ``%`` are stripped before parsing.
+
+    Returns:
+        The parsed ``float``, or ``None`` if ``text`` (after
+        stripping) is not a valid float literal (e.g. ``""``,
+        ``"-"``, ``"TBD"``).
+    """
+    text = text.strip().rstrip("%")
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
 def _parse_team(link_el) -> Team:
     """Parse a team from a ``.match-header-link`` element.
 
@@ -148,6 +175,88 @@ def _parse_team(link_el) -> Team:
     return Team(name=name, team_id=m.group(1) if m else None)
 
 
+def _parse_player_stats_table(table_el, team_name: str) -> List[PlayerStats]:
+    """Parse one team's player-stats table from a map's stats block.
+
+    vlr.gg renders each completed map's per-player stats as two
+    ``.ovw-table`` divs (not ``<table>`` elements) inside its
+    ``.vm-stats-game`` block — one per team, in document order
+    (team1 first, team2 second) — mirroring the DOM-order convention
+    ``_parse_map`` already uses for scores. Each table has one header
+    row (``.ovw-row.mod-head``, skipped) and one row per player
+    (``.ovw-row``). A player row carries a ``.ovw-player-name``, a
+    ``.ovw-agents`` cell with one ``<img>`` per agent the player used
+    on the map, and one ``[data-col]`` cell per stat column; the
+    column name lives in the ``data-col`` attribute (on the cell
+    itself, or on inner ``.ovw-kda-stat`` spans for the K/D/A trio)
+    and the map-total value in that cell's nested ``.side.mod-both``
+    span. Only the ``mod-both`` value is read — the ``mod-t``/
+    ``mod-ct`` half splits belong to a later milestone (roadmap M6).
+
+    Args:
+        table_el: A BeautifulSoup ``Tag`` for one ``.ovw-table``
+            element within a per-map ``.vm-stats-game`` block.
+        team_name: The resolved ``Team.name`` this table's players
+            belong to (the plan's positional convention — the table's
+            DOM position pins it to team1 or team2, so the
+            ``.ovw-player-tag`` abbreviation is never needed). Stored
+            on every returned ``PlayerStats``.
+
+    Returns:
+        A list of :class:`scraper.models.PlayerStats`, one per player
+        row in table order. Empty/unparseable numeric cells parse to
+        ``None`` via the same best-effort convention as
+        ``_parse_int``/``_parse_float`` (e.g. a future ``"-"`` value),
+        never raising; ``agents`` holds every agent image's ``alt``
+        text in render order (an agent swap mid-map yields more than
+        one entry).
+
+    Raises:
+        VlrParseError: If a player row has no ``.ovw-player-name``
+            or it is empty — the table exists but its shape is
+            broken, so this fails loudly (per the module's
+            fail-loud-on-unrecognized-structure convention) rather
+            than silently dropping the row.
+    """
+    players: List[PlayerStats] = []
+    for row_el in table_el.select(".ovw-row"):
+        if "mod-head" in (row_el.get("class") or []):
+            continue
+        name_el = row_el.select_one(".ovw-player-name")
+        player_name = name_el.get_text(strip=True) if name_el is not None else ""
+        if not player_name:
+            raise VlrParseError(
+                "player stats row without a player name (.ovw-player-name)"
+            )
+        cells = {}
+        for el in row_el.select("[data-col]"):
+            side_el = el.select_one(".side.mod-both")
+            cells[el.get("data-col")] = (
+                side_el.get_text(strip=True) if side_el is not None else ""
+            )
+        agents = [
+            img.get("alt") for img in row_el.select(".ovw-agents img") if img.get("alt")
+        ]
+        players.append(
+            PlayerStats(
+                player_name=player_name,
+                team_name=team_name,
+                rating=_parse_float(cells.get("rating2", "")),
+                acs=_parse_float(cells.get("acs", "")),
+                kills=_parse_int(cells.get("kills", "")),
+                deaths=_parse_int(cells.get("deaths", "")),
+                assists=_parse_int(cells.get("assists", "")),
+                adr=_parse_float(cells.get("adr", "")),
+                kast=_parse_float(cells.get("kast", "")),
+                hs_pct=_parse_float(cells.get("hsp", "")),
+                first_kills=_parse_int(cells.get("fb", "")),
+                first_deaths=_parse_int(cells.get("fd", "")),
+                agents=agents,
+            )
+        )
+    return players
+
+
 def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
     """Parse one played map's result from a ``.vm-stats-game`` block.
 
@@ -155,13 +264,16 @@ def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
         game_el: A BeautifulSoup ``Tag`` for one ``.vm-stats-game``
             element, expected to contain a ``.vm-stats-game-header``
             with the map name, per-team score, win indicator and
-            duration.
+            duration, plus (for real maps) two ``.ovw-table`` stat
+            blocks, one per team.
         team1: The match's team1, used to resolve the map winner's
             name when the ``.score.mod-win`` element is on the
-            left-hand (``mod-1``) side.
+            left-hand (``mod-1``) side, and to label the first
+            ``.ovw-table``'s players.
         team2: The match's team2, used to resolve the map winner's
             name when the ``.score.mod-win`` element is on the
-            right-hand (``mod-right``) side.
+            right-hand (``mod-right``) side, and to label the second
+            ``.ovw-table``'s players.
 
     Returns:
         A :class:`scraper.models.MapResult` with the parsed map name,
@@ -169,8 +281,17 @@ def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
         as an integer), the winner's team name (``None`` if no
         ``.score.mod-win`` element was found, or if either score is
         missing so the declared winner cannot be verified against the
-        final scores), and the map duration. ``agent_picks`` is always
-        ``None`` (not yet parsed from stats tables).
+        final scores), the map duration, and — when the map rendered
+        two ``.ovw-table`` stat blocks — ``player_stats`` (every
+        player-map stat line, team1 rows then team2 rows) and
+        ``agent_picks`` (a dict mapping each team's resolved name to
+        the list of agents its players used, one entry per player in
+        table row order, first-listed agent only). A map block with
+        no ``.ovw-table`` at all (e.g. a future awarded/abandoned map
+        that never rendered stats) yields ``player_stats == []`` and
+        ``agent_picks is None`` — the same soft-missing treatment
+        ``duration``/``winner`` get — while a block with exactly one
+        table is a structural break and raises (see Raises).
 
     Raises:
         VlrParseError: If ``game_el`` has no ``.vm-stats-game-header``,
@@ -178,9 +299,14 @@ def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
             parsed final score is illegal (a winner with fewer than
             13 rounds, or an overtime scoreline with margin < 2), or
             the winner label contradicts the final scores (the
-            winning side must be the one with more rounds). The
-            illegal-score and winner-mismatch cases include the map
-            name and both scores in the message.
+            winning side must be the one with more rounds), or the
+            block has a non-0/non-2 count of ``.ovw-table`` elements
+            (one team's stats missing is a broken render, not a valid
+            soft-missing state), or a player row inside a present
+            table has no ``.ovw-player-name`` (propagated from
+            :func:`_parse_player_stats_table`). The illegal-score and
+            winner-mismatch cases include the map name and both
+            scores in the message.
     """
     header_el = game_el.select_one(".vm-stats-game-header")
     if header_el is None:
@@ -257,6 +383,44 @@ def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
     duration_el = header_el.select_one(".map-duration")
     duration = duration_el.get_text(strip=True) if duration_el is not None else None
 
+    # Per-player stats and agent picks. A real map renders exactly two
+    # .ovw-table blocks (one per team, team1 in document order first),
+    # each parsed positionally like the scores above. Zero tables is
+    # the soft-missing case (e.g. a future awarded/abandoned map that
+    # never rendered stats): player_stats stays [] and agent_picks
+    # None, the same treatment _parse_map already gives duration/
+    # winner. Any other count is a structural break — a half-rendered
+    # table set would silently drop one team's stats, so it fails
+    # loudly (per the fail-loud-on-unrecognized-structure convention)
+    # instead. The upcoming-match placeholder blocks also carry two
+    # tables; their rows have player names but empty stat cells and no
+    # agents, which parse to None/[] here — parse_match discards the
+    # whole block by its "TBD" map name afterwards, so no placeholder
+    # data ever reaches the cache.
+    tables = game_el.select(".ovw-table")
+    player_stats: List[PlayerStats] = []
+    agent_picks = None
+    if len(tables) not in (0, 2):
+        raise VlrParseError(
+            f"map {map_name!r} has {len(tables)} .ovw-table blocks, "
+            f"expected 0 (no stats rendered) or 2 (one per team)"
+        )
+    if len(tables) == 2:
+        team1_stats = _parse_player_stats_table(tables[0], team1.name)
+        team2_stats = _parse_player_stats_table(tables[1], team2.name)
+        player_stats = team1_stats + team2_stats
+        # agent_picks is a composition-summary convenience: exactly one
+        # entry per player row, in table order, using only the
+        # first-listed agent for players who swapped mid-map (vlr.gg's
+        # markup does not label which agent was primary). The full swap
+        # history is never lost — it stays on PlayerStats.agents. A
+        # player with no agents at all contributes an empty string so
+        # the one-entry-per-player / row-order alignment holds.
+        agent_picks = {
+            team1.name: [ps.agents[0] if ps.agents else "" for ps in team1_stats],
+            team2.name: [ps.agents[0] if ps.agents else "" for ps in team2_stats],
+        }
+
     try:
         return MapResult(
             map_name=map_name,
@@ -264,7 +428,8 @@ def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
             team2_score=team2_score,
             winner=winner,
             duration=duration,
-            agent_picks=None,  # reserved; agent picks not parsed from stats tables yet
+            agent_picks=agent_picks,
+            player_stats=player_stats,
         )
     except ValueError as exc:
         # An illegal final score is a data problem, not a programming
@@ -403,9 +568,13 @@ def parse_match(html: str, url: str) -> Match:
     scheduled/played date, match status (``"completed"``/``"live"``/
     ``"upcoming"``), best-of format, overall scores, the list of
     per-map results (skipping the "All Maps" overview block and any
-    placeholder ``"TBD"`` maps rendered for upcoming matches), and the
-    ordered ban/pick/decider veto sequence parsed from the page's
-    ``.match-header-note`` element (see :func:`_parse_veto_note`).
+    placeholder ``"TBD"`` maps rendered for upcoming matches) — each
+    map now also carrying its per-player stats
+    (``MapResult.player_stats``) and agent-pick summary
+    (``MapResult.agent_picks``) parsed from the map's ``.ovw-table``
+    blocks — and the ordered ban/pick/decider veto sequence parsed
+    from the page's ``.match-header-note`` element (see
+    :func:`_parse_veto_note`).
 
     Args:
         html: The full HTML of a vlr.gg match page.
