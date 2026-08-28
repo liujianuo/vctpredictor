@@ -156,9 +156,10 @@ def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
         A :class:`scraper.models.MapResult` with the parsed map name,
         both teams' scores (``None`` for any that could not be parsed
         as an integer), the winner's team name (``None`` if no
-        ``.score.mod-win`` element was found), and the map duration.
-        ``agent_picks`` is always ``None`` (not yet parsed from stats
-        tables).
+        ``.score.mod-win`` element was found, or if either score is
+        missing so the declared winner cannot be verified against the
+        final scores), and the map duration. ``agent_picks`` is always
+        ``None`` (not yet parsed from stats tables).
 
     Raises:
         VlrParseError: If ``game_el`` has no ``.vm-stats-game-header``,
@@ -202,6 +203,17 @@ def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
         else:
             winner = team1.name
 
+    # A declared winner is only trustworthy when both final scores
+    # parsed. If either score is missing (e.g. a forfeited/awarded map
+    # renders "-" for one side), the win-element fallback above can
+    # label the wrong team (it defaults to team1 when the ancestor
+    # lookup fails), and MapResult's own validation skips maps with a
+    # None score — so an unverified, possibly-wrong winner would reach
+    # the cache unchecked. Drop the winner (None) instead: the map is
+    # kept with its known score(s) but no asserted winner.
+    if winner is not None and (team1_score is None or team2_score is None):
+        winner = None
+
     # Cross-check the winner label against the final scores: a
     # finished map's winner must be the side with more rounds. This
     # catches the win-element fallback above (when the
@@ -212,7 +224,9 @@ def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
     # was - so it lives here where both team names and scores are
     # known. Equal scores with a declared winner are already rejected
     # below by ``MapResult`` score validation (a winner must reach 13
-    # and OT margins must be >= 2), so they are skipped here.
+    # and OT margins must be >= 2), so they are skipped here. The
+    # missing-score case (one side None) never reaches this check: the
+    # winner was already dropped above as unverifiable.
     if (
         winner is not None
         and team1_score is not None

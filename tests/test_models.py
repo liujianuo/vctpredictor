@@ -60,6 +60,22 @@ def test_forfeit_style_scoreline_raises():
         MapResult(map_name="Ascent", team1_score=2, team2_score=0, winner="Team A")
 
 
+def test_impossible_regulation_upper_bound_raises():
+    # 30-3 and 14-11 cannot be final scorelines: a regulation game
+    # ends the moment a team reaches 13 rounds, so a winner above 13
+    # with a loser below 12 (not overtime) is impossible.
+    with pytest.raises(IllegalScoreError):
+        MapResult(map_name="Ascent", team1_score=30, team2_score=3, winner="Team A")
+    with pytest.raises(IllegalScoreError):
+        MapResult(map_name="Ascent", team1_score=14, team2_score=11, winner="Team B")
+
+
+def test_regulation_13_winner_with_sub_12_loser_is_valid():
+    # 13-11 is a legal regulation final: winner exactly 13, loser < 12.
+    MapResult(map_name="Ascent", team1_score=13, team2_score=11, winner="Team A")
+    MapResult(map_name="Ascent", team1_score=13, team2_score=0, winner="Team B")
+
+
 def test_error_message_includes_map_name_and_scores():
     with pytest.raises(ValueError) as excinfo:
         MapResult(map_name="Ascent", team1_score=13, team2_score=12, winner="Team A")

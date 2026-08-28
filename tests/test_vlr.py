@@ -105,6 +105,71 @@ def test_parse_map_winner_score_mismatch_raises_vlr_parse_error():
     assert "Team B" in message
 
 
+MISSING_SCORE_HTML = """
+<div class="vm-stats-game">
+<div class="vm-stats-game-header">
+<div class="team">
+<div class="score">-</div>
+</div>
+<div class="map">
+<div><span>Ascent</span></div>
+</div>
+<div class="team mod-right">
+<div class="score">13</div>
+</div>
+<div class="score mod-win"></div>
+</div>
+</div>
+"""
+
+MISSING_SCORE_WIN_INSIDE_HTML = """
+<div class="vm-stats-game">
+<div class="vm-stats-game-header">
+<div class="team">
+<div class="score mod-win">-</div>
+</div>
+<div class="map">
+<div><span>Ascent</span></div>
+</div>
+<div class="team mod-right">
+<div class="score">13</div>
+</div>
+</div>
+</div>
+"""
+
+
+def test_parse_map_missing_score_drops_unverifiable_winner():
+    # One score renders as non-numeric text ("-", e.g. a
+    # forfeited/awarded map) while a .score.mod-win element is still
+    # present. The win element sits outside any .team div here, so the
+    # ancestor lookup fails and the fallback would label team1 as the
+    # winner — but team2's 13 is the only parsed score, so that label
+    # is unverifiable. The parser must drop the winner (None) rather
+    # than cache a possibly-wrong label, and must not raise.
+    game_el = BeautifulSoup(MISSING_SCORE_HTML, "lxml").select_one(".vm-stats-game")
+    result = vlr._parse_map(game_el, Team(name="Team A"), Team(name="Team B"))
+    assert result.map_name == "Ascent"
+    assert result.team1_score is None
+    assert result.team2_score == 13
+    assert result.winner is None
+
+
+def test_parse_map_missing_score_drops_winner_even_when_mod_win_is_positioned():
+    # Same missing-score situation, but the .score.mod-win element is
+    # correctly positioned inside team1's div (so the ancestor lookup
+    # succeeds and names team1). team1's score still failed to parse,
+    # so the winner cannot be verified against the final scores and
+    # must still be dropped rather than trusted blindly.
+    game_el = BeautifulSoup(MISSING_SCORE_WIN_INSIDE_HTML, "lxml").select_one(
+        ".vm-stats-game"
+    )
+    result = vlr._parse_map(game_el, Team(name="Team A"), Team(name="Team B"))
+    assert result.team1_score is None
+    assert result.team2_score == 13
+    assert result.winner is None
+
+
 def test_parse_match_completed():
     m = vlr.parse_match(MATCH_HTML, MATCH_URL)
     assert m.match_id == "712803"

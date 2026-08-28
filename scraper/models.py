@@ -17,9 +17,10 @@ class IllegalScoreError(ValueError):
     """A finished map's final score violates standard VCT rules.
 
     Raised by :meth:`MapResult.__post_init__` when a finished map's
-    scoreline is impossible: a winner with fewer than 13 rounds, or an
+    scoreline is impossible: a winner with fewer than 13 rounds, an
     overtime scoreline (both teams >= 12) with a winning margin below
-    2 rounds. Subclasses ``ValueError`` so existing ``except
+    2 rounds, or a regulation scoreline (loser below 12) whose winner
+    exceeds 13 rounds. Subclasses ``ValueError`` so existing ``except
     ValueError`` handlers keep working, but gives callers a way to
     distinguish a score-validity failure from unrelated ``ValueError``
     sources (e.g. a corrupt cache row whose ``date`` field fails
@@ -154,8 +155,9 @@ class MapResult:
             :meth:`__post_init__`, if the map is finished (all three
             of ``team1_score``, ``team2_score`` and ``winner`` set)
             with an illegal scoreline: a winner with fewer than 13
-            rounds, or an overtime scoreline (both teams >= 12) with
-            a winning margin below 2.
+            rounds, an overtime scoreline (both teams >= 12) with a
+            winning margin below 2, or a regulation scoreline (loser
+            below 12) whose winner exceeds 13 rounds.
     """
 
     map_name: str
@@ -173,21 +175,27 @@ class MapResult:
         ``None`` (unfinished/live/upcoming maps have no final labels
         yet and are skipped). For finished maps it enforces the
         standard VCT rules: the winner must have at least 13 rounds
-        (``winner_score >= 13``), and when both teams reached 12
-        rounds (overtime), the winning margin must be at least 2
-        rounds (``winner_score - loser_score >= 2``). This is
-        validation only — no ``is_overtime`` field is persisted here;
-        deriving an OT flag belongs to a later milestone against the
-        materialized dataset.
+        (``winner_score >= 13``); when both teams reached 12 rounds
+        (overtime), the winning margin must be at least 2 rounds
+        (``winner_score - loser_score >= 2``); and a regulation win
+        (loser below 12) must end at exactly 13 rounds
+        (``winner_score == 13``) since a regulation game stops the
+        moment a team reaches 13 — so a score like 30-3 or 14-11 is
+        impossible. This is validation only — no ``is_overtime`` field
+        is persisted here; deriving an OT flag belongs to a later
+        milestone against the materialized dataset.
 
         Raises:
             IllegalScoreError (a ``ValueError`` subclass): If the map
                 is finished and ``winner_score < 13`` (a winner
-                cannot have fewer than 13 rounds), or if the map went
-                to overtime (both scores >= 12) and the winning
-                margin is less than 2 rounds (e.g. 13-12, which is
-                not a legal final scoreline). The message includes
-                ``map_name`` and both scores.
+                cannot have fewer than 13 rounds), if the map went to
+                overtime (both scores >= 12) and the winning margin
+                is less than 2 rounds (e.g. 13-12, which is not a
+                legal final scoreline), or if the map is a regulation
+                scoreline (loser below 12) whose winner exceeds 13
+                rounds (e.g. 30-3, impossible since a regulation game
+                ends at 13). The message includes ``map_name`` and
+                both scores.
         """
         if (
             self.team1_score is None
@@ -203,12 +211,27 @@ class MapResult:
                 f"(scores {self.team1_score}-{self.team2_score})"
             )
         is_overtime = loser_score >= 12
-        if is_overtime and winner_score - loser_score < 2:
+        if is_overtime:
+            if winner_score - loser_score < 2:
+                raise IllegalScoreError(
+                    f"map {self.map_name!r} went to overtime with an illegal "
+                    f"margin: winner {winner_score} vs loser {loser_score} "
+                    f"(scores {self.team1_score}-{self.team2_score}); "
+                    f"overtime wins must have margin >= 2"
+                )
+        elif winner_score > 13:
+            # A regulation game (loser below 12) ends the moment a
+            # team reaches 13 rounds, so a regulation win is always
+            # exactly 13-<loser>. A winner with more than 13 rounds
+            # and a sub-12 loser (e.g. 30-3 or 14-11) is impossible:
+            # the only way past 13 is overtime, which requires both
+            # teams to have reached 12 (handled above).
             raise IllegalScoreError(
-                f"map {self.map_name!r} went to overtime with an illegal "
-                f"margin: winner {winner_score} vs loser {loser_score} "
-                f"(scores {self.team1_score}-{self.team2_score}); "
-                f"overtime wins must have margin >= 2"
+                f"map {self.map_name!r} has an impossible regulation score "
+                f"{self.team1_score}-{self.team2_score}: a regulation win "
+                f"ends at 13 rounds, but the winner has {winner_score} "
+                f"rounds and the loser only {loser_score} (< 12, so not "
+                f"overtime)"
             )
 
     def to_dict(self) -> dict[str, Any]:
