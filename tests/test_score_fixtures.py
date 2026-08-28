@@ -79,11 +79,33 @@ MULTI_OT_URL = (
 
 
 def _find_map_by_score(match, target_scores):
-    # Locate the map whose final score matches target_scores as an
-    # unordered pair, e.g. (13, 2). The map's index within the page is
-    # recorded in the module docstring; locating by score keeps the
-    # tests robust to cosmetic fixture edits while still asserting
-    # the exact per-side values below.
+    """Locate the map in a parsed match whose final score matches ``target_scores``.
+
+    Matches the target score as an *unordered* pair, e.g. ``(13, 2)``
+    matches both a 13-2 and a 2-13 map, so the test then asserts the
+    exact per-side values and winner explicitly. Locating by score
+    rather than by the map's index within the page (which is recorded
+    in the module docstring) keeps the tests robust to cosmetic
+    fixture edits.
+
+    Args:
+        match: The parsed :class:`scraper.models.Match` produced from
+            a fixture, exposing ``maps`` (list of ``MapResult``) and
+            ``team1``/``team2`` (for the failure message).
+        target_scores: A two-element iterable of ints, the final score
+            as an unordered pair, e.g. ``(13, 2)``.
+
+    Returns:
+        The ``MapResult`` whose ``team1_score``/``team2_score`` equal
+        ``target_scores`` as an unordered pair.
+
+    Raises:
+        pytest.fail.Exception: If no map matches (always when a map's
+            score is unverifiable — e.g. a forfeit ``"-"`` parses to
+            ``None`` and is skipped — or when the scoreline is simply
+            absent from the fixture). The failure message lists the
+            match-up and every found map scoreline to aid debugging.
+    """
     for map_result in match.maps:
         if map_result.team1_score is None or map_result.team2_score is None:
             continue
@@ -97,9 +119,28 @@ def _find_map_by_score(match, target_scores):
 
 
 def _assert_scoreline(map_result, team1_score, team2_score, winner, is_overtime):
-    # Shared assertion for every target scoreline: exact per-side
-    # scores, the winner's team name, and the derived OT flag
-    # (min(score1, score2) >= 12).
+    """Assert one parsed map matches an expected scoreline exactly.
+
+    Shared assertion for every target scoreline in this suite: checks
+    the exact per-side scores, the winner's team name, and the derived
+    OT flag ``min(score1, score2) >= 12`` (the same rule
+    ``MapResult.__post_init__`` applies internally; per plan assumption
+    1 this is a test-only computation, not a persisted field).
+
+    Args:
+        map_result: The parsed ``MapResult`` under test.
+        team1_score: Expected ``team1_score`` of ``map_result``.
+        team2_score: Expected ``team2_score`` of ``map_result``.
+        winner: Expected ``winner`` team name of ``map_result``.
+        is_overtime: Expected derived OT flag; ``True`` when both teams
+            reached at least 12 rounds.
+
+    Returns:
+        Nothing; raises on any mismatch.
+
+    Raises:
+        AssertionError: If any of the four assertions fail.
+    """
     assert map_result.team1_score == team1_score
     assert map_result.team2_score == team2_score
     assert map_result.winner == winner
