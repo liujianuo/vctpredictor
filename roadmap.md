@@ -50,7 +50,7 @@ and the derived OT flag.
 - Size: **S**
 - Depends on: M1
 
-### M3. Veto log parser
+### M3. Veto log parser [x]
 Parse the ordered ban/pick/decider action sequence off a match page into a
 `VetoAction` model (step index, acting team, action type, map). Fail loudly on
 unrecognised phrasing rather than skipping the action.
