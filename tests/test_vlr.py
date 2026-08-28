@@ -328,6 +328,28 @@ def test_parse_match_veto_actions_empty_when_no_note():
     assert m.veto_actions == []
 
 
+def test_parse_match_unrecognized_veto_note_logs_warning_and_keeps_match(caplog):
+    # A note segment matching neither the ban/pick nor the decider
+    # pattern must not abort the whole match parse — and therefore
+    # must not, via get_matches_from_event's plain loop, discard every
+    # other match already parsed from the same event. parse_match
+    # catches the VlrParseError, logs a warning, leaves veto_actions
+    # empty, and still returns the fully-parsed match.
+    html = MATCH_HTML.replace("Sunset remains", "NAVI swaps Haven")
+    m = vlr.parse_match(html, MATCH_URL)
+    assert m.veto_actions == []
+    # The rest of the match is intact: no partial/discarded data.
+    assert m.match_id == "712803"
+    assert m.team1.name == "FUT Esports"
+    assert m.team2.name == "Natus Vincere"
+    assert m.team2_score == 2
+    assert len(m.maps) == 2
+    # The skip is loud, not silent: a warning names the offending
+    # segment text.
+    assert "unrecognized veto note" in caplog.text
+    assert "NAVI swaps Haven" in caplog.text
+
+
 # --------------------------------------------------------------------------
 # parse_event_match_links
 # --------------------------------------------------------------------------

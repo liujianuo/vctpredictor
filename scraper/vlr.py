@@ -13,6 +13,7 @@ against saved fixtures.
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from datetime import datetime
@@ -28,6 +29,8 @@ from .cache import (
     set_cached_page,
 )
 from .models import MapResult, Match, Team, VetoAction
+
+logger = logging.getLogger(__name__)
 
 BASE_URL = "https://www.vlr.gg"
 USER_AGENT = (
@@ -413,7 +416,8 @@ def parse_match(html: str, url: str) -> Match:
     Returns:
         The parsed :class:`scraper.models.Match`, including a
         ``veto_actions`` list (empty when the page has no
-        ``.match-header-note`` element, e.g. upcoming matches).
+        ``.match-header-note`` element, e.g. upcoming matches, or
+        when the note's phrasing is unrecognized — see Raises).
 
     Raises:
         VlrParseError: If ``url`` is not a parseable match URL, or if
@@ -421,12 +425,13 @@ def parse_match(html: str, url: str) -> Match:
             ``div.match-header``, no ``.match-header-event`` (and no
             fallback event slug), fewer than two
             ``.match-header-link`` team elements, or a per-map block
-            with no map name. Also raised when a non-empty
-            ``.match-header-note`` contains a segment matching neither
-            the ban/pick pattern nor the decider pattern
-            (``"<map> remains"``) — unrecognized veto phrasing fails
-            loudly instead of being silently skipped (propagated from
-            :func:`_parse_veto_note`).
+            with no map name. Unrecognized veto-note phrasing does
+            *not* raise here: :func:`_parse_veto_note` still fails
+            loudly on it at the unit level, but ``parse_match``
+            catches that error, logs a warning, and leaves
+            ``veto_actions`` empty — the same state as a match with
+            no note — so one match's note can never abort the whole
+            event fetch via :func:`get_matches_from_event`.
     """
     soup = BeautifulSoup(html, "lxml")
     header = soup.select_one("div.match-header")
@@ -507,15 +512,27 @@ def parse_match(html: str, url: str) -> Match:
     # it; upcoming matches (and a few completed ones, e.g.
     # match_page_single_ot.html) have no such element at all. An
     # absent or empty note yields an empty list, matching the existing
-    # convention for maps/scores that aren't available yet —
+    # convention for maps/scores that aren't available yet.
     # _parse_veto_note raises VlrParseError on unrecognized phrasing
-    # rather than silently dropping an action.
+    # rather than silently dropping an action; that error is caught
+    # here (not propagated) so one match's unrecognized note can never
+    # discard every other match already parsed from the same event
+    # fetch via get_matches_from_event. The veto data is left empty —
+    # the same state as a match with no note element — and the
+    # failure is logged loudly rather than being silent.
     note_el = header.select_one(".match-header-note")
-    veto_actions = (
-        _parse_veto_note(note_el.get_text(strip=True))
-        if note_el is not None
-        else []
-    )
+    veto_actions: List[VetoAction] = []
+    if note_el is not None:
+        try:
+            veto_actions = _parse_veto_note(note_el.get_text(strip=True))
+        except VlrParseError as exc:
+            logger.warning(
+                "match %s (%s): unrecognized veto note phrasing; "
+                "veto_actions left empty: %s",
+                match_id,
+                url,
+                exc,
+            )
 
     return Match(
         match_id=match_id,
@@ -588,7 +605,10 @@ def get_match(url: str, use_cache: bool = True) -> Match:
         VlrParseError: If ``url`` is not a parseable match URL, or if
             the fetched page is missing expected structure
             (propagated from :func:`extract_match_id` /
-            :func:`parse_match`).
+            :func:`parse_match`). Unrecognized veto-note phrasing is
+            not one of these cases: ``parse_match`` catches it
+            internally, logs a warning, and leaves
+            ``Match.veto_actions`` empty.
         VlrFetchError: If fetching the page over HTTP fails
             (propagated from :func:`fetch_page`).
         IllegalScoreError: If a cached row for the match deserializes
@@ -637,7 +657,11 @@ def get_matches_from_event(event_url: str, use_cache: bool = True) -> List[Match
         VlrFetchError: If fetching the event page or any match page
             over HTTP fails.
         VlrParseError: If the event page or any match page is missing
-            expected structure.
+            expected structure. Unrecognized veto-note phrasing does
+            not raise here — ``parse_match`` catches it, logs a
+            warning, and leaves that match's ``veto_actions`` empty —
+            so a single match's veto note can never discard the other
+            matches already parsed from the event.
         IllegalScoreError: If a cached row for any match deserializes
             to an illegal final map score (propagated from
             :func:`cache.get_cached_match`, either directly or via
