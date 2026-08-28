@@ -43,7 +43,7 @@ loudly rather than storing a silently wrong label.
 - Size: **S**
 - Depends on: — (hardens existing `vlr.py` / `models.py`)
 
-### M2. Score parser fixture suite
+### M2. Score parser fixture suite [x]
 Real match HTML fixtures covering regulation blowout (13-2), regulation close
 (13-11), single OT (15-13) and multi-OT (16-14, 19-17), asserting exact scores
 and the derived OT flag.
