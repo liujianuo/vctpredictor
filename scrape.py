@@ -23,10 +23,10 @@ Exit codes:
   event was touched: scraping without knowing the rules is a hard
   stop (description.txt's scraping-etiquette row lists robots.txt as a
   requirement, not a suggestion).
-- ``3`` — no event failed, but at least one was disallowed by
-  robots.txt: a policy stop for that URL, deliberately distinct from
-  ``1`` so automation retrying on ``1`` never retries a
-  policy-disallowed URL.
+- ``3`` — no event failed, but at least one event (or individual
+  match page) was disallowed by robots.txt: a policy stop for those
+  URLs, deliberately distinct from ``1`` so automation retrying on
+  ``1`` never retries a policy-disallowed URL.
 """
 
 from __future__ import annotations
@@ -93,15 +93,17 @@ def _build_summary(
     failed_urls: Sequence[str],
     disallowed_urls: Sequence[str],
     total_matches: int,
+    robots_skipped_matches: Sequence[str] = (),
 ) -> str:
     """Build the one-line run summary shared by every exit path of main.
 
-    The three summary branches in :func:`main` (all events ok; at least
-    one failed event; no failures but some robots-disallowed events) all
-    funnel through this single builder so the wording and count
-    formatting live in exactly one place — a future change to the
-    summary (e.g. adding a counted category) cannot silently drift
-    between independently-formatted branches.
+    The summary branches in :func:`main` (all events ok; at least one
+    failed event; no failures but some robots-disallowed events; some
+    individual match pages robots-disallowed) all funnel through this
+    single builder so the wording and count formatting live in exactly
+    one place — a future change to the summary (e.g. adding a counted
+    category) cannot silently drift between independently-formatted
+    branches.
 
     Args:
         ok_count: Number of events processed successfully (derived by
@@ -121,6 +123,17 @@ def _build_summary(
             failure list; omitted entirely when both lists are empty.
         total_matches: Total number of matches scraped across all
             succeeded events.
+        robots_skipped_matches: URLs of individual match pages that
+            passed the event-level robots gate but were then disallowed
+            by the per-match gate inside
+            :func:`scraper.vlr.get_matches_from_event`. Rendered as a
+            count-only clause when non-empty (the per-URL warnings are
+            already logged one per skip by that function, and a
+            disallowed path prefix can easily skip dozens of URLs — a
+            count keeps the summary readable). A non-empty list makes
+            :func:`main` return ``3``, same as an event-level
+            disallow: a run whose match pages are policy-blocked must
+            not exit ``0``.
 
     Returns:
         The formatted summary string, e.g. ``"2/3 events ok; 1 failed
@@ -147,6 +160,10 @@ def _build_summary(
         # disallowed by robots" explicitly so the summary never looks
         # like a robots stop was silently swallowed by the failure list.
         parts.append("0 disallowed by robots")
+    if robots_skipped_matches:
+        n = len(robots_skipped_matches)
+        page_word = "page" if n == 1 else "pages"
+        parts.append(f"{n} match {page_word} disallowed by robots")
     parts.append(f"{total_matches} total matches")
     return "; ".join(parts)
 
@@ -165,12 +182,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     separately from genuine failures. Events that pass are scraped via
     :func:`scraper.vlr.get_matches_from_event` (``use_cache`` forwarded
     from ``--no-cache``; the same robots parser is passed through so
-    every individual match page is gated too) inside a per-event
-    ``try/except`` over ``_RECOVERABLE_EXCEPTIONS``, so one bad event
-    is logged and skipped rather than taking down the remaining events
-    — the same isolation principle ``parse_match`` applies to a single
-    bad veto note. A one-line summary of ok/failed/disallowed counts
-    and the total match count is logged at the end.
+    every individual match page is gated too, and the URLs it skips are
+    collected via its ``robots_skipped`` list so per-match policy stops
+    surface in the summary and exit code instead of being silently
+    dropped) inside a per-event ``try/except`` over
+    ``_RECOVERABLE_EXCEPTIONS``, so one bad event is logged and skipped
+    rather than taking down the remaining events — the same isolation
+    principle ``parse_match`` applies to a single bad veto note. A
+    one-line summary of ok/failed/disallowed counts, per-match robots
+    skips, and the total match count is logged at the end.
 
     Args:
         argv: The argument list to parse (see :func:`parse_args`);
@@ -181,9 +201,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         one event failed with a fetch or parse error (a retryable
         condition); ``2`` if the robots.txt fetch itself failed, in
         which case nothing was scraped; ``3`` if no event failed but at
-        least one was disallowed by robots.txt (a policy stop,
-        deliberately distinct from ``1`` so automation retrying on
-        ``1`` never retries a policy-disallowed URL).
+        least one event — or individual match page — was disallowed by
+        robots.txt (a policy stop, deliberately distinct from ``1`` so
+        automation retrying on ``1`` never retries a policy-disallowed
+        URL; the match-page case is a run whose event pages passed the
+        gate but whose match pages are all policy-blocked, which must
+        not report success with zero data).
 
     Raises:
         Nothing; all expected failure modes are converted to exit
@@ -215,6 +238,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     use_cache = not args.no_cache
     failed_urls: List[str] = []
     disallowed_urls: List[str] = []
+    # Match URLs skipped by the per-match robots gate inside
+    # get_matches_from_event. Collected here so a run whose event pages
+    # pass the gate but whose match pages are disallowed (e.g. robots
+    # allows the listing path but not the deeper match-page prefix)
+    # surfaces the policy stop in the summary and exit code 3 rather
+    # than exiting 0 with zero data.
+    robots_skipped_matches: list[str] = []
     total_matches = 0
 
     for url in event_urls:
@@ -232,7 +262,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             continue
         try:
             matches = vlr.get_matches_from_event(
-                url, use_cache=use_cache, robots_parser=robots_parser
+                url,
+                use_cache=use_cache,
+                robots_parser=robots_parser,
+                robots_skipped=robots_skipped_matches,
             )
         except _RECOVERABLE_EXCEPTIONS as exc:
             logger.error("event %s failed: %s; skipping", url, exc)
@@ -247,12 +280,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # complement of failed/disallowed events.
     ok_count = len(event_urls) - len(failed_urls) - len(disallowed_urls)
     summary = _build_summary(
-        ok_count, len(event_urls), failed_urls, disallowed_urls, total_matches
+        ok_count,
+        len(event_urls),
+        failed_urls,
+        disallowed_urls,
+        total_matches,
+        robots_skipped_matches,
     )
     if failed_urls:
         logger.warning("summary: %s", summary)
         return 1
-    if disallowed_urls:
+    if disallowed_urls or robots_skipped_matches:
         logger.warning("summary: %s", summary)
         return 3
     logger.info("summary: %s", summary)

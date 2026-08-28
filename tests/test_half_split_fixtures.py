@@ -287,6 +287,59 @@ def test_second_half_over_12_raises_illegal_score_error():
     assert "combined second-half" in str(excinfo.value)
 
 
+def test_single_team_half_data_raises_illegal_score_error():
+    # Round-5 finding 2: malformed markup yielding exactly one .team
+    # div leaves the missing team's four half-split fields None, and
+    # the old all-four-None guard then silently skipped every half
+    # invariant for that map. Partial data is itself invalid — a
+    # finished map's header must render both teams' halves or neither
+    # — so this must raise IllegalScoreError rather than construct
+    # cleanly. (Fails on the pre-fix code, which skipped validation
+    # entirely when one side was all-None.)
+    with pytest.raises(IllegalScoreError) as excinfo:
+        MapResult(
+            map_name="Ascent",
+            team1_score=13,
+            team2_score=10,
+            winner="Team A",
+            team1_first_half_rounds=7,
+            team1_second_half_rounds=3,
+            team1_atk_rounds=7,
+            team1_def_rounds=3,
+        )
+    message = str(excinfo.value)
+    assert "Ascent" in message
+    assert "half-split data for team1 only" in message
+
+
+def test_atk_def_mismatch_with_half_splits_raises_illegal_score_error():
+    # Round-5 finding 7: a team's atk+def totals and its first+second
+    # half rounds count the same regulation rounds from the same
+    # header spans (grouped by side vs by half) and must agree. A
+    # data-repair or parsing path that adjusts one pair without the
+    # other is exactly the silent inconsistency this cross-invariant
+    # catches. The 4+8=12 first-half and 2+5<=12 second-half sums are
+    # valid, so the atk/def pair is the only violation.
+    with pytest.raises(IllegalScoreError) as excinfo:
+        MapResult(
+            map_name="Split",
+            team1_score=6,
+            team2_score=13,
+            winner="Natus Vincere",
+            team1_first_half_rounds=4,
+            team1_second_half_rounds=2,
+            team1_atk_rounds=6,  # should be 2: 2+4 != 4+2
+            team1_def_rounds=4,
+            team2_first_half_rounds=8,
+            team2_second_half_rounds=5,
+            team2_atk_rounds=8,
+            team2_def_rounds=5,
+        )
+    message = str(excinfo.value)
+    assert "Split" in message
+    assert "atk/def" in message
+
+
 def test_live_map_partial_half_data_does_not_raise():
     # Review finding 1 regression: a live match's in-progress map
     # renders partial round counts (mid-first-half 6-3, combined 9 !=
@@ -308,6 +361,25 @@ def test_live_map_partial_half_data_does_not_raise():
     )
     assert result.team1_first_half_rounds == 6
     assert result.team2_first_half_rounds == 3
+
+
+def test_live_map_single_team_half_data_does_not_raise():
+    # The cross-team completeness check (round-5 finding 2) is gated on
+    # finished maps like every other half-split invariant: a live
+    # in-progress map with only one team's header rendered so far must
+    # construct cleanly, not raise — the finished-map gate returns
+    # before any half-split validation runs.
+    result = MapResult(
+        map_name="Ascent",
+        team1_score=6,
+        team2_score=3,
+        winner=None,
+        team1_first_half_rounds=6,
+        team1_second_half_rounds=None,
+        team1_atk_rounds=6,
+        team1_def_rounds=None,
+    )
+    assert result.team1_first_half_rounds == 6
 
 
 LIVE_MAP_HTML = """

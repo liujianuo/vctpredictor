@@ -256,9 +256,12 @@ class MapResult:
             rounds, an overtime scoreline (both teams >= 12) with a
             winning margin below 2, or a regulation scoreline (loser
             below 12) whose winner exceeds 13 rounds; or, on such a
-            finished map, if both teams' half-split data parsed and
-            the combined first-half round count is not exactly 12 or
-            the combined second-half count exceeds 12. Neither
+            finished map, if half-split data parsed for exactly one
+            team (partial data is itself invalid), if both teams'
+            half-split data parsed and the combined first-half round
+            count is not exactly 12 or the combined second-half count
+            exceeds 12, or if a team's ``atk + def`` totals disagree
+            with its ``first + second`` half rounds. Neither
             validation layer runs on live/in-progress maps (their
             winner is still ``None``), since those render partial
             round counts that legitimately violate the finished-map
@@ -297,14 +300,24 @@ class MapResult:
         running them on unfinished maps would crash an entire
         ``get_matches_from_event`` fetch over a false positive.
 
-        The half-split layer enforces the two round-count invariants
-        that hold on every real vlr.gg header: the combined first-half
-        round count of both teams is always exactly 12 (a regulation
-        first half always runs its full 12 rounds), and the combined
-        second-half count never exceeds 12 (the second half *may* be
-        truncated — a team reaching 13 rounds ends the game mid-half,
-        so e.g. a 13-6 map's second half sums to fewer than 12 — but
-        can never exceed it).
+        The half-split layer enforces three properties that hold on
+        every real vlr.gg header. Completeness: a finished map's
+        header must render both teams' half-split data or neither —
+        exactly one team parsing (e.g. malformed markup with a single
+        ``.team`` div) is partial data, as invalid as a bad sum, and
+        must fail loudly rather than silently skipping validation.
+        Round counts: the combined first-half round count of both
+        teams is always exactly 12 (a regulation first half always
+        runs its full 12 rounds), and the combined second-half count
+        never exceeds 12 (the second half *may* be truncated — a team
+        reaching 13 rounds ends the game mid-half, so e.g. a 13-6
+        map's second half sums to fewer than 12 — but can never
+        exceed it). Cross-pair agreement: each team's ``atk + def``
+        totals (its ``mod-t``/``mod-ct`` span sums, regulation-only)
+        must equal its ``first + second`` half rounds — the two pairs
+        count the same regulation rounds from the same spans, grouped
+        by side vs by half, so any future repair path that adjusts one
+        pair without the other is caught.
 
         The score layer enforces the standard VCT
         rules: the winner must have at least 13 rounds
@@ -319,18 +332,23 @@ class MapResult:
         milestone against the materialized dataset.
 
         Raises:
-            IllegalScoreError (a ``ValueError`` subclass): If both
-                teams' half-split data parsed and the combined
-                first-half round count is not exactly 12, or the
-                combined second-half count exceeds 12 (the message
-                includes ``map_name`` and both teams' half values); or
-                if the map is finished and ``winner_score < 13`` (a
-                winner cannot have fewer than 13 rounds), the map went
-                to overtime (both scores >= 12) and the winning
-                margin is less than 2 rounds (e.g. 13-12), or the map
-                is a regulation scoreline (loser below 12) whose
-                winner exceeds 13 rounds (e.g. 30-3). The score
-                messages include ``map_name`` and both scores.
+            IllegalScoreError (a ``ValueError`` subclass): If half-split
+                data parsed for exactly one team (the message includes
+                ``map_name`` and both teams' values); if both teams'
+                half-split data parsed and the combined first-half
+                round count is not exactly 12, or the combined
+                second-half count exceeds 12 (the message includes
+                ``map_name`` and both teams' half values); if a team's
+                ``atk + def`` totals disagree with its
+                ``first + second`` half rounds (the message includes
+                ``map_name`` and both sums); or if the map is finished
+                and ``winner_score < 13`` (a winner cannot have fewer
+                than 13 rounds), the map went to overtime (both scores
+                >= 12) and the winning margin is less than 2 rounds
+                (e.g. 13-12), or the map is a regulation scoreline
+                (loser below 12) whose winner exceeds 13 rounds (e.g.
+                30-3). The score messages include ``map_name`` and
+                both scores.
         """
         # Finished-map gate: the round-count invariants and score
         # validity below only make sense once the map is known-
@@ -351,7 +369,43 @@ class MapResult:
         ):
             return
 
-        # Half-split invariants: run whenever both teams' half data
+        # Half-split validation, three layers deep on this finished
+        # map. The four values per team are the (first, second) halves
+        # and the (atk, def) side totals; ``_parse_half_split`` derives
+        # both pairs from the same recognized spans, so a team's data
+        # is all-or-nothing in practice.
+        team1_halves = (
+            self.team1_first_half_rounds,
+            self.team1_second_half_rounds,
+            self.team1_atk_rounds,
+            self.team1_def_rounds,
+        )
+        team2_halves = (
+            self.team2_first_half_rounds,
+            self.team2_second_half_rounds,
+            self.team2_atk_rounds,
+            self.team2_def_rounds,
+        )
+        team1_half_present = any(value is not None for value in team1_halves)
+        team2_half_present = any(value is not None for value in team2_halves)
+        if team1_half_present != team2_half_present:
+            # Completeness: a finished map's header must render both
+            # teams' half-split data or neither. Exactly one team
+            # parsing — e.g. malformed markup with a single .team div,
+            # which _parse_map handles by leaving the missing side's
+            # four fields None — is partial data, as invalid as the bad
+            # sums below, and must fail loudly rather than silently
+            # skipping them (the old all-four-None guard made the
+            # missing-team case bypass every half invariant).
+            present_side = "team1" if team1_half_present else "team2"
+            raise IllegalScoreError(
+                f"map {self.map_name!r} has half-split data for "
+                f"{present_side} only (team1 {team1_halves}, team2 "
+                f"{team2_halves}): a finished map's header must render "
+                f"both teams' halves or neither"
+            )
+
+        # Round-count invariants: run whenever both teams' half data
         # parsed on this finished map. A regulation first half always
         # runs its full 12 rounds, so the combined first-half count
         # must be exactly 12. The combined second-half count is capped
@@ -388,6 +442,45 @@ class MapResult:
                     f"{self.team2_second_half_rounds}): a second half "
                     f"can be truncated (a team reaching 13 ends the "
                     f"game) but never exceeds 12 rounds"
+                )
+
+        # Cross-pair invariant: each team's atk/def totals (the sums of
+        # its mod-t/mod-ct spans, regulation-only) must equal its
+        # first+second half rounds — both pairs count the same
+        # regulation rounds from the same spans, just grouped by side
+        # vs by half. Runs when all four of a team's values parsed; a
+        # future data-repair or parsing path that adjusts one pair
+        # without the other is exactly the silent inconsistency this
+        # catches.
+        for team_label, first, second, atk, defense in (
+            (
+                "team1",
+                self.team1_first_half_rounds,
+                self.team1_second_half_rounds,
+                self.team1_atk_rounds,
+                self.team1_def_rounds,
+            ),
+            (
+                "team2",
+                self.team2_first_half_rounds,
+                self.team2_second_half_rounds,
+                self.team2_atk_rounds,
+                self.team2_def_rounds,
+            ),
+        ):
+            if (
+                first is not None
+                and second is not None
+                and atk is not None
+                and defense is not None
+                and atk + defense != first + second
+            ):
+                raise IllegalScoreError(
+                    f"map {self.map_name!r} {team_label} atk/def rounds "
+                    f"({atk}+{defense}={atk + defense}) do not match its "
+                    f"half-split rounds ({first}+{second}="
+                    f"{first + second}): the two pairs must count the "
+                    f"same regulation rounds"
                 )
 
         winner_score = max(self.team1_score, self.team2_score)

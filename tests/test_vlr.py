@@ -606,7 +606,10 @@ def test_fetch_robots_parser_401_403_is_disallow_all(monkeypatch):
     # RobotFileParser.read()'s disallow-all handling: can_fetch must
     # return False for every URL rather than raising, so a
     # WAF/bot-detection 403 on the robots endpoint cannot abort the
-    # whole scrape run.
+    # whole scrape run. The status is retried once before being
+    # accepted as authoritative (round-5 finding 3); these fakes return
+    # the same status on both attempts, so the confirmed disallow-all
+    # path is what is exercised.
     for status in (401, 403):
         monkeypatch.setattr(
             vlr.requests,
@@ -621,6 +624,55 @@ def test_fetch_robots_parser_401_403_is_disallow_all(monkeypatch):
             is False
         )
         assert rp.can_fetch(vlr.ROBOTS_USER_AGENT, "https://www.vlr.gg/forums/123/") is False
+
+
+def test_fetch_robots_parser_401_then_200_retries_and_parses(monkeypatch):
+    # Round-5 finding 3: a transient 401 on the robots.txt fetch (e.g.
+    # a WAF hiccup) must not be accepted as authoritative — the fetch
+    # is retried once, and a successful retry parses the real rules
+    # instead of returning a disallow-all parser that would block every
+    # URL in the run. (Fails on the pre-fix code, which treated the
+    # first 401 as final.)
+    responses = iter(
+        [_FakeResponse("denied", status_code=401), _FakeResponse(ROBOTS_TXT)]
+    )
+
+    def fake_get(url, **kwargs):
+        return next(responses)
+
+    monkeypatch.setattr(vlr.requests, "get", fake_get)
+    rp = vlr.fetch_robots_parser()
+    # The real rules were parsed on retry: /forums/ is disallowed and
+    # an unrelated match path is default-allowed.
+    assert (
+        rp.can_fetch(vlr.ROBOTS_USER_AGENT, "https://www.vlr.gg/forums/123/") is False
+    )
+    assert (
+        rp.can_fetch(vlr.ROBOTS_USER_AGENT, "https://www.vlr.gg/712803/fut-vs-navi")
+        is True
+    )
+
+
+def test_fetch_robots_parser_confirmed_401_logs_error_status_warning(
+    monkeypatch, caplog
+):
+    # Round-5 finding 3: when the retry confirms a 401/403, the
+    # resulting disallow-all parser must be logged as coming from an
+    # HTTP error status, not a published Disallow rule — so an operator
+    # can distinguish "the site says no" from "the robots fetch had a
+    # hiccup".
+    monkeypatch.setattr(
+        vlr.requests,
+        "get",
+        lambda url, **kwargs: _FakeResponse("denied", status_code=401),
+    )
+    rp = vlr.fetch_robots_parser()
+    assert (
+        rp.can_fetch(vlr.ROBOTS_USER_AGENT, "https://www.vlr.gg/712803/fut-vs-navi")
+        is False
+    )
+    assert "not a published Disallow rule" in caplog.text
+    assert "401" in caplog.text
 
 
 def test_fetch_robots_parser_other_4xx_is_allow_all(monkeypatch):
@@ -696,12 +748,65 @@ def test_get_matches_from_event_skips_robots_disallowed_match(monkeypatch, tmp_p
         return _FakeResponse(MATCH_HTML)
 
     monkeypatch.setattr(vlr.requests, "get", fake_get)
-    matches = vlr.get_matches_from_event(EVENT_URL, robots_parser=rp)
+    robots_skipped = []
+    matches = vlr.get_matches_from_event(
+        EVENT_URL, robots_parser=rp, robots_skipped=robots_skipped
+    )
     assert blocked_id not in {m.match_id for m in matches}
     assert len(matches) == len(links) - 1
+    # The skipped URL is reported to the caller (round-5 finding 1) so
+    # scrape.main can surface the policy stop in its summary/exit code.
+    assert len(robots_skipped) == 1
+    assert blocked_id in robots_skipped[0]
     # Event page + one fetch per non-blocked match; the blocked match is
     # never fetched (the gate runs before any network call for it).
     assert calls["n"] == len(matches) + 1
+
+
+def test_get_matches_from_event_cached_match_served_despite_tighter_robots(
+    monkeypatch, tmp_path
+):
+    # Round-5 finding 4: robots.txt governs *fetching*, not returning
+    # data we already have — the per-match robots gate must run after
+    # the cache-hit check, not before it. A match fetched and cached
+    # under a permissive robots.txt is served from cache on a later run
+    # even if robots.txt has since tightened to disallow its path, with
+    # zero new HTTP traffic and no skip. (Fails on the pre-fix code,
+    # which gated before the cache lookup and dropped the cached match.)
+    monkeypatch.setattr(cache, "DEFAULT_DB_PATH", tmp_path / "c.sqlite3")
+    monkeypatch.setattr(vlr, "POLITE_DELAY_SECONDS", 0)
+    links = vlr.parse_event_match_links(EVENT_HTML)
+    blocked_id = vlr.extract_match_id(links[0])
+    calls = {"n": 0}
+
+    def fake_get(url, **kwargs):
+        calls["n"] += 1
+        if "event/matches" in url:
+            return _FakeResponse(EVENT_HTML)
+        return _FakeResponse(MATCH_HTML)
+
+    monkeypatch.setattr(vlr.requests, "get", fake_get)
+
+    # Run 1: fetch everything under a permissive robots.txt, caching it.
+    rp_open = RobotFileParser()
+    rp_open.parse([])
+    matches1 = vlr.get_matches_from_event(EVENT_URL, robots_parser=rp_open)
+    assert len(matches1) == len(links)
+
+    # Run 2: robots.txt now disallows the first match's path. The row
+    # is already cached, so it must still be served — every match comes
+    # from cache, no HTTP request is made, and nothing is skipped.
+    rp_tight = RobotFileParser()
+    rp_tight.parse(["User-agent: *", f"Disallow: /{blocked_id}/"])
+    calls["n"] = 0
+    robots_skipped = []
+    matches2 = vlr.get_matches_from_event(
+        EVENT_URL, robots_parser=rp_tight, robots_skipped=robots_skipped
+    )
+    assert calls["n"] == 0
+    assert len(matches2) == len(links)
+    assert robots_skipped == []
+    assert matches2 == matches1
 
 
 def test_get_matches_from_event_skips_single_match_failure(

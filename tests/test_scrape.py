@@ -70,7 +70,9 @@ class _FakeScraper:
         self.fail_url = fail_url
         self.fail_error = fail_error
 
-    def __call__(self, url, use_cache=True, robots_parser=None):
+    def __call__(
+        self, url, use_cache=True, robots_parser=None, robots_skipped=None
+    ):
         """Simulate ``vlr.get_matches_from_event``.
 
         Args:
@@ -79,6 +81,9 @@ class _FakeScraper:
             robots_parser: The robots parser forwarded by the driver
                 (ignored by the fake; the real function uses it to gate
                 individual match pages).
+            robots_skipped: The list the real function appends
+                robots-disallowed match URLs to (ignored by the fake;
+                the fake never reports skips).
 
         Returns:
             A one-element list of fake match objects for URLs other
@@ -270,11 +275,14 @@ def test_main_no_cache_forwards_use_cache_false(monkeypatch, caplog):
 
 
 def test_build_summary_single_format_across_branches():
-    # Round-4 review finding regression: all three summary branches must
-    # share one builder so the wording cannot drift (the disallowed-only
+    # Round-4 review finding regression: all summary branches must share
+    # one builder so the wording cannot drift (the disallowed-only
     # branch used to hard-code "0 failed" with different formatting from
     # the failed branch's list-based builder). The builder is the single
-    # source of truth for every summary line main() emits.
+    # source of truth for every summary line main() emits. The last
+    # assertion also locks the round-5 per-match robots-skip clause: a
+    # count only, since the per-URL warnings are already logged one per
+    # skip by get_matches_from_event.
     assert (
         scrape._build_summary(2, 3, [], [], 98)
         == "2/3 events ok; 98 total matches"
@@ -289,6 +297,66 @@ def test_build_summary_single_format_across_branches():
         == "2/3 events ok; 0 failed; 1 disallowed by robots (http://e2); "
         "98 total matches"
     )
+    assert (
+        scrape._build_summary(2, 3, [], [], 98, ["http://m1", "http://m2"])
+        == "2/3 events ok; 2 match pages disallowed by robots; "
+        "98 total matches"
+    )
+
+
+def test_main_match_level_robots_skips_surface_in_summary_and_exit_code(
+    monkeypatch, caplog
+):
+    # Round-5 finding 1: per-match robots skips inside
+    # get_matches_from_event used to be invisible to the driver — an
+    # event whose match pages were all disallowed by robots still
+    # counted as ok and the run exited 0 reporting success with zero
+    # data. The driver must collect the skipped URLs and fold them into
+    # the disallowed accounting: the summary names them (count only)
+    # and the run exits 3 — the same policy-stop code as a whole-event
+    # disallow — never 0.
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(scrape.config, "ACTIVE", _FakeEventUrls(EVENT_URLS))
+    monkeypatch.setattr(scrape.vlr, "fetch_robots_parser", _permissive_robots)
+    calls = []
+
+    def fake_scraper(url, use_cache=True, robots_parser=None, robots_skipped=None):
+        calls.append((url, use_cache))
+        if robots_skipped is not None:
+            robots_skipped.append("https://www.vlr.gg/12345/blocked-match")
+        return ["match-0"]
+
+    monkeypatch.setattr(scrape.vlr, "get_matches_from_event", fake_scraper)
+    assert scrape.main([]) == 3
+    assert [url for url, _ in calls] == list(EVENT_URLS)
+    assert "2/2 events ok" in caplog.text
+    # One skip per event -> 2 match pages total.
+    assert "2 match pages disallowed by robots" in caplog.text
+
+
+def test_main_match_skips_with_failure_still_returns_1(monkeypatch, caplog):
+    # Exit-code priority is unchanged when both signals occur: genuine
+    # failures (exit 1, retryable) outrank robots policy stops (exit 3),
+    # matching the module docstring's documented priority — but the
+    # match-skip clause still appears in the summary so the policy
+    # signal is not lost inside the failure branch.
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(scrape.config, "ACTIVE", _FakeEventUrls(EVENT_URLS))
+    monkeypatch.setattr(scrape.vlr, "fetch_robots_parser", _permissive_robots)
+    calls = []
+
+    def fake_scraper(url, use_cache=True, robots_parser=None, robots_skipped=None):
+        calls.append((url, use_cache))
+        if url == EVENT_URLS[0]:
+            raise vlr.VlrFetchError("network down")
+        if robots_skipped is not None:
+            robots_skipped.append("https://www.vlr.gg/12345/blocked-match")
+        return ["match-0"]
+
+    monkeypatch.setattr(scrape.vlr, "get_matches_from_event", fake_scraper)
+    assert scrape.main([]) == 1
+    assert "1 match page disallowed by robots" in caplog.text
+    assert "network down" in caplog.text
 
 
 # --------------------------------------------------------------------------

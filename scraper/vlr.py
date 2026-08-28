@@ -776,6 +776,31 @@ def fetch_page(url: str, use_cache: bool = True, force_refresh: bool = False) ->
 # the same parser when one is passed in.
 
 
+def _allow_all_parser() -> RobotFileParser:
+    """Build the allow-all parser used when robots.txt cannot be read.
+
+    Returns a fresh :class:`RobotFileParser` whose ``parse([])`` call
+    marks it checked with no rules, so :meth:`RobotFileParser.can_fetch`
+    returns ``True`` for every URL. (An *unparsed* ``RobotFileParser``
+    conservatively denies everything, which would wrongly block the
+    whole run.) Shared by the "404 no robots.txt published" and "other
+    4xx" branches of :func:`fetch_robots_parser` so the allow-all
+    construction lives in exactly one place.
+
+    Returns:
+        A parsed, empty :class:`RobotFileParser`.
+
+    Raises:
+        Nothing.
+    """
+    parser = RobotFileParser()
+    # parse([]) sets last_checked: an unparsed RobotFileParser
+    # conservatively denies everything (mirroring urllib.robotparser's
+    # own read(), which treats a missing file as allow-all).
+    parser.parse([])
+    return parser
+
+
 def fetch_robots_parser() -> RobotFileParser:
     """Fetch vlr.gg's robots.txt and return a parsed ``RobotFileParser``.
 
@@ -789,23 +814,27 @@ def fetch_robots_parser() -> RobotFileParser:
     ``ROBOTS_USER_AGENT``, the scraper's explicit bot token.
 
     Status handling mirrors ``urllib.robotparser.RobotFileParser.read``
-    (verified against the CPython source):
+    's four-way mapping (verified against CPython 3.10's
+    ``Lib/urllib/robotparser.py`` — this mapping is undocumented public
+    behavior, so it should be re-verified on major Python upgrades):
 
     - ``2xx``: the body is parsed into rules normally.
-    - ``404`` (no robots.txt published): allow-all — an empty parser
-      whose ``can_fetch`` always returns ``True``. A site that simply
-      does not publish a robots.txt must not make the whole scrape run
-      abort; the empty parser is still *parsed* (``parse([])`` sets
-      ``last_checked``), since an unparsed ``RobotFileParser``
-      conservatively denies everything.
-    - ``401``/``403`` (the file exists but we may not read it):
+    - ``401``/``403`` (the file exists but we may not read it): the
+      fetch is retried once, since a transient WAF/bot-detection blip
+      on this single auxiliary request must not be accepted as
+      authoritative; if the retry also returns ``401``/``403``,
       disallow-all — a parser whose ``can_fetch`` always returns
       ``False``, matching ``read()``'s handling of these statuses
-      rather than aborting the run.
-    - Any other ``4xx`` (e.g. ``429`` rate-limited): allow-all, again
-      matching ``read()``: a transient rate-limit or WAF response on
-      the robots endpoint must not abort the run while the event/match
-      pages may still be perfectly fetchable.
+      rather than aborting the run. A confirmed error-status
+      disallow-all is logged prominently, because it is an HTTP error
+      status, not a published ``Disallow: /`` rule.
+    - ``404`` (no robots.txt published) and any other ``4xx`` (e.g.
+      ``429`` rate-limited): allow-all — an empty parser whose
+      ``can_fetch`` always returns ``True`` (see
+      :func:`_allow_all_parser`). A site that simply does not publish a
+      robots.txt, or that rate-limits the request, must not make the
+      whole scrape run abort while the event/match pages may still be
+      perfectly fetchable.
     - ``5xx``/network failure: fatal (``VlrFetchError``) — deliberately
       stricter than ``read()``, which silently disallow-alls on a 5xx;
       a server error on the robots endpoint fails loudly rather than
@@ -815,39 +844,44 @@ def fetch_robots_parser() -> RobotFileParser:
     Returns:
         A parsed :class:`RobotFileParser` for vlr.gg's robots.txt; an
         allow-all parser for ``404``/other ``4xx``; a disallow-all
-        parser for ``401``/``403``.
+        parser for a confirmed ``401``/``403`` (after one retry).
 
     Raises:
         VlrFetchError: If the HTTP request fails at the transport level
             (network error or timeout), or the response is ``5xx``.
     """
     resp = _http_get(ROBOTS_URL)
-    if resp.status_code == 404:
-        # No robots.txt published: allow-all, not an error. The empty
-        # parser must still be *parsed* (parse([]) sets last_checked):
-        # an unparsed RobotFileParser conservatively denies everything
-        # (mirroring urllib.robotparser's own read(), which treats a 404
-        # as allow-all).
-        parser = RobotFileParser()
-        parser.parse([])
-        return parser
     if resp.status_code in (401, 403):
-        # The file exists but we may not read it: read() maps these to
-        # disallow-all (can_fetch always False) rather than raising, so
-        # a WAF/bot-detection 403 on the robots endpoint cannot abort
-        # the whole run. can_fetch checks disallow_all first, before any
-        # rule matching, so no parse() call is needed.
-        parser = RobotFileParser()
-        parser.disallow_all = True
-        return parser
+        # The file exists but we may not read it — the one status that
+        # maps to a *disallow-all* parser, i.e. the one that would block
+        # every URL for the whole run. A transient WAF/bot-detection
+        # blip on this single request must not be accepted as
+        # authoritative: retry once before treating the status as real.
+        resp = _http_get(ROBOTS_URL)
+        if resp.status_code in (401, 403):
+            # Confirmed on retry: disallow-all, matching read()'s
+            # handling of these statuses rather than aborting the run.
+            # can_fetch checks disallow_all first, before any rule
+            # matching, so no parse() call is needed. Log prominently
+            # that this came from an HTTP error status rather than a
+            # published rule, so an operator can distinguish "the site
+            # says no" from "the robots fetch had a hiccup".
+            logger.warning(
+                "robots.txt returned %s on both attempts; treating every "
+                "URL as disallowed (this is an HTTP error status, not a "
+                "published Disallow rule)",
+                resp.status_code,
+            )
+            parser = RobotFileParser()
+            parser.disallow_all = True
+            return parser
     if 400 <= resp.status_code < 500:
-        # Any other 4xx (429 rate-limited, 410 gone, ...): read() maps
-        # these to allow-all, same as a missing file. A rate-limit
-        # response for the robots endpoint must not abort the run while
-        # the event/match pages may still be fetchable.
-        parser = RobotFileParser()
-        parser.parse([])
-        return parser
+        # 404 (no robots.txt published), 429 (rate-limited), 410 (gone),
+        # ...: read() maps all of these to allow-all — the dedicated
+        # 404 branch was merged into this general 4xx branch in round-5
+        # because the two constructed identical allow-all parsers, so
+        # the split was pure duplication.
+        return _allow_all_parser()
     # 2xx: parse the body. 5xx: fatal — see the docstring's status table
     # for why this is deliberately stricter than read()'s silent
     # disallow-all.
@@ -1150,6 +1184,7 @@ def get_matches_from_event(
     event_url: str,
     use_cache: bool = True,
     robots_parser: Optional[RobotFileParser] = None,
+    robots_skipped: list[str] | None = None,
 ) -> List[Match]:
     """Fetch (or load from cache) every match listed on an event page.
 
@@ -1161,12 +1196,19 @@ def get_matches_from_event(
     matches incur no delay. Two per-match gates sit between the event
     page and each match fetch:
 
-    - When ``robots_parser`` is given, every match URL is checked with
-      :func:`assert_allowed` first and a disallowed match is logged and
-      skipped. (The CLI driver checks the event URL up front, but that
-      only covers the listing page; without this per-match gate the
-      majority of the requests this function makes would go out with
-      zero permission check.)
+    - The cache is checked first: a match already cached is served
+      with no HTTP request at all, and so is *not* subject to the
+      robots gate — robots.txt governs fetching, not returning data we
+      already have. The robots gate applies only to the path that
+      would actually issue a new HTTP request: when ``robots_parser``
+      is given, an uncached match URL is checked with
+      :func:`assert_allowed` first and a disallowed match is logged
+      and skipped (and, when ``robots_skipped`` is given, its URL is
+      appended there so the caller's summary/exit code can surface the
+      policy stop). (The CLI driver checks the event URL up front, but
+      that only covers the listing page; without this per-match gate
+      the majority of the requests this function makes would go out
+      with zero permission check.)
     - A match that fails to fetch or parse (``VlrFetchError`` /
       ``VlrParseError`` / ``IllegalScoreError``) is logged and skipped
       rather than aborting the whole event, so matches already parsed
@@ -1187,17 +1229,26 @@ def get_matches_from_event(
             between all of them).
         robots_parser: An already-parsed :class:`RobotFileParser`
             (normally the one ``scrape.main`` fetched once up front)
-            to gate every match URL with before fetching it. ``None``
-            (the default) performs no per-match robots check, keeping
-            the function's existing behavior for callers that do not
-            run under the robots gate.
+            to gate every uncached match URL with before fetching it.
+            ``None`` (the default) performs no per-match robots check,
+            keeping the function's existing behavior for callers that
+            do not run under the robots gate.
+        robots_skipped: An optional list the URLs of robots-disallowed
+            matches are appended to (in page order), so the caller can
+            fold the per-match policy skips into its summary and exit
+            code — without this, a run whose event pages pass the gate
+            but whose match pages are all disallowed would exit 0 and
+            report success with zero data. ``None`` (the default) does
+            not collect the skipped URLs; the skip is still logged as a
+            warning either way.
 
     Returns:
         A list of parsed :class:`scraper.models.Match` objects, one
         per match link found on the event page that was not skipped,
         in page order. Matches skipped by the robots gate or by a
         per-match fetch/parse failure are not included (each skip is
-        logged as a warning).
+        logged as a warning; robots skips are also appended to
+        ``robots_skipped`` when that list is given).
 
     Raises:
         VlrFetchError: If fetching the *event page* over HTTP fails.
@@ -1223,6 +1274,28 @@ def get_matches_from_event(
     fetched = False
     for link in links:
         url = link if link.startswith("http") else BASE_URL + link
+        # Cached fast path first: serving an already-cached row makes no
+        # HTTP request, so it is not subject to the robots gate —
+        # robots.txt governs *fetching*, not returning data we already
+        # have. (Gating before the cache check would let a later-
+        # tightened robots.txt silently drop already-cached results with
+        # no corresponding reduction in site load.) A corrupt cached row
+        # deserializing to an illegal score is still isolated like any
+        # other per-match failure.
+        if use_cache:
+            try:
+                cached = get_cached_match(extract_match_id(url))
+            except RECOVERABLE_EXCEPTIONS as exc:
+                logger.warning("match %s failed: %s; skipping", url, exc)
+                continue
+            if cached is not None:
+                try:
+                    matches.append(get_match(url, use_cache=True))
+                except RECOVERABLE_EXCEPTIONS as exc:
+                    logger.warning("match %s failed: %s; skipping", url, exc)
+                continue
+        # Robots gate: applies only to the fetch path below — the one
+        # that would actually issue a new HTTP request.
         if robots_parser is not None:
             try:
                 assert_allowed(url, robots_parser)
@@ -1230,11 +1303,10 @@ def get_matches_from_event(
                 logger.warning(
                     "robots.txt disallows match %s: %s; skipping", url, exc
                 )
+                if robots_skipped is not None:
+                    robots_skipped.append(url)
                 continue
         try:
-            if use_cache and get_cached_match(extract_match_id(url)) is not None:
-                matches.append(get_match(url, use_cache=True))
-                continue
             if fetched:
                 time.sleep(POLITE_DELAY_SECONDS)
             fetched = True
@@ -1242,10 +1314,6 @@ def get_matches_from_event(
         except RECOVERABLE_EXCEPTIONS as exc:
             # One bad match must not discard the matches already
             # parsed/cached for this event: log and move on, so a
-            # partial run's summary still counts what succeeded. The
-            # same catch covers the cached fast path, where a corrupt
-            # cached row deserializing to an illegal score raises
-            # IllegalScoreError from get_cached_match (both the
-            # condition check above and the call inside get_match).
+            # partial run's summary still counts what succeeded.
             logger.warning("match %s failed: %s; skipping", url, exc)
     return matches
