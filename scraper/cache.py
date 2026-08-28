@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Union
 
-from .models import Match
+from .models import IllegalScoreError, Match
 
 # Default cache location: <project root>/cache/vlr_cache.sqlite3
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "cache" / "vlr_cache.sqlite3"
@@ -154,12 +154,13 @@ def set_cached_page(url: str, html: str, db_path: _DB_PATH_T = None) -> None:
 def get_cached_match(match_id: str, db_path: _DB_PATH_T = None) -> Optional[Match]:
     """Look up a previously cached, parsed match by its id.
 
-    A corrupt cached row (unparseable JSON, or JSON that fails to
+    A corrupt cached row (unparseable JSON, JSON that fails to
     deserialize into a ``Match`` because of a missing key or wrong
-    type) is treated as a miss (returns ``None``) so the caller
-    re-fetches rather than crashing on a bad row. A row that
-    deserializes but fails score validity is NOT a miss: it is a
-    genuine data problem, so the resulting ``ValueError`` propagates
+    type, or a ``date`` string that is not valid ISO-8601) is treated
+    as a miss (returns ``None``) so the caller re-fetches rather than
+    crashing on a bad row. A row that deserializes but fails score
+    validity is NOT a miss: it is a genuine data problem, so the
+    resulting :class:`scraper.models.IllegalScoreError` propagates
     loudly instead of silently forcing a full re-fetch and re-parse
     on every call (which would re-raise the same error anyway).
 
@@ -177,8 +178,9 @@ def get_cached_match(match_id: str, db_path: _DB_PATH_T = None) -> Optional[Matc
     Raises:
         sqlite3.OperationalError: If the database cannot be opened or
             queried.
-        ValueError: If the stored match deserializes to an illegal
-            final map score (propagated from
+        IllegalScoreError (a ``ValueError`` subclass): If the stored
+            match deserializes to an illegal final map score
+            (propagated from
             :meth:`scraper.models.MapResult.__post_init__` via
             :meth:`scraper.models.Match.from_dict`).
     """
@@ -193,12 +195,20 @@ def get_cached_match(match_id: str, db_path: _DB_PATH_T = None) -> Optional[Matc
         return None
     try:
         return Match.from_dict(json.loads(row[0]))
-    except (json.JSONDecodeError, TypeError, KeyError):
+    except IllegalScoreError:
+        # A row that deserializes but fails score validity is a
+        # genuine data problem, not corruption: surface it loudly
+        # rather than silently treating it as a miss (which would
+        # force a full re-fetch and re-parse on every call).
+        raise
+    except (ValueError, TypeError, KeyError):
         # json.JSONDecodeError (a ValueError subclass) covers corrupt
-        # JSON; TypeError/KeyError cover structurally malformed rows.
-        # A validation ValueError from MapResult.__post_init__ is NOT
-        # caught here on purpose - it must surface loudly (see the
-        # docstring above).
+        # JSON; ValueError also covers a ``date`` field that is not
+        # valid ISO-8601 (from datetime.fromisoformat);
+        # TypeError/KeyError cover structurally malformed rows. Any
+        # of these means the row is corrupt, so it is treated as a
+        # miss and the caller re-fetches. The IllegalScoreError above
+        # is deliberately not caught here.
         return None
 
 

@@ -2,7 +2,7 @@
 
 import pytest
 
-from scraper.models import MapResult
+from scraper.models import IllegalScoreError, MapResult
 
 # --------------------------------------------------------------------------
 # MapResult score validity assertions
@@ -30,6 +30,15 @@ def test_winner_score_below_13_raises():
     # 12-10 with a declared winner is illegal: a winner must reach 13.
     with pytest.raises(ValueError):
         MapResult(map_name="Ascent", team1_score=12, team2_score=10, winner="Team A")
+
+
+def test_illegal_score_raises_illegal_score_error():
+    # Illegal scorelines raise IllegalScoreError (a ValueError
+    # subclass), so callers can distinguish score-validity failures
+    # from unrelated ValueErrors (e.g. a corrupt cache row's bad date
+    # field) while still matching ``except ValueError`` handlers.
+    with pytest.raises(IllegalScoreError):
+        MapResult(map_name="Ascent", team1_score=13, team2_score=12, winner="Team A")
 
 
 def test_overtime_with_margin_below_2_raises():

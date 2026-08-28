@@ -479,6 +479,12 @@ def get_match(url: str, use_cache: bool = True) -> Match:
             :func:`parse_match`).
         VlrFetchError: If fetching the page over HTTP fails
             (propagated from :func:`fetch_page`).
+        IllegalScoreError: If a cached row for the match deserializes
+            to an illegal final map score (propagated from
+            :func:`cache.get_cached_match`; a ``ValueError`` subclass,
+            so callers catching ``ValueError`` still see it). The same
+            failure on a freshly fetched page is raised as
+            :class:`VlrParseError` instead (via :func:`_parse_map`).
     """
     match_id = extract_match_id(url)
     if use_cache:
@@ -520,6 +526,11 @@ def get_matches_from_event(event_url: str, use_cache: bool = True) -> List[Match
             over HTTP fails.
         VlrParseError: If the event page or any match page is missing
             expected structure.
+        IllegalScoreError: If a cached row for any match deserializes
+            to an illegal final map score (propagated from
+            :func:`cache.get_cached_match`, either directly or via
+            :func:`get_match`; a ``ValueError`` subclass, so callers
+            catching ``ValueError`` still see it).
     """
     html = fetch_page(event_url, use_cache=use_cache)
     links = parse_event_match_links(html)

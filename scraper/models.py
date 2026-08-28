@@ -13,6 +13,20 @@ from datetime import datetime
 from typing import Any, Optional
 
 
+class IllegalScoreError(ValueError):
+    """A finished map's final score violates standard VCT rules.
+
+    Raised by :meth:`MapResult.__post_init__` when a finished map's
+    scoreline is impossible: a winner with fewer than 13 rounds, or an
+    overtime scoreline (both teams >= 12) with a winning margin below
+    2 rounds. Subclasses ``ValueError`` so existing ``except
+    ValueError`` handlers keep working, but gives callers a way to
+    distinguish a score-validity failure from unrelated ``ValueError``
+    sources (e.g. a corrupt cache row whose ``date`` field fails
+    ``datetime.fromisoformat``).
+    """
+
+
 @dataclass
 class Team:
     """A competing team.
@@ -136,11 +150,12 @@ class MapResult:
             populated by the current parsers.
 
     Raises:
-        ValueError: In :meth:`__post_init__`, if the map is finished
-            (all three of ``team1_score``, ``team2_score`` and
-            ``winner`` set) with an illegal scoreline: a winner with
-            fewer than 13 rounds, or an overtime scoreline (both
-            teams >= 12) with a winning margin below 2.
+        IllegalScoreError (a ``ValueError`` subclass): In
+            :meth:`__post_init__`, if the map is finished (all three
+            of ``team1_score``, ``team2_score`` and ``winner`` set)
+            with an illegal scoreline: a winner with fewer than 13
+            rounds, or an overtime scoreline (both teams >= 12) with
+            a winning margin below 2.
     """
 
     map_name: str
@@ -166,12 +181,13 @@ class MapResult:
         materialized dataset.
 
         Raises:
-            ValueError: If the map is finished and ``winner_score < 13``
-                (a winner cannot have fewer than 13 rounds), or if the
-                map went to overtime (both scores >= 12) and the
-                winning margin is less than 2 rounds (e.g. 13-12,
-                which is not a legal final scoreline). The message
-                includes ``map_name`` and both scores.
+            IllegalScoreError (a ``ValueError`` subclass): If the map
+                is finished and ``winner_score < 13`` (a winner
+                cannot have fewer than 13 rounds), or if the map went
+                to overtime (both scores >= 12) and the winning
+                margin is less than 2 rounds (e.g. 13-12, which is
+                not a legal final scoreline). The message includes
+                ``map_name`` and both scores.
         """
         if (
             self.team1_score is None
@@ -182,13 +198,13 @@ class MapResult:
         winner_score = max(self.team1_score, self.team2_score)
         loser_score = min(self.team1_score, self.team2_score)
         if winner_score < 13:
-            raise ValueError(
+            raise IllegalScoreError(
                 f"map {self.map_name!r} has winner score {winner_score} < 13 "
                 f"(scores {self.team1_score}-{self.team2_score})"
             )
         is_overtime = loser_score >= 12
         if is_overtime and winner_score - loser_score < 2:
-            raise ValueError(
+            raise IllegalScoreError(
                 f"map {self.map_name!r} went to overtime with an illegal "
                 f"margin: winner {winner_score} vs loser {loser_score} "
                 f"(scores {self.team1_score}-{self.team2_score}); "
@@ -234,9 +250,9 @@ class MapResult:
 
         Raises:
             KeyError: If ``data`` has no ``"map_name"`` key.
-            ValueError: If the reconstructed map is finished with an
-                illegal scoreline (propagated from
-                :meth:`__post_init__`).
+            IllegalScoreError (a ``ValueError`` subclass): If the
+                reconstructed map is finished with an illegal
+                scoreline (propagated from :meth:`__post_init__`).
         """
         return cls(
             map_name=data["map_name"],
@@ -339,8 +355,9 @@ class Match:
                 ``"event_name"``, ``"team1"`` or ``"team2"``.
             ValueError: If ``"date"`` is present and not a valid
                 ISO-8601 string (propagated from
-                ``datetime.fromisoformat``), or if any map in
-                ``"maps"`` deserializes to an illegal final score
+                ``datetime.fromisoformat``).
+            IllegalScoreError (a ``ValueError`` subclass): If any map
+                in ``"maps"`` deserializes to an illegal final score
                 (propagated from :meth:`MapResult.from_dict`, which
                 validates each map via
                 :meth:`MapResult.__post_init__`).

@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from scraper import cache
-from scraper.models import MapResult, Match, Team
+from scraper.models import IllegalScoreError, MapResult, Match, Team
 
 
 def make_match(match_id="1001", url="https://www.vlr.gg/1001/alpha-vs-beta"):
@@ -135,8 +135,45 @@ def test_match_illegal_score_row_propagates_value_error(tmp_path):
         conn.commit()
     finally:
         conn.close()
-    with pytest.raises(ValueError):
+    with pytest.raises(IllegalScoreError):
         cache.get_cached_match("1", db_path=db)
+
+
+def test_match_corrupt_date_row_treated_as_miss(tmp_path):
+    # A cached row whose "date" field is not a valid ISO-8601 string
+    # is corrupt (ValueError from datetime.fromisoformat), not a
+    # score-validity failure: it must be treated as a miss so the
+    # caller re-fetches instead of crashing on a bad row.
+    db = tmp_path / "c.sqlite3"
+    conn = cache.get_connection(db)
+    try:
+        conn.execute(
+            "INSERT INTO matches (match_id, url, data, cached_at) VALUES (?, ?, ?, ?)",
+            (
+                "1",
+                "https://x",
+                json.dumps(
+                    {
+                        "match_id": "1",
+                        "url": "https://x",
+                        "event_name": "Test Event",
+                        "date": "not-a-real-date",
+                        "team1": {"name": "Alpha", "team_id": "1"},
+                        "team2": {"name": "Beta", "team_id": "2"},
+                        "team1_score": 1,
+                        "team2_score": 0,
+                        "best_of": "Bo3",
+                        "maps": [],
+                        "status": "completed",
+                    }
+                ),
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert cache.get_cached_match("1", db_path=db) is None
 
 
 def test_match_overwrite_updates(tmp_path):
