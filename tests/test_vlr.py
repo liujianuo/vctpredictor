@@ -471,3 +471,102 @@ def test_get_matches_from_event(monkeypatch, tmp_path):
     matches2 = vlr.get_matches_from_event(EVENT_URL)
     assert calls["n"] == 0
     assert matches2 == matches
+
+
+# --------------------------------------------------------------------------
+# robots.txt (fetch_robots_parser / assert_allowed)
+# --------------------------------------------------------------------------
+
+# Synthetic robots.txt body with two Disallow rules (plain text, not an
+# HTML fixture file — robots.txt isn't HTML, so it doesn't fit the
+# tests/fixtures/*.html convention). URLs under /forums/ or under the
+# Stage-1 event's path are disallowed; everything else is default-allowed
+# (no matching rule).
+ROBOTS_TXT = """\
+User-agent: *
+Disallow: /forums/
+Disallow: /event/matches/2863/
+"""
+
+
+def test_fetch_robots_parser_parses_rules(monkeypatch):
+    # The parser must be fed vlr.gg's real robots URL and must apply its
+    # rules: a disallowed path returns can_fetch False, an unrelated path
+    # returns True (default-allow).
+    def fake_get(url, **kwargs):
+        assert url == vlr.ROBOTS_URL
+        return _FakeResponse(ROBOTS_TXT)
+
+    monkeypatch.setattr(vlr.requests, "get", fake_get)
+    rp = vlr.fetch_robots_parser()
+    assert rp.can_fetch(vlr.USER_AGENT, "https://www.vlr.gg/forums/123/") is False
+    assert (
+        rp.can_fetch(
+            vlr.USER_AGENT,
+            "https://www.vlr.gg/event/matches/2863/vct-2026-emea-stage-1/?group=completed",
+        )
+        is False
+    )
+    assert rp.can_fetch(vlr.USER_AGENT, "https://www.vlr.gg/712803/fut-vs-navi") is True
+
+
+def test_fetch_robots_parser_raises_vlr_fetch_error_on_http_error(monkeypatch):
+    # A non-2xx robots.txt response must surface as VlrFetchError, the
+    # same conversion fetch_page applies, so the CLI driver can abort the
+    # run on it.
+    monkeypatch.setattr(
+        vlr.requests,
+        "get",
+        lambda url, **kwargs: _FakeResponse("oops", status_code=500),
+    )
+    with pytest.raises(vlr.VlrFetchError):
+        vlr.fetch_robots_parser()
+
+
+def test_fetch_robots_parser_raises_vlr_fetch_error_on_network_error(monkeypatch):
+    def boom(url, **kwargs):
+        import requests as _r
+
+        raise _r.exceptions.ConnectionError("connection refused")
+
+    monkeypatch.setattr(vlr.requests, "get", boom)
+    with pytest.raises(vlr.VlrFetchError):
+        vlr.fetch_robots_parser()
+
+
+def test_assert_allowed_passes_for_allowed_url(monkeypatch):
+    # rp=None means assert_allowed fetches robots.txt itself; an allowed
+    # URL (no matching rule -> default-allow) must return without raising.
+    monkeypatch.setattr(
+        vlr.requests, "get", lambda url, **kwargs: _FakeResponse(ROBOTS_TXT)
+    )
+    vlr.assert_allowed("https://www.vlr.gg/712803/fut-vs-navi")
+
+
+def test_assert_allowed_raises_vlr_robots_error_for_disallowed_url(monkeypatch):
+    # A disallowed URL must raise VlrRobotsError, not silently pass.
+    monkeypatch.setattr(
+        vlr.requests, "get", lambda url, **kwargs: _FakeResponse(ROBOTS_TXT)
+    )
+    with pytest.raises(vlr.VlrRobotsError) as excinfo:
+        vlr.assert_allowed("https://www.vlr.gg/forums/123/")
+    assert "forums" in str(excinfo.value)
+
+
+def test_assert_allowed_with_provided_parser_does_not_fetch(monkeypatch):
+    # The whole point of passing rp in is to avoid re-fetching robots.txt
+    # per URL: with a parser supplied, no requests.get call may happen.
+    calls = {"n": 0}
+
+    def fake_get(url, **kwargs):
+        calls["n"] += 1
+        return _FakeResponse(ROBOTS_TXT)
+
+    monkeypatch.setattr(vlr.requests, "get", fake_get)
+    rp = vlr.fetch_robots_parser()
+    calls["n"] = 0
+    vlr.assert_allowed("https://www.vlr.gg/712803/fut-vs-navi", rp=rp)
+    assert calls["n"] == 0
+    with pytest.raises(vlr.VlrRobotsError):
+        vlr.assert_allowed("https://www.vlr.gg/forums/123/", rp=rp)
+    assert calls["n"] == 0

@@ -18,6 +18,7 @@ import re
 import time
 from datetime import datetime
 from typing import List, Optional
+from urllib.robotparser import RobotFileParser
 
 import requests
 from bs4 import BeautifulSoup
@@ -40,6 +41,9 @@ USER_AGENT = (
 REQUEST_TIMEOUT = 15
 # Delay between consecutive uncached match fetches, to be polite to vlr.gg.
 POLITE_DELAY_SECONDS = 1.0
+# Where vlr.gg publishes its robots.txt; checked once per CLI run, before any
+# event URL is fetched (see scrape.py).
+ROBOTS_URL = BASE_URL + "/robots.txt"
 
 _MATCH_ID_RE = re.compile(r"/(\d+)/")
 _BO_RE = re.compile(r"Bo\d+")
@@ -64,6 +68,10 @@ class VlrFetchError(VlrError):
 
 class VlrParseError(VlrError):
     """Expected structure was missing from a fetched page."""
+
+
+class VlrRobotsError(VlrError):
+    """A URL is disallowed by the site's robots.txt."""
 
 
 # --------------------------------------------------------------------------
@@ -670,6 +678,86 @@ def fetch_page(url: str, use_cache: bool = True, force_refresh: bool = False) ->
     if use_cache:
         set_cached_page(url, html)
     return html
+
+
+# --------------------------------------------------------------------------
+# Robots.txt (driver boundary)
+# --------------------------------------------------------------------------
+#
+# The robots check lives one level up from fetch_page — it is a property of
+# the CLI entry point (scrape.py), not of the page-fetch layer. Wiring it
+# into fetch_page itself would fetch robots.txt on every cache miss and break
+# the exact ``requests.get`` call-count assertions in tests/test_vlr.py, plus
+# raise a recursion question (checking robots permission to fetch robots.txt).
+# These two functions are the reusable primitives; only the CLI driver calls
+# them.
+
+
+def fetch_robots_parser() -> RobotFileParser:
+    """Fetch vlr.gg's robots.txt and return a parsed ``RobotFileParser``.
+
+    Fetches ``ROBOTS_URL`` over HTTP with ``requests.get`` (the same
+    mockable call path the other fetch functions use) rather than through
+    :func:`fetch_page`, so the robots fetch never touches the page cache
+    and never affects any existing fetch-page call-count assertion. The
+    response body is fed to a fresh :class:`RobotFileParser` via
+    :meth:`RobotFileParser.parse`, which populates its allow/disallow
+    rules for subsequent :meth:`RobotFileParser.can_fetch` checks.
+
+    Returns:
+        A parsed :class:`RobotFileParser` for vlr.gg's robots.txt.
+
+    Raises:
+        VlrFetchError: If the HTTP request fails (network error, timeout,
+            or non-2xx status via ``raise_for_status``) — the same
+            conversion :func:`fetch_page` applies.
+    """
+    try:
+        resp = requests.get(
+            ROBOTS_URL, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT
+        )
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        raise VlrFetchError(f"failed to fetch {ROBOTS_URL}: {exc}") from exc
+    parser = RobotFileParser()
+    parser.parse(resp.text.splitlines())
+    return parser
+
+
+def assert_allowed(url: str, rp: Optional[RobotFileParser] = None) -> None:
+    """Assert that a URL is permitted by vlr.gg's robots.txt.
+
+    When ``rp`` is ``None`` (the default), the robots file is fetched and
+    parsed first via :func:`fetch_robots_parser`; callers that already
+    fetched it once (e.g. ``scrape.main``, which checks every configured
+    event URL against a single parser) pass it in to avoid N fetches of
+    the same file.
+
+    Args:
+        url: The absolute URL to check, e.g. an event matches page from
+            ``config.ACTIVE.event_urls``. Permission is checked at this
+            URL's granularity (typically a path prefix, e.g. an
+            ``/event/`` page); the CLI checks each configured event URL,
+            not every individual match URL discovered from it.
+        rp: An already-parsed :class:`RobotFileParser` to check against.
+            ``None`` fetches a fresh one via
+            :func:`fetch_robots_parser` (see Raises).
+
+    Returns:
+        Nothing; returns normally when ``rp.can_fetch(USER_AGENT, url)``
+        is ``True`` (including the default-allow case where the robots
+        file has no rule matching the URL).
+
+    Raises:
+        VlrRobotsError: If ``rp.can_fetch(USER_AGENT, url)`` is
+            ``False`` — the URL is disallowed and must not be fetched.
+        VlrFetchError: If ``rp`` was ``None`` and the robots.txt fetch
+            itself failed (propagated from :func:`fetch_robots_parser`).
+    """
+    if rp is None:
+        rp = fetch_robots_parser()
+    if not rp.can_fetch(USER_AGENT, url):
+        raise VlrRobotsError(f"robots.txt disallows fetching {url}")
 
 
 # --------------------------------------------------------------------------
