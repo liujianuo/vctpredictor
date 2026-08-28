@@ -1,0 +1,34 @@
+{
+  "region": "emea",
+  "active_era": "2026-abyss",
+  "eras": [
+    {
+      "name": "2026-s1-bind",
+      "start": "2026-04-01",
+      "end": "2026-05-02",
+      "map_pool": ["Bind", "Breeze", "Fracture", "Haven", "Lotus", "Pearl", "Split"]
+    },
+    {
+      "name": "2026-s1-ascent",
+      "start": "2026-05-02",
+      "end": "2026-07-15",
+      "map_pool": ["Ascent", "Breeze", "Fracture", "Haven", "Lotus", "Pearl", "Split"]
+    },
+    {
+      "name": "2026-s2-breeze",
+      "start": "2026-07-15",
+      "end": "2026-08-17",
+      "map_pool": ["Ascent", "Breeze", "Haven", "Lotus", "Split", "Summit", "Sunset"]
+    },
+    {
+      "name": "2026-abyss",
+      "start": "2026-08-17",
+      "end": null,
+      "map_pool": ["Abyss", "Ascent", "Haven", "Lotus", "Split", "Summit", "Sunset"]
+    }
+  ],
+  "event_urls": [
+    "https://www.vlr.gg/event/matches/2976/vct-2026-emea-stage-2/?group=completed",
+    "https://www.vlr.gg/event/matches/2863/vct-2026-emea-stage-1/?group=completed"
+  ]
+}
