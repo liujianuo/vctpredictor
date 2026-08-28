@@ -4,9 +4,10 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+from bs4 import BeautifulSoup
 
 from scraper import cache, vlr
-from scraper.models import Match
+from scraper.models import Match, Team
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -38,6 +39,37 @@ def test_extract_match_id_rejects_non_match_url():
 # --------------------------------------------------------------------------
 # parse_match
 # --------------------------------------------------------------------------
+
+
+INVALID_SCORE_HTML = """
+<div class="vm-stats-game">
+<div class="vm-stats-game-header">
+<div class="team">
+<div class="score">13</div>
+</div>
+<div class="map">
+<div><span>Ascent</span></div>
+</div>
+<div class="team mod-right">
+<div class="score mod-win">12</div>
+</div>
+</div>
+</div>
+"""
+
+
+def test_parse_map_invalid_score_raises_vlr_parse_error():
+    # 13-12 with a declared winner is an illegal final scoreline
+    # (overtime, margin < 2). _parse_map must surface it as a
+    # VlrParseError (via the score-validity wrapper), not a raw
+    # ValueError.
+    game_el = BeautifulSoup(INVALID_SCORE_HTML, "lxml").select_one(".vm-stats-game")
+    with pytest.raises(vlr.VlrParseError) as excinfo:
+        vlr._parse_map(game_el, Team(name="Team A"), Team(name="Team B"))
+    message = str(excinfo.value)
+    assert "Ascent" in message
+    assert "13" in message
+    assert "12" in message
 
 
 def test_parse_match_completed():

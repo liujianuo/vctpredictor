@@ -162,7 +162,12 @@ def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
 
     Raises:
         VlrParseError: If ``game_el`` has no ``.vm-stats-game-header``,
-            or the header has no map name (``.map div span``).
+            or the header has no map name (``.map div span``), or the
+            parsed final score is illegal (a winner with fewer than
+            13 rounds, or an overtime scoreline with margin < 2) —
+            the latter re-raises the ``ValueError`` from
+            :class:`scraper.models.MapResult` with the map name and
+            both scores included in the message.
     """
     header_el = game_el.select_one(".vm-stats-game-header")
     if header_el is None:
@@ -199,14 +204,25 @@ def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
     duration_el = header_el.select_one(".map-duration")
     duration = duration_el.get_text(strip=True) if duration_el is not None else None
 
-    return MapResult(
-        map_name=map_name,
-        team1_score=team1_score,
-        team2_score=team2_score,
-        winner=winner,
-        duration=duration,
-        agent_picks=None,  # reserved; agent picks not parsed from stats tables yet
-    )
+    try:
+        return MapResult(
+            map_name=map_name,
+            team1_score=team1_score,
+            team2_score=team2_score,
+            winner=winner,
+            duration=duration,
+            agent_picks=None,  # reserved; agent picks not parsed from stats tables yet
+        )
+    except ValueError as exc:
+        # An illegal final score is a data problem, not a programming
+        # error, so it surfaces through the module's error taxonomy
+        # (VlrParseError) rather than as a raw ValueError. It still
+        # aborts the whole match parse — fail loudly, never silently
+        # skip-and-continue with a wrong label.
+        raise VlrParseError(
+            f"illegal final score for map {map_name!r} "
+            f"({team1_score}-{team2_score}): {exc}"
+        ) from exc
 
 
 # --------------------------------------------------------------------------

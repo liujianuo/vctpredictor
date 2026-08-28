@@ -134,6 +134,13 @@ class MapResult:
             ``"59:20"``, or ``None`` if not shown.
         agent_picks: Reserved for future agent-pick data; not
             populated by the current parsers.
+
+    Raises:
+        ValueError: In :meth:`__post_init__`, if the map is finished
+            (all three of ``team1_score``, ``team2_score`` and
+            ``winner`` set) with an illegal scoreline: a winner with
+            fewer than 13 rounds, or an overtime scoreline (both
+            teams >= 12) with a winning margin below 2.
     """
 
     map_name: str
@@ -143,6 +150,51 @@ class MapResult:
     duration: Optional[str] = None  # e.g. "59:20" as displayed on vlr.gg
     agent_picks: Optional[dict[str, Any]] = None  # reserved; not populated yet
 
+    def __post_init__(self) -> None:
+        """Validate a finished map's score after construction.
+
+        Validation runs only when the map is finished — i.e. when
+        ``team1_score``, ``team2_score`` and ``winner`` are all not
+        ``None`` (unfinished/live/upcoming maps have no final labels
+        yet and are skipped). For finished maps it enforces the
+        standard VCT rules: the winner must have at least 13 rounds
+        (``winner_score >= 13``), and when both teams reached 12
+        rounds (overtime), the winning margin must be at least 2
+        rounds (``winner_score - loser_score >= 2``). This is
+        validation only — no ``is_overtime`` field is persisted here;
+        deriving an OT flag belongs to a later milestone against the
+        materialized dataset.
+
+        Raises:
+            ValueError: If the map is finished and ``winner_score < 13``
+                (a winner cannot have fewer than 13 rounds), or if the
+                map went to overtime (both scores >= 12) and the
+                winning margin is less than 2 rounds (e.g. 13-12,
+                which is not a legal final scoreline). The message
+                includes ``map_name`` and both scores.
+        """
+        if (
+            self.team1_score is None
+            or self.team2_score is None
+            or self.winner is None
+        ):
+            return
+        winner_score = max(self.team1_score, self.team2_score)
+        loser_score = min(self.team1_score, self.team2_score)
+        if winner_score < 13:
+            raise ValueError(
+                f"map {self.map_name!r} has winner score {winner_score} < 13 "
+                f"(scores {self.team1_score}-{self.team2_score})"
+            )
+        is_overtime = loser_score >= 12
+        if is_overtime and winner_score - loser_score < 2:
+            raise ValueError(
+                f"map {self.map_name!r} went to overtime with an illegal "
+                f"margin: winner {winner_score} vs loser {loser_score} "
+                f"(scores {self.team1_score}-{self.team2_score}); "
+                f"overtime wins must have margin >= 2"
+            )
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize this map result to a JSON-compatible dict.
 
@@ -151,6 +203,12 @@ class MapResult:
             ``"team2_score"``, ``"winner"``, ``"duration"`` and
             ``"agent_picks"``, suitable for ``json.dumps`` and for
             round-tripping via :meth:`from_dict`.
+
+        Raises:
+            ValueError: Propagated from :meth:`__post_init__` if this
+                map is finished (all three of ``team1_score``,
+                ``team2_score`` and ``winner`` set) with an illegal
+                scoreline.
         """
         return {
             "map_name": self.map_name,
@@ -176,6 +234,9 @@ class MapResult:
 
         Raises:
             KeyError: If ``data`` has no ``"map_name"`` key.
+            ValueError: If the reconstructed map is finished with an
+                illegal scoreline (propagated from
+                :meth:`__post_init__`).
         """
         return cls(
             map_name=data["map_name"],
