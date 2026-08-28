@@ -154,8 +154,14 @@ def set_cached_page(url: str, html: str, db_path: _DB_PATH_T = None) -> None:
 def get_cached_match(match_id: str, db_path: _DB_PATH_T = None) -> Optional[Match]:
     """Look up a previously cached, parsed match by its id.
 
-    A corrupted/unparseable cached row is treated as a miss (returns
-    ``None``) so the caller re-fetches rather than crashing.
+    A corrupt cached row (unparseable JSON, or JSON that fails to
+    deserialize into a ``Match`` because of a missing key or wrong
+    type) is treated as a miss (returns ``None``) so the caller
+    re-fetches rather than crashing on a bad row. A row that
+    deserializes but fails score validity is NOT a miss: it is a
+    genuine data problem, so the resulting ``ValueError`` propagates
+    loudly instead of silently forcing a full re-fetch and re-parse
+    on every call (which would re-raise the same error anyway).
 
     Args:
         match_id: The vlr.gg numeric match id to look up (see
@@ -165,12 +171,16 @@ def get_cached_match(match_id: str, db_path: _DB_PATH_T = None) -> Optional[Matc
 
     Returns:
         The cached :class:`scraper.models.Match`, or ``None`` if there
-        is no entry for ``match_id`` or the stored JSON fails to parse
-        or deserialize.
+        is no entry for ``match_id`` or the stored JSON is corrupt
+        (fails to parse, or is structurally malformed).
 
     Raises:
         sqlite3.OperationalError: If the database cannot be opened or
             queried.
+        ValueError: If the stored match deserializes to an illegal
+            final map score (propagated from
+            :meth:`scraper.models.MapResult.__post_init__` via
+            :meth:`scraper.models.Match.from_dict`).
     """
     conn = get_connection(db_path)
     try:
@@ -183,7 +193,12 @@ def get_cached_match(match_id: str, db_path: _DB_PATH_T = None) -> Optional[Matc
         return None
     try:
         return Match.from_dict(json.loads(row[0]))
-    except (ValueError, TypeError, KeyError):
+    except (json.JSONDecodeError, TypeError, KeyError):
+        # json.JSONDecodeError (a ValueError subclass) covers corrupt
+        # JSON; TypeError/KeyError cover structurally malformed rows.
+        # A validation ValueError from MapResult.__post_init__ is NOT
+        # caught here on purpose - it must surface loudly (see the
+        # docstring above).
         return None
 
 

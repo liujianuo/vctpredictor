@@ -1,6 +1,9 @@
 """Tests for scraper.cache (SQLite page/match caching)."""
 
+import json
 from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from scraper import cache
 from scraper.models import MapResult, Match, Team
@@ -87,6 +90,53 @@ def test_match_corrupt_row_treated_as_miss(tmp_path):
     finally:
         conn.close()
     assert cache.get_cached_match("1", db_path=db) is None
+
+
+def test_match_illegal_score_row_propagates_value_error(tmp_path):
+    # A cached row that deserializes but fails score validity (13-12
+    # with a declared winner is an illegal OT scoreline) is a genuine
+    # data problem, not a corrupt row: it must raise loudly instead of
+    # being silently treated as a cache miss (which would force a full
+    # re-fetch and re-parse on every call).
+    db = tmp_path / "c.sqlite3"
+    conn = cache.get_connection(db)
+    try:
+        conn.execute(
+            "INSERT INTO matches (match_id, url, data, cached_at) VALUES (?, ?, ?, ?)",
+            (
+                "1",
+                "https://x",
+                json.dumps(
+                    {
+                        "match_id": "1",
+                        "url": "https://x",
+                        "event_name": "Test Event",
+                        "date": None,
+                        "team1": {"name": "Alpha", "team_id": "1"},
+                        "team2": {"name": "Beta", "team_id": "2"},
+                        "team1_score": 1,
+                        "team2_score": 0,
+                        "best_of": "Bo3",
+                        "maps": [
+                            {
+                                "map_name": "Ascent",
+                                "team1_score": 13,
+                                "team2_score": 12,
+                                "winner": "Alpha",
+                                "duration": "41:10",
+                            }
+                        ],
+                        "status": "completed",
+                    }
+                ),
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(ValueError):
+        cache.get_cached_match("1", db_path=db)
 
 
 def test_match_overwrite_updates(tmp_path):

@@ -72,6 +72,39 @@ def test_parse_map_invalid_score_raises_vlr_parse_error():
     assert "12" in message
 
 
+WINNER_MISMATCH_HTML = """
+<div class="vm-stats-game">
+<div class="vm-stats-game-header">
+<div class="team">
+<div class="score">2</div>
+</div>
+<div class="map">
+<div><span>Ascent</span></div>
+</div>
+<div class="team mod-right">
+<div class="score">13</div>
+</div>
+<div class="score mod-win"></div>
+</div>
+</div>
+"""
+
+
+def test_parse_map_winner_score_mismatch_raises_vlr_parse_error():
+    # The .score.mod-win element sits outside any .team div, so the
+    # ancestor lookup in _parse_map fails and the parser falls back to
+    # team1's name. team2 outscored team1 (2-13), so that fallback
+    # label contradicts the final score: it must fail loudly rather
+    # than cache a mislabeled winner.
+    game_el = BeautifulSoup(WINNER_MISMATCH_HTML, "lxml").select_one(".vm-stats-game")
+    with pytest.raises(vlr.VlrParseError) as excinfo:
+        vlr._parse_map(game_el, Team(name="Team A"), Team(name="Team B"))
+    message = str(excinfo.value)
+    assert "Ascent" in message
+    assert "Team A" in message
+    assert "Team B" in message
+
+
 def test_parse_match_completed():
     m = vlr.parse_match(MATCH_HTML, MATCH_URL)
     assert m.match_id == "712803"

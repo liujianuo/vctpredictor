@@ -198,17 +198,17 @@ class MapResult:
     def to_dict(self) -> dict[str, Any]:
         """Serialize this map result to a JSON-compatible dict.
 
+        Reads fields off the already-constructed instance and never
+        re-runs :meth:`__post_init__` validation, so it does not
+        raise ``ValueError``; an illegal scoreline is rejected at
+        construction time (:meth:`__init__` / :meth:`from_dict`)
+        before this is ever called.
+
         Returns:
             A dict with keys ``"map_name"``, ``"team1_score"``,
             ``"team2_score"``, ``"winner"``, ``"duration"`` and
             ``"agent_picks"``, suitable for ``json.dumps`` and for
             round-tripping via :meth:`from_dict`.
-
-        Raises:
-            ValueError: Propagated from :meth:`__post_init__` if this
-                map is finished (all three of ``team1_score``,
-                ``team2_score`` and ``winner`` set) with an illegal
-                scoreline.
         """
         return {
             "map_name": self.map_name,
@@ -339,7 +339,11 @@ class Match:
                 ``"event_name"``, ``"team1"`` or ``"team2"``.
             ValueError: If ``"date"`` is present and not a valid
                 ISO-8601 string (propagated from
-                ``datetime.fromisoformat``).
+                ``datetime.fromisoformat``), or if any map in
+                ``"maps"`` deserializes to an illegal final score
+                (propagated from :meth:`MapResult.from_dict`, which
+                validates each map via
+                :meth:`MapResult.__post_init__`).
         """
         raw_date = data.get("date")
         return cls(

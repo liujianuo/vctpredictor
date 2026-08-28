@@ -164,10 +164,11 @@ def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
         VlrParseError: If ``game_el`` has no ``.vm-stats-game-header``,
             or the header has no map name (``.map div span``), or the
             parsed final score is illegal (a winner with fewer than
-            13 rounds, or an overtime scoreline with margin < 2) —
-            the latter re-raises the ``ValueError`` from
-            :class:`scraper.models.MapResult` with the map name and
-            both scores included in the message.
+            13 rounds, or an overtime scoreline with margin < 2), or
+            the winner label contradicts the final scores (the
+            winning side must be the one with more rounds). The
+            illegal-score and winner-mismatch cases include the map
+            name and both scores in the message.
     """
     header_el = game_el.select_one(".vm-stats-game-header")
     if header_el is None:
@@ -200,6 +201,33 @@ def _parse_map(game_el, team1: Team, team2: Team) -> MapResult:
             winner = team2.name
         else:
             winner = team1.name
+
+    # Cross-check the winner label against the final scores: a
+    # finished map's winner must be the side with more rounds. This
+    # catches the win-element fallback above (when the
+    # ``.score.mod-win`` ancestor lookup fails and the code defaults
+    # to ``team1`` even if team2 actually won) before an inconsistent
+    # MapResult reaches the cache. ``MapResult`` itself cannot do this
+    # check - it stores only the winner's *name*, not which side it
+    # was - so it lives here where both team names and scores are
+    # known. Equal scores with a declared winner are already rejected
+    # below by ``MapResult`` score validation (a winner must reach 13
+    # and OT margins must be >= 2), so they are skipped here.
+    if (
+        winner is not None
+        and team1_score is not None
+        and team2_score is not None
+        and team1_score != team2_score
+    ):
+        expected_winner = (
+            team1.name if team1_score > team2_score else team2.name
+        )
+        if winner != expected_winner:
+            raise VlrParseError(
+                f"map {map_name!r} winner {winner!r} does not match final "
+                f"score {team1_score}-{team2_score} (expected "
+                f"{expected_winner!r})"
+            )
 
     duration_el = header_el.select_one(".map-duration")
     duration = duration_el.get_text(strip=True) if duration_el is not None else None

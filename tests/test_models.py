@@ -39,6 +39,18 @@ def test_overtime_with_margin_below_2_raises():
         MapResult(map_name="Ascent", team1_score=13, team2_score=12, winner="Team A")
 
 
+def test_forfeit_style_scoreline_raises():
+    # A forfeited/defaulted map (winner declared, scores like 0-0 or
+    # 2-0) has no legal winner_score >= 13, so it raises. This is
+    # accepted per plan#1, which specified no carve-out for forfeits:
+    # if vlr.gg ever renders one, it surfaces loudly rather than
+    # caching a wrong label.
+    with pytest.raises(ValueError):
+        MapResult(map_name="Ascent", team1_score=0, team2_score=0, winner="Team A")
+    with pytest.raises(ValueError):
+        MapResult(map_name="Ascent", team1_score=2, team2_score=0, winner="Team A")
+
+
 def test_error_message_includes_map_name_and_scores():
     with pytest.raises(ValueError) as excinfo:
         MapResult(map_name="Ascent", team1_score=13, team2_score=12, winner="Team A")
