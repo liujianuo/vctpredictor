@@ -312,6 +312,31 @@ def test_single_team_half_data_raises_illegal_score_error():
     assert "half-split data for team1 only" in message
 
 
+def test_partial_team_half_data_with_full_other_team_raises():
+    # Round-6 finding 2: the round-5 completeness check used any() for
+    # the per-team presence test, so a team with only one of its four
+    # half-split fields set (e.g. atk only) counted as "present", and
+    # when the other team was fully populated the "exactly one team
+    # parsed" guard never fired. all() must treat the 3-of-4-None team
+    # as absent, so the mismatch raises IllegalScoreError (fails on the
+    # pre-fix code, which let the partial team slip through silently).
+    with pytest.raises(IllegalScoreError) as excinfo:
+        MapResult(
+            map_name="Ascent",
+            team1_score=13,
+            team2_score=10,
+            winner="Team A",
+            team1_atk_rounds=7,  # partial: first/second/def all None
+            team2_first_half_rounds=8,
+            team2_second_half_rounds=5,
+            team2_atk_rounds=8,
+            team2_def_rounds=5,
+        )
+    message = str(excinfo.value)
+    assert "Ascent" in message
+    assert "half-split data for team2 only" in message
+
+
 def test_atk_def_mismatch_with_half_splits_raises_illegal_score_error():
     # Round-5 finding 7: a team's atk+def totals and its first+second
     # half rounds count the same regulation rounds from the same

@@ -913,3 +913,76 @@ def test_get_matches_from_event_skips_cached_illegal_score_row(
     # Event page + one fetch per non-bad match; the bad cached match is
     # skipped without any network call.
     assert calls["n"] == len(matches) + 1
+
+
+def test_get_matches_from_event_reports_fetch_failures(
+    monkeypatch, tmp_path, caplog
+):
+    # Round-6 finding 1: a per-match fetch/parse failure must be
+    # surfaced to the caller (via failed_matches), not just logged —
+    # otherwise an event whose matches all fail returns [] with no
+    # exception and scrape.main would miscount it as fully ok. The
+    # failed URL is appended to the list while the event's other
+    # matches still parse.
+    monkeypatch.setattr(cache, "DEFAULT_DB_PATH", tmp_path / "c.sqlite3")
+    monkeypatch.setattr(vlr, "POLITE_DELAY_SECONDS", 0)
+    links = vlr.parse_event_match_links(EVENT_HTML)
+    bad_id = vlr.extract_match_id(links[0])
+    calls = {"n": 0}
+
+    def fake_get(url, **kwargs):
+        calls["n"] += 1
+        if "event/matches" in url:
+            return _FakeResponse(EVENT_HTML)
+        if bad_id in url:
+            import requests as _r
+
+            raise _r.exceptions.ConnectionError("connection refused")
+        return _FakeResponse(MATCH_HTML)
+
+    monkeypatch.setattr(vlr.requests, "get", fake_get)
+    failed_matches = []
+    matches = vlr.get_matches_from_event(EVENT_URL, failed_matches=failed_matches)
+    assert bad_id not in {m.match_id for m in matches}
+    assert len(matches) == len(links) - 1
+    assert len(failed_matches) == 1
+    assert bad_id in failed_matches[0]
+    assert "connection refused" in caplog.text
+
+
+def test_get_matches_from_event_cached_fast_path_appends_row_directly(
+    monkeypatch, tmp_path
+):
+    # Round-6 finding 3: the cached fast path used to call get_match
+    # (re-deriving the match ID and re-querying the cache) after already
+    # holding the cached row, doubling cache I/O on the common
+    # idempotent-rerun path. It must append the already-fetched row
+    # directly, so get_match is never invoked for a cache hit and the
+    # cache is read exactly once per match.
+    monkeypatch.setattr(cache, "DEFAULT_DB_PATH", tmp_path / "c.sqlite3")
+    monkeypatch.setattr(vlr, "POLITE_DELAY_SECONDS", 0)
+    links = vlr.parse_event_match_links(EVENT_HTML)
+    ids = [vlr.extract_match_id(link) for link in links]
+    cache_reads = {"n": 0}
+
+    def counting_get_cached(match_id):
+        cache_reads["n"] += 1
+        return "cached-" + match_id
+
+    monkeypatch.setattr(vlr, "get_cached_match", counting_get_cached)
+
+    def fail_if_called(url, **kwargs):
+        raise AssertionError("get_match must not be called for a cache hit")
+
+    monkeypatch.setattr(vlr, "get_match", fail_if_called)
+
+    def fake_get(url, **kwargs):
+        if "event/matches" in url:
+            return _FakeResponse(EVENT_HTML)
+        raise AssertionError("no match-page fetch should happen (all cached)")
+
+    monkeypatch.setattr(vlr.requests, "get", fake_get)
+
+    matches = vlr.get_matches_from_event(EVENT_URL)
+    assert matches == ["cached-" + mid for mid in ids]
+    assert cache_reads["n"] == len(ids)

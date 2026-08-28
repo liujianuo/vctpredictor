@@ -71,7 +71,12 @@ class _FakeScraper:
         self.fail_error = fail_error
 
     def __call__(
-        self, url, use_cache=True, robots_parser=None, robots_skipped=None
+        self,
+        url,
+        use_cache=True,
+        robots_parser=None,
+        robots_skipped=None,
+        failed_matches=None,
     ):
         """Simulate ``vlr.get_matches_from_event``.
 
@@ -84,6 +89,9 @@ class _FakeScraper:
             robots_skipped: The list the real function appends
                 robots-disallowed match URLs to (ignored by the fake;
                 the fake never reports skips).
+            failed_matches: The list the real function appends
+                fetch/parse-failed match URLs to (ignored by the fake;
+                the fake never reports failures).
 
         Returns:
             A one-element list of fake match objects for URLs other
@@ -302,6 +310,14 @@ def test_build_summary_single_format_across_branches():
         == "2/3 events ok; 2 match pages disallowed by robots; "
         "98 total matches"
     )
+    # Round-6 finding 1: per-match fetch/parse failures get their own
+    # count-only clause (mirroring the robots-skip clause), so an event
+    # whose matches all failed is not silently miscounted as ok.
+    assert (
+        scrape._build_summary(2, 3, [], [], 98, [], ["http://m1", "http://m2"])
+        == "2/3 events ok; 2 match pages failed to fetch/parse; "
+        "98 total matches"
+    )
 
 
 def test_main_match_level_robots_skips_surface_in_summary_and_exit_code(
@@ -320,7 +336,13 @@ def test_main_match_level_robots_skips_surface_in_summary_and_exit_code(
     monkeypatch.setattr(scrape.vlr, "fetch_robots_parser", _permissive_robots)
     calls = []
 
-    def fake_scraper(url, use_cache=True, robots_parser=None, robots_skipped=None):
+    def fake_scraper(
+        url,
+        use_cache=True,
+        robots_parser=None,
+        robots_skipped=None,
+        failed_matches=None,
+    ):
         calls.append((url, use_cache))
         if robots_skipped is not None:
             robots_skipped.append("https://www.vlr.gg/12345/blocked-match")
@@ -345,7 +367,13 @@ def test_main_match_skips_with_failure_still_returns_1(monkeypatch, caplog):
     monkeypatch.setattr(scrape.vlr, "fetch_robots_parser", _permissive_robots)
     calls = []
 
-    def fake_scraper(url, use_cache=True, robots_parser=None, robots_skipped=None):
+    def fake_scraper(
+        url,
+        use_cache=True,
+        robots_parser=None,
+        robots_skipped=None,
+        failed_matches=None,
+    ):
         calls.append((url, use_cache))
         if url == EVENT_URLS[0]:
             raise vlr.VlrFetchError("network down")
@@ -357,6 +385,41 @@ def test_main_match_skips_with_failure_still_returns_1(monkeypatch, caplog):
     assert scrape.main([]) == 1
     assert "1 match page disallowed by robots" in caplog.text
     assert "network down" in caplog.text
+
+
+def test_main_match_fetch_failures_surface_in_summary_and_exit_code(
+    monkeypatch, caplog
+):
+    # Round-6 finding 1: per-match fetch/parse failures inside
+    # get_matches_from_event used to be invisible to the driver — an
+    # event whose matches all failed still counted as ok and the run
+    # exited 0 with zero data. The driver must collect the failed URLs
+    # via failed_matches and fold them into the failure accounting: the
+    # summary names them (count only) and the run exits 1 — the same
+    # retryable code as an event-level failure — never 0.
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(scrape.config, "ACTIVE", _FakeEventUrls(EVENT_URLS))
+    monkeypatch.setattr(scrape.vlr, "fetch_robots_parser", _permissive_robots)
+    calls = []
+
+    def fake_scraper(
+        url,
+        use_cache=True,
+        robots_parser=None,
+        robots_skipped=None,
+        failed_matches=None,
+    ):
+        calls.append((url, use_cache))
+        if failed_matches is not None:
+            failed_matches.append("https://www.vlr.gg/12345/broken-match")
+        return []
+
+    monkeypatch.setattr(scrape.vlr, "get_matches_from_event", fake_scraper)
+    assert scrape.main([]) == 1
+    assert [url for url, _ in calls] == list(EVENT_URLS)
+    assert "2/2 events ok" in caplog.text
+    # One failure per event -> 2 match pages total.
+    assert "2 match pages failed to fetch/parse" in caplog.text
 
 
 # --------------------------------------------------------------------------

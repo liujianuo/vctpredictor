@@ -1180,11 +1180,47 @@ def get_match(url: str, use_cache: bool = True) -> Match:
     return match
 
 
+def _record_match_skip(
+    url: str,
+    exc: Exception,
+    failed_matches: list[str] | None,
+) -> None:
+    """Log a per-match fetch/parse failure and record the skipped URL.
+
+    Shared by every per-match isolation site in
+    :func:`get_matches_from_event` (the cached fast path and the
+    uncached fetch path) so the log wording and the skipped-URL
+    bookkeeping live in exactly one place — a future change to either
+    cannot silently diverge between the cached and uncached paths.
+
+    Args:
+        url: The match URL that failed to fetch or parse.
+        exc: The exception that caused the failure (a member of
+            ``RECOVERABLE_EXCEPTIONS``).
+        failed_matches: An optional list the URL is appended to when
+            given, mirroring :func:`get_matches_from_event`'s
+            ``robots_skipped`` collection so the caller's summary and
+            exit code can surface per-match fetch/parse failures;
+            ``None`` means log only.
+
+    Returns:
+        Nothing; logs a warning and optionally mutates
+        ``failed_matches``.
+
+    Raises:
+        Nothing.
+    """
+    logger.warning("match %s failed: %s; skipping", url, exc)
+    if failed_matches is not None:
+        failed_matches.append(url)
+
+
 def get_matches_from_event(
     event_url: str,
     use_cache: bool = True,
     robots_parser: Optional[RobotFileParser] = None,
     robots_skipped: list[str] | None = None,
+    failed_matches: list[str] | None = None,
 ) -> List[Match]:
     """Fetch (or load from cache) every match listed on an event page.
 
@@ -1217,7 +1253,12 @@ def get_matches_from_event(
       isolation: a cached row that deserializes to an illegal final map
       score (``IllegalScoreError`` raised by
       :func:`cache.get_cached_match`) is logged and skipped too, not
-      propagated to the caller.
+      propagated to the caller. The skipped URL is also appended to
+      ``failed_matches`` (when given), mirroring ``robots_skipped``, so
+      the caller can surface per-match fetch/parse failures in its
+      summary and exit code — otherwise an event whose matches all fail
+      returns an empty list with no exception and would be miscounted
+      as fully ok.
 
     Args:
         event_url: The vlr.gg event matches page URL.
@@ -1241,14 +1282,26 @@ def get_matches_from_event(
             report success with zero data. ``None`` (the default) does
             not collect the skipped URLs; the skip is still logged as a
             warning either way.
+        failed_matches: An optional list the URLs of matches that
+            failed to fetch or parse are appended to (in page order),
+            mirroring ``robots_skipped`` so the caller can fold
+            per-match fetch/parse failures into its summary and exit
+            code — without this, an event whose matches all fail
+            (``VlrFetchError`` / ``VlrParseError`` /
+            ``IllegalScoreError``) returns an empty list with no
+            exception and would be miscounted as fully ok by a caller
+            that only sees the empty result. ``None`` (the default)
+            does not collect the failed URLs; the skip is still logged
+            as a warning either way.
 
     Returns:
         A list of parsed :class:`scraper.models.Match` objects, one
         per match link found on the event page that was not skipped,
         in page order. Matches skipped by the robots gate or by a
         per-match fetch/parse failure are not included (each skip is
-        logged as a warning; robots skips are also appended to
-        ``robots_skipped`` when that list is given).
+        logged as a warning; robots skips are appended to
+        ``robots_skipped`` and fetch/parse failures to
+        ``failed_matches`` when those lists are given).
 
     Raises:
         VlrFetchError: If fetching the *event page* over HTTP fails.
@@ -1286,13 +1339,14 @@ def get_matches_from_event(
             try:
                 cached = get_cached_match(extract_match_id(url))
             except RECOVERABLE_EXCEPTIONS as exc:
-                logger.warning("match %s failed: %s; skipping", url, exc)
+                _record_match_skip(url, exc, failed_matches)
                 continue
             if cached is not None:
-                try:
-                    matches.append(get_match(url, use_cache=True))
-                except RECOVERABLE_EXCEPTIONS as exc:
-                    logger.warning("match %s failed: %s; skipping", url, exc)
+                # The row is already in hand: append it directly rather
+                # than re-deriving the match ID and re-querying the
+                # cache through get_match, which would double cache I/O
+                # on the common idempotent-rerun path.
+                matches.append(cached)
                 continue
         # Robots gate: applies only to the fetch path below — the one
         # that would actually issue a new HTTP request.
@@ -1315,5 +1369,5 @@ def get_matches_from_event(
             # One bad match must not discard the matches already
             # parsed/cached for this event: log and move on, so a
             # partial run's summary still counts what succeeded.
-            logger.warning("match %s failed: %s; skipping", url, exc)
+            _record_match_skip(url, exc, failed_matches)
     return matches

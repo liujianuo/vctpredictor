@@ -373,7 +373,11 @@ class MapResult:
         # map. The four values per team are the (first, second) halves
         # and the (atk, def) side totals; ``_parse_half_split`` derives
         # both pairs from the same recognized spans, so a team's data
-        # is all-or-nothing in practice.
+        # is all-or-nothing in practice. A team counts as present only
+        # when all four of its values parsed (``all``, not ``any``): a
+        # 3-of-4-None partial row is treated as absent, so the
+        # mismatch guard below still fires when the other team is fully
+        # populated instead of silently skipping every invariant.
         team1_halves = (
             self.team1_first_half_rounds,
             self.team1_second_half_rounds,
@@ -386,8 +390,8 @@ class MapResult:
             self.team2_atk_rounds,
             self.team2_def_rounds,
         )
-        team1_half_present = any(value is not None for value in team1_halves)
-        team2_half_present = any(value is not None for value in team2_halves)
+        team1_half_present = all(value is not None for value in team1_halves)
+        team2_half_present = all(value is not None for value in team2_halves)
         if team1_half_present != team2_half_present:
             # Completeness: a finished map's header must render both
             # teams' half-split data or neither. Exactly one team
