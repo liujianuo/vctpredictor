@@ -129,7 +129,7 @@ through it.
 - Size: **M**
 - Depends on: M8
 
-### M13. Bayesian-shrunk map win rates
+### M13. Bayesian-shrunk map win rates [x]
 Partial-pooling estimator `(wins + k·prior)/(games + k)` shrinking map-specific
 win rate toward the team's overall rate; expose the posterior, not just the point
 estimate; choose k by cross-validation.
