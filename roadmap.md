@@ -122,7 +122,7 @@ penalises adjacent-category misses less than distant ones.
 
 ## Phase 2 — Feature layer (leakage-safe)
 
-### M12. Point-in-time feature framework
+### M12. Point-in-time feature framework [x]
 `features_as_of(team, date)` scaffolding: a strict as-of API plus a test proving
 no row dated ≥ the match date can enter a feature. Everything downstream must go
 through it.
