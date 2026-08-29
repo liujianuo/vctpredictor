@@ -212,7 +212,11 @@ def build_labels_table(maps_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     ``team2_score`` are both non-null, in input row order, labelled
     by a vectorized transcription of :func:`compute_outcome`'s logic
     (``np.select`` over the two score columns — same OT criterion,
-    winner side, and signed margin, no row-by-row Python loop). Only
+    winner side, and signed margin, no row-by-row Python loop). The
+    ``outcome_ordinal`` is computed first and the ``outcome_label``
+    string is then derived from :data:`OUTCOME_LABELS` via that
+    ordinal, so the string vocabulary lives in exactly one place
+    rather than being re-hardcoded in a second list. Only
     the ``match_id``, ``map_index``,
     ``team1_score`` and ``team2_score`` columns are read — the
     ``winner`` column (and everything else M8 wrote) is deliberately
@@ -276,14 +280,14 @@ def build_labels_table(maps_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     valid_team1 = team1_score[valid]
     valid_team2 = team2_score[valid]
 
-    for label_index in maps_df.index[null_scores.to_numpy()]:
+    for pos in np.flatnonzero(null_scores.to_numpy()):
         logger.warning(
             "map (match %s, map_index %s) has a null score (%s-%s); "
             "skipping it from the labels table",
-            maps_df.at[label_index, "match_id"],
-            maps_df.at[label_index, "map_index"],
-            maps_df.at[label_index, "team1_score"],
-            maps_df.at[label_index, "team2_score"],
+            match_ids.iloc[pos],
+            map_indices.iloc[pos],
+            team1_score.iloc[pos],
+            team2_score.iloc[pos],
         )
 
     # A tie among the valid rows is an invariant break: same refusal
@@ -299,20 +303,20 @@ def build_labels_table(maps_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
 
     # Vectorized transcription of compute_outcome: the OT criterion is
     # min(scores) >= 12 (the loser reached 12+), the winner is the
-    # higher score, and the margin is team1 minus team2.
+    # higher score, and the margin is team1 minus team2. The ordinal is
+    # computed first and the label string is then derived from
+    # OUTCOME_LABELS via that ordinal, so the string vocabulary lives in
+    # exactly one place (OUTCOME_LABELS) and can never drift out of sync
+    # with the ordinals.
     margin = valid_team1 - valid_team2
     overtime = (valid_team1 >= 12) & (valid_team2 >= 12)
     a_wins = valid_team1 > valid_team2
-    label = np.select(
-        [a_wins & overtime, a_wins & ~overtime, ~a_wins & overtime],
-        ["A-OT", "A-regulation", "B-OT"],
-        default="B-regulation",
-    )
     ordinal = np.select(
         [a_wins & overtime, a_wins & ~overtime, ~a_wins & overtime],
         [1, 0, 2],
         default=3,
     )
+    label = np.asarray(OUTCOME_LABELS)[ordinal]
 
     labels_df = pd.DataFrame(
         {

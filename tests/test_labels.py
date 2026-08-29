@@ -226,6 +226,58 @@ def test_build_labels_table_ordinal_matches_label():
         assert labels.OUTCOME_LABELS[row["outcome_ordinal"]] == row["outcome_label"]
 
 
+def test_build_labels_table_label_derives_from_outcome_labels(monkeypatch):
+    # Regression for round-2 finding 4: the label string must be
+    # derived from OUTCOME_LABELS via the computed ordinal, not from a
+    # second hardcoded string list — changing OUTCOME_LABELS alone must
+    # change the produced labels without any other edit.
+    monkeypatch.setattr(
+        labels,
+        "OUTCOME_LABELS",
+        ("X-regulation", "X-OT", "Y-OT", "Y-regulation"),
+    )
+    maps_df = pd.DataFrame(
+        [
+            {"match_id": "1", "map_index": 0, "team1_score": 13, "team2_score": 6},
+            {"match_id": "1", "map_index": 1, "team1_score": 14, "team2_score": 12},
+            {"match_id": "1", "map_index": 2, "team1_score": 12, "team2_score": 14},
+            {"match_id": "1", "map_index": 3, "team1_score": 6, "team2_score": 13},
+        ]
+    )
+    df, skipped = labels.build_labels_table(maps_df)
+    assert skipped == 0
+    assert list(df["outcome_label"]) == [
+        "X-regulation",
+        "X-OT",
+        "Y-OT",
+        "Y-regulation",
+    ]
+
+
+def test_build_labels_table_null_score_warning_scalar_with_duplicate_index(caplog):
+    # Regression for round-2 finding 3: with a non-unique maps_df index
+    # the null-score warning must report the one skipped row's scalar
+    # values, not a multi-row Series repr (which the old .at lookup
+    # produced for duplicate index labels).
+    maps_df = pd.DataFrame(
+        [
+            {"match_id": "1", "map_index": 0, "team1_score": None, "team2_score": 11},
+            {"match_id": "1", "map_index": 1, "team1_score": 13, "team2_score": 6},
+        ],
+        index=[0, 0],
+    )
+    with caplog.at_level(logging.WARNING):
+        df, skipped = labels.build_labels_table(maps_df)
+    assert skipped == 1
+    assert len(df) == 1
+    warning = caplog.text
+    assert "match 1" in warning
+    assert "map_index 0" in warning
+    assert "nan-11" in warning
+    assert "Name: match_id" not in warning
+    assert "Name: map_index" not in warning
+
+
 # --------------------------------------------------------------------------
 # load_maps_table / write_labels_table
 # --------------------------------------------------------------------------
