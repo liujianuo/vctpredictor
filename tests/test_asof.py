@@ -28,17 +28,19 @@ def _synthetic_tables():
     ``team2``), one match dated *exactly equal* to :data:`QUERY_DATE`,
     one match dated *after* it, one match that is not ``T1``'s at all,
     and one ``T1`` match dated before the cutoff but not completed. The
-    maps table carries one map for each of the four ``T1``-involving
-    matches (the not-completed and non-T1 matches have no map, as is
-    irrelevant for the map-level filter).
+    maps table carries one finished map for each of the four
+    ``T1``-involving matches (the not-completed and non-T1 matches have
+    no map), plus one *unfinished* map (``winner=None``) attached to the
+    strictly-before ``m001`` so the map-level completeness filter has a
+    row to drop.
 
     Returns:
         A ``(matches_df, maps_df)`` tuple. ``matches_df`` has columns
         ``match_id, date, team1_id, team2_id, status``;
         ``maps_df`` has columns ``match_id, map_index, team1_score,
-        team2_score`` (the subset ``maps_as_of`` and the tests need —
-        ``maps_as_of`` only reads ``match_id`` and carries the rest
-        through untouched).
+        team2_score, winner`` (the subset ``maps_as_of`` and the tests
+        need — ``maps_as_of`` reads ``match_id`` and ``winner`` and
+        carries the rest through untouched).
 
     Raises:
         Nothing.
@@ -92,14 +94,15 @@ def _synthetic_tables():
         columns=["match_id", "date", "team1_id", "team2_id", "status"],
     )
     maps_rows = [
-        {"match_id": "m001", "map_index": 0, "team1_score": 13, "team2_score": 8},
-        {"match_id": "m002", "map_index": 0, "team1_score": 9, "team2_score": 13},
-        {"match_id": "m003", "map_index": 0, "team1_score": 10, "team2_score": 13},
-        {"match_id": "m004", "map_index": 0, "team1_score": 13, "team2_score": 5},
+        {"match_id": "m001", "map_index": 0, "team1_score": 13, "team2_score": 8, "winner": "team1"},
+        {"match_id": "m001", "map_index": 1, "team1_score": 3, "team2_score": 5, "winner": None},
+        {"match_id": "m002", "map_index": 0, "team1_score": 9, "team2_score": 13, "winner": "team2"},
+        {"match_id": "m003", "map_index": 0, "team1_score": 10, "team2_score": 13, "winner": "team2"},
+        {"match_id": "m004", "map_index": 0, "team1_score": 13, "team2_score": 5, "winner": "team1"},
     ]
     maps_df = pd.DataFrame(
         maps_rows,
-        columns=["match_id", "map_index", "team1_score", "team2_score"],
+        columns=["match_id", "map_index", "team1_score", "team2_score", "winner"],
     )
     return matches_df, maps_df
 
@@ -259,6 +262,37 @@ def test_maps_as_of_missing_match_id_raises():
         asof.maps_as_of("T1", QUERY_DATE, matches_df, maps_df.drop(columns=["match_id"]))
 
 
+def test_maps_as_of_missing_winner_raises():
+    # maps_df must carry the map-completion signal too; its absence is
+    # a KeyError rather than a silent skip of the completeness filter.
+    matches_df, maps_df = _synthetic_tables()
+    with pytest.raises(KeyError, match="winner"):
+        asof.maps_as_of("T1", QUERY_DATE, matches_df, maps_df.drop(columns=["winner"]))
+
+
+def test_maps_as_of_drops_unfinished_map():
+    # The map-level completeness filter: a winner-null map attached to
+    # a completed, strictly-before match is dropped, while its finished
+    # sibling map survives — so "completed rows only" holds at the map
+    # level, not just the match level.
+    matches_df, maps_df = _synthetic_tables()
+    result = asof.maps_as_of("T1", QUERY_DATE, matches_df, maps_df)
+    m001_maps = result[result["match_id"] == "m001"]
+    assert set(m001_maps["map_index"]) == {0}
+    assert (result["winner"].notna()).all()
+
+
+def test_maps_as_of_duplicate_match_id_raises():
+    # A duplicate match_id in the as-of-filtered matches would fan out
+    # the maps join and silently duplicate map rows; the framework must
+    # raise instead.
+    matches_df, maps_df = _synthetic_tables()
+    dup_row = matches_df[matches_df["match_id"] == "m001"].copy()
+    matches_df = pd.concat([matches_df, dup_row], ignore_index=True)
+    with pytest.raises(ValueError, match="duplicate match_id"):
+        asof.maps_as_of("T1", QUERY_DATE, matches_df, maps_df)
+
+
 def test_load_asof_tables_roundtrip(tmp_path):
     # Both Parquet files under tmp_path/<version> read back intact and
     # in the right order (matches first, then maps).
@@ -320,3 +354,41 @@ def test_real_data_no_leakage_at_v1_scale():
         bundle.matches[["match_id", "team1_id"]], on="match_id", how="inner"
     )
     assert (check["team_is_team1"] == (check["team1_id"] == team_id)).all()
+
+
+@pytest.mark.skipif(
+    not (
+        Path("data/v1/matches.parquet").exists()
+        and Path("data/v1/maps.parquet").exists()
+    ),
+    reason="materialised v1 dataset not present (run materialize.py first)",
+)
+def test_real_data_strict_boundary_excludes_equal_date():
+    # The strict-< boundary exercised at real v1 scale, not just on the
+    # synthetic fixture: query at a real team's latest match timestamp
+    # exactly and prove that match (date == query) is excluded while its
+    # strictly-earlier history is still returned. This would fail if the
+    # implementation regressed to <= at real-data scale.
+    matches_df, maps_df = asof.load_asof_tables("v1")
+    appearances = pd.concat(
+        [matches_df["team1_id"], matches_df["team2_id"]]
+    ).dropna()
+    team_id = appearances.value_counts().idxmax()
+    team_matches = matches_df[
+        (matches_df["team1_id"] == team_id) | (matches_df["team2_id"] == team_id)
+    ].copy()
+    team_matches["_parsed"] = pd.to_datetime(team_matches["date"])
+    team_matches = team_matches.sort_values("_parsed")
+    assert team_matches["_parsed"].nunique() >= 2
+
+    cutoff_row = team_matches.iloc[-1]
+    query = str(cutoff_row["date"])
+    excluded_id = cutoff_row["match_id"]
+
+    bundle = asof.features_as_of(team_id, query, matches_df, maps_df)
+
+    assert len(bundle.matches) > 0
+    assert excluded_id not in set(bundle.matches["match_id"])
+    query_ts = pd.to_datetime(query)
+    for frame in (bundle.matches, bundle.maps):
+        assert (pd.to_datetime(frame["date"]) < query_ts).all()

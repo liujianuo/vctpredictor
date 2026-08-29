@@ -40,8 +40,11 @@ The whole module is built around a single, non-negotiable contract:
   their maps) are eligible: a live/upcoming match carries no usable
   outcome signal for win-rate/Elo/closeness-style features, so the
   as-of contract filters it out rather than leaving that to each
-  caller. (A completed match's maps are all finished in practice; see
-  the :func:`maps_as_of` docstring for how unfinished maps are treated.)
+  caller. The match-level half of this is the ``status`` check above;
+  the map-level half is enforced separately in :func:`maps_as_of`,
+  which drops any map whose ``winner`` is null (an unfinished map)
+  even when its parent match is ``completed`` — see that function's
+  docstring for the exact rule.
 - **Unknown team is empty, not an error.** A new/unseen ``team_id``
   (or a ``team_id`` whose first match is still in the future of the
   query date) legitimately yields zero history rows. Feature functions
@@ -91,6 +94,11 @@ TEAM2_ID_COL = "team2_id"
 STATUS_COL = "status"
 COMPLETED_STATUS = "completed"
 
+# M8's "this map is finished" signal on the maps table: ``winner`` is
+# ``"team1"``/``"team2"`` for a finished map and ``None`` for an
+# unfinished one (``materialize.build_maps_table`` skips the latter).
+WINNER_COL = "winner"
+
 # The added orientation column on :func:`maps_as_of`'s output: True
 # when the queried team is the match's ``team1`` (so its score is
 # ``team1_score``), False when it is ``team2`` (its score is
@@ -99,6 +107,10 @@ TEAM_ORIENTATION_COL = "team_is_team1"
 
 # The columns :func:`matches_as_of` needs on the matches table.
 _MATCHES_REQUIRED = (TEAM1_ID_COL, TEAM2_ID_COL, DATE_COL, STATUS_COL)
+
+# The columns :func:`maps_as_of` needs on the maps table: the join key
+# plus the map-completion signal used by the map-level filter.
+_MAPS_REQUIRED = (MATCH_ID_COL, WINNER_COL)
 
 
 @dataclass(eq=False)
@@ -322,9 +334,20 @@ def maps_as_of(
     join back to ``matches`` on ``match_id`` — so this function first
     runs the match-level filter (:func:`matches_as_of`) and then inner-
     joins ``maps_df`` against those matches. The inner join is what
-    applies every filter to the maps in one step: a map whose match is
-    the wrong team, not completed, or not strictly before the cutoff
-    is absent from the join keys and therefore dropped.
+    applies the match-level filters to the maps in one step: a map whose
+    match is the wrong team, not completed, or not strictly before the
+    cutoff is absent from the join keys and therefore dropped.
+
+    A map-level completeness filter is applied in addition to (and
+    before) that join: only maps whose ``winner`` is non-null are
+    eligible. ``winner`` is M8's "this map is finished" signal —
+    ``materialize.build_maps_table`` already skips winner-null maps, but
+    a ``completed`` match can in principle still carry an unfinished
+    child map, so the as-of contract enforces the map-level half of
+    "completed rows only" here rather than assuming it away. The join is
+    also guarded against fan-out: the as-of-filtered ``matches`` frame
+    must have unique ``match_id`` values, otherwise an inner join would
+    silently duplicate every map row of the offending match.
 
     Two columns are added to each surviving map row:
 
@@ -347,29 +370,45 @@ def maps_as_of(
             ``date``/orientation.
         maps_df: The materialised ``maps`` table (M8's
             ``maps.parquet``). Every column is carried through; only
-            ``match_id`` is used as the join key.
+            ``match_id`` (join key) and ``winner`` (map-completion
+            signal) are read.
 
     Returns:
         A ``pandas.DataFrame`` with all of ``maps_df``'s columns (in
         their original order) followed by ``date`` and then
         ``team_is_team1``, containing exactly the rows whose match
-        passes the match-level filter. A zero-row result (unseen team,
-        no prior completed maps, or an empty join) carries the full
+        passes the match-level filter *and* whose own ``winner`` is
+        non-null (a finished map). A zero-row result (unseen team, no
+        prior completed maps, or an empty join) carries the full
         ``maps`` + ``date`` + ``team_is_team1`` column set with
         ``team_is_team1`` still boolean.
 
     Raises:
-        KeyError: If ``maps_df`` lacks ``match_id``, or if
+        KeyError: If ``maps_df`` lacks ``match_id`` or ``winner``, or if
             ``matches_df`` lacks a required column (propagated from
             :func:`matches_as_of`).
-        ValueError: If the query date or a row date is
+        ValueError: If the as-of-filtered ``matches`` frame contains
+            duplicate ``match_id`` values (the join would fan out and
+            duplicate map rows); or if the query date or a row date is
             null/unparseable/timezone-aware (propagated from
             :func:`matches_as_of` / the parse helpers).
         TypeError: If the query date is list-like (propagated from
             :func:`_parse_query_date` via :func:`matches_as_of`).
     """
     matches = matches_as_of(team_id, date, matches_df)
-    _require_columns(maps_df, (MATCH_ID_COL,), "maps_df")
+    _require_columns(maps_df, _MAPS_REQUIRED, "maps_df")
+
+    if not matches[MATCH_ID_COL].is_unique:
+        duplicates = matches.loc[
+            matches[MATCH_ID_COL].duplicated(keep=False), MATCH_ID_COL
+        ].unique().tolist()
+        raise ValueError(
+            "matches_df contains duplicate match_id value(s) "
+            f"{duplicates} after as-of filtering; the maps join would "
+            "fan out and duplicate map rows"
+        )
+
+    finished_maps = maps_df[maps_df[WINNER_COL].notna()]
 
     is_team1 = (matches[TEAM1_ID_COL] == team_id).to_numpy()
     join_frame = pd.DataFrame(
@@ -379,7 +418,7 @@ def maps_as_of(
             TEAM_ORIENTATION_COL: is_team1,
         }
     )
-    return maps_df.merge(join_frame, on=MATCH_ID_COL, how="inner")
+    return finished_maps.merge(join_frame, on=MATCH_ID_COL, how="inner")
 
 
 def features_as_of(
@@ -419,7 +458,9 @@ def features_as_of(
     Raises:
         KeyError: If either table lacks a required column (propagated
             from :func:`matches_as_of` / :func:`maps_as_of`).
-        ValueError: If the query date or a row date is
+        ValueError: If the as-of-filtered ``matches`` frame contains
+            duplicate ``match_id`` values (propagated from
+            :func:`maps_as_of`); or if the query date or a row date is
             null/unparseable/timezone-aware (propagated from the parse
             helpers).
         TypeError: If the query date is list-like (propagated from
