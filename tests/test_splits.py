@@ -144,6 +144,22 @@ def test_split_matches_unparseable_date_raises():
         splits.split_matches(df)
 
 
+@pytest.mark.parametrize("null_value", [None, float("nan")])
+def test_split_matches_null_date_raises(null_value):
+    # A null date parses to NaT (not a pd.to_datetime error) and must be
+    # rejected explicitly, otherwise NaT sorts to an arbitrary position
+    # and breaks the train<test chronological invariant.
+    df = pd.DataFrame(
+        [
+            {"match_id": "m000", "date": "2026-01-01T00:00:00"},
+            {"match_id": "m001", "date": null_value},
+        ],
+        columns=["match_id", "date"],
+    )
+    with pytest.raises(ValueError, match="null"):
+        splits.split_matches(df)
+
+
 def test_split_matches_empty_raises():
     # A zero-row matches table cannot be split meaningfully; the empty
     # case is M8's problem to flag, so M10 raises instead of writing an
@@ -222,6 +238,17 @@ def test_walk_forward_folds_real_scale_83():
     assert [f[0] for f in folds] == [1, 2, 3, 4, 5]
     assert len(folds[0][1]) == 18
     assert [len(f[2]) for f in folds] == [13, 13, 13, 13, 13]
+
+
+def test_walk_forward_folds_null_date_raises():
+    # The same null-date rejection must apply to the fold generator's
+    # internal sort, so a null-dated match cannot land in the wrong
+    # walk-forward block and leak future data into an earlier fold's
+    # training set (or vice versa).
+    df = _dated_matches(40)
+    df.loc[0, "date"] = None
+    with pytest.raises(ValueError, match="null"):
+        list(splits.walk_forward_folds(df))
 
 
 # --------------------------------------------------------------------------

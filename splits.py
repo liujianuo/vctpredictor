@@ -233,12 +233,25 @@ def _chronological_order(dates: pd.Series, match_ids: pd.Series) -> list[int]:
 
     Raises:
         ValueError: If any date cannot be parsed (propagated from
-            ``pandas.to_datetime`` with its default ``errors="raise"``).
+            ``pandas.to_datetime`` with its default ``errors="raise"``),
+            or if any parsed date is null (``None``/``NaN`` parses to
+            ``NaT`` rather than raising, and ``NaT`` has no
+            chronological position — it compares ``False`` in both
+            directions against real timestamps and would otherwise
+            sort to an arbitrary, order-breaking position).
         TypeError: If ``match_ids`` contains values that are not
             mutually comparable (only possible with a mixed-type
             ``match_id`` column, which M8 never produces).
     """
     parsed = pd.to_datetime(dates)
+    null_positions = [i for i, value in enumerate(parsed) if pd.isna(value)]
+    if null_positions:
+        raise ValueError(
+            f"dates contains {len(null_positions)} null value(s) at row(s) "
+            f"{null_positions}: a null date (None/NaN) parses to NaT and "
+            "has no chronological position, so it cannot be sorted for "
+            "the split"
+        )
     return sorted(
         range(len(dates)),
         key=lambda i: (parsed.iloc[i], match_ids.iloc[i]),
@@ -284,8 +297,11 @@ def split_matches(
     Raises:
         ValueError: If ``test_frac`` is not in ``(0, 1)``; if the table
             is empty; if the resulting ``n_train`` falls below
-            :data:`MIN_TRAIN_MATCHES`; or if a date is unparseable
-            (propagated from ``pandas.to_datetime``).
+            :data:`MIN_TRAIN_MATCHES`; if a date is unparseable
+            (propagated from ``pandas.to_datetime``); or if a date is
+            null (``None``/``NaN``), which parses to ``NaT`` and has
+            no chronological position (raised by
+            :func:`_chronological_order`).
         KeyError: If ``matches_df`` lacks ``date_col`` or ``id_col``.
     """
     if not 0.0 < test_frac < 1.0:
@@ -375,8 +391,11 @@ def walk_forward_folds(
     Raises:
         ValueError: If ``effective_n_folds < 1`` (the input is too
             small to form even one fold — e.g. ``n <= min_fold_block``);
-            or if a date is unparseable (propagated from
-            ``pandas.to_datetime``).
+            if a date is unparseable (propagated from
+            ``pandas.to_datetime``); or if a date is null
+            (``None``/``NaN``), which parses to ``NaT`` and has no
+            chronological position (raised by
+            :func:`_chronological_order`).
         KeyError: If ``train_matches_df`` lacks ``date_col`` or
             ``id_col``.
     """
