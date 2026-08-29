@@ -174,6 +174,41 @@ def test_build_labels_table_empty_input():
     assert list(df.columns) == list(labels.LABELS_COLUMNS)
 
 
+def test_build_labels_table_empty_input_has_schema_dtypes():
+    # Regression for review finding 1: the empty case must carry the
+    # fixed LABELS_DTYPES schema, not the all-object/null columns a
+    # bare ``pd.DataFrame([], columns=...)`` construction produces.
+    # map_index/outcome_ordinal/round_margin stay int64 and the text
+    # columns stay object, so empty and non-empty runs write the same
+    # Parquet schema.
+    empty = pd.DataFrame(
+        columns=["match_id", "map_index", "team1_score", "team2_score"]
+    )
+    df, skipped = labels.build_labels_table(empty)
+    assert skipped == 0
+    assert len(df) == 0
+    for column, dtype in labels.LABELS_DTYPES.items():
+        assert df[column].dtype == dtype
+
+
+def test_build_labels_table_tie_raises():
+    # A tied non-null row is an invariant break: the vectorized
+    # labelling path raises the same ValueError compute_outcome does
+    # (message contains "tie") rather than silently guessing a side.
+    maps_df = pd.DataFrame(
+        [
+            {
+                "match_id": "1",
+                "map_index": 0,
+                "team1_score": 13,
+                "team2_score": 13,
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="tie"):
+        labels.build_labels_table(maps_df)
+
+
 def test_build_labels_table_ordinal_matches_label():
     # OUTCOME_LABELS[ordinal] == label for every produced row: the
     # ordinal-to-string mapping is an invariant for the ordinal model,
@@ -314,4 +349,9 @@ def test_main_against_empty_maps_table(tmp_path, caplog):
     written = pd.read_parquet(version_dir / "labels.parquet")
     assert len(written) == 0
     assert list(written.columns) == list(labels.LABELS_COLUMNS)
+    # Regression for review finding 1: even a zero-row labels.parquet
+    # round-trips with the numeric columns as int64, not null/object.
+    assert str(written["map_index"].dtype) == "int64"
+    assert str(written["outcome_ordinal"].dtype) == "int64"
+    assert str(written["round_margin"].dtype) == "int64"
     assert "labelled 0 maps" in caplog.text

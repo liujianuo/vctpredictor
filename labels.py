@@ -55,6 +55,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,23 @@ LABELS_COLUMNS = (
     "outcome_ordinal",
     "round_margin",
 )
+
+# Fixed target dtypes for the labels table, applied to every row count
+# (including zero) so an empty run writes exactly the same Parquet
+# schema as a non-empty one: numeric columns are int64, the two text
+# columns stay object (pandas' default string container, matching what
+# materialize.py's maps table produces). Without this, an empty
+# DataFrame constructed from ``rows=[]`` would come out all-object/
+# null dtype and round-trip through Parquet with ``map_index: null``
+# instead of ``map_index: int64``, breaking any downstream consumer
+# that assumes one fixed schema across dataset versions.
+LABELS_DTYPES = {
+    "match_id": object,
+    "map_index": "int64",
+    "outcome_label": object,
+    "outcome_ordinal": "int64",
+    "round_margin": "int64",
+}
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -192,7 +210,10 @@ def build_labels_table(maps_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
 
     One row per map in ``maps_df`` whose ``team1_score`` and
     ``team2_score`` are both non-null, in input row order, labelled
-    via :func:`compute_outcome`. Only the ``match_id``, ``map_index``,
+    by a vectorized transcription of :func:`compute_outcome`'s logic
+    (``np.select`` over the two score columns — same OT criterion,
+    winner side, and signed margin, no row-by-row Python loop). Only
+    the ``match_id``, ``map_index``,
     ``team1_score`` and ``team2_score`` columns are read — the
     ``winner`` column (and everything else M8 wrote) is deliberately
     ignored, since the label follows purely from the two scores. A
@@ -204,10 +225,10 @@ def build_labels_table(maps_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     ``team1_score``/``team2_score``/``winner`` is ``None``, so M8's
     ``winner is not None`` finished test does not itself guarantee
     both scores are present). A *tie* is a different, invariant-breaking
-    case and is deliberately *not* caught here — it propagates from
-    :func:`compute_outcome` as a ``ValueError`` rather than being
-    swallowed (the plan's Assumptions section draws exactly this
-    distinction).
+    case and is deliberately *not* caught here — it propagates as a
+    ``ValueError`` (the same contract as :func:`compute_outcome`)
+    rather than being swallowed (the plan's Assumptions section draws
+    exactly this distinction).
 
     Args:
         maps_df: The materialised ``maps`` table (M8's
@@ -221,44 +242,88 @@ def build_labels_table(maps_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
         outcome_label, outcome_ordinal, round_margin``
         (:data:`LABELS_COLUMNS` order) and ``skipped`` is the number
         of input rows excluded because ``team1_score`` or
-        ``team2_score`` was null.
+        ``team2_score`` was null. The dataframe always has the fixed
+        :data:`LABELS_DTYPES` schema regardless of row count — an
+        empty (all-null or zero-row) input yields a zero-row frame
+        with ``map_index``/``outcome_ordinal``/``round_margin`` still
+        ``int64`` and the text columns still object, so empty and
+        non-empty runs write byte-identical Parquet schemas.
 
     Raises:
         ValueError: If a non-null row has ``team1_score ==
-            team2_score`` (propagated from :func:`compute_outcome`; a
-            tie in a "finished" row is a real invariant break and
-            must not be silently skipped).
+            team2_score`` (the vectorized transcription of
+            :func:`compute_outcome`'s tie check; a tie in a
+            "finished" row is a real invariant break and must not be
+            silently skipped).
         KeyError: If ``maps_df`` lacks one of the four required
             columns (``match_id``, ``map_index``, ``team1_score``,
             ``team2_score``).
     """
-    rows = []
-    skipped = 0
-    for _, map_row in maps_df.iterrows():
-        team1_score = map_row["team1_score"]
-        team2_score = map_row["team2_score"]
-        if pd.isna(team1_score) or pd.isna(team2_score):
-            skipped += 1
-            logger.warning(
-                "map (match %s, map_index %s) has a null score (%s-%s); "
-                "skipping it from the labels table",
-                map_row["match_id"],
-                map_row["map_index"],
-                team1_score,
-                team2_score,
-            )
-            continue
-        label, ordinal, margin = compute_outcome(int(team1_score), int(team2_score))
-        rows.append(
-            {
-                "match_id": map_row["match_id"],
-                "map_index": map_row["map_index"],
-                "outcome_label": label,
-                "outcome_ordinal": ordinal,
-                "round_margin": margin,
-            }
+    try:
+        match_ids = maps_df["match_id"]
+        map_indices = maps_df["map_index"]
+        team1_score = maps_df["team1_score"]
+        team2_score = maps_df["team2_score"]
+    except KeyError as exc:
+        # pandas raises KeyError for a missing column; re-raise
+        # unchanged so the missing-name signal is preserved.
+        raise KeyError(str(exc)) from exc
+
+    # Null scores are the expected-absent case: skip and count them.
+    null_scores = team1_score.isna() | team2_score.isna()
+    skipped = int(null_scores.sum())
+    valid = ~null_scores
+    valid_team1 = team1_score[valid]
+    valid_team2 = team2_score[valid]
+
+    for label_index in maps_df.index[null_scores.to_numpy()]:
+        logger.warning(
+            "map (match %s, map_index %s) has a null score (%s-%s); "
+            "skipping it from the labels table",
+            maps_df.at[label_index, "match_id"],
+            maps_df.at[label_index, "map_index"],
+            maps_df.at[label_index, "team1_score"],
+            maps_df.at[label_index, "team2_score"],
         )
-    return pd.DataFrame(rows, columns=LABELS_COLUMNS), skipped
+
+    # A tie among the valid rows is an invariant break: same refusal
+    # contract as compute_outcome, raised on the first tied row.
+    tie = valid_team1 == valid_team2
+    if tie.any():
+        first_tied = tie.to_numpy().argmax()
+        raise ValueError(
+            f"a tied scoreline ({valid_team1.iloc[first_tied]}-"
+            f"{valid_team2.iloc[first_tied]}) has no winner and cannot "
+            "be labelled"
+        )
+
+    # Vectorized transcription of compute_outcome: the OT criterion is
+    # min(scores) >= 12 (the loser reached 12+), the winner is the
+    # higher score, and the margin is team1 minus team2.
+    margin = valid_team1 - valid_team2
+    overtime = (valid_team1 >= 12) & (valid_team2 >= 12)
+    a_wins = valid_team1 > valid_team2
+    label = np.select(
+        [a_wins & overtime, a_wins & ~overtime, ~a_wins & overtime],
+        ["A-OT", "A-regulation", "B-OT"],
+        default="B-regulation",
+    )
+    ordinal = np.select(
+        [a_wins & overtime, a_wins & ~overtime, ~a_wins & overtime],
+        [1, 0, 2],
+        default=3,
+    )
+
+    labels_df = pd.DataFrame(
+        {
+            "match_id": match_ids.to_numpy()[valid.to_numpy()],
+            "map_index": map_indices.to_numpy()[valid.to_numpy()],
+            "outcome_label": label,
+            "outcome_ordinal": ordinal,
+            "round_margin": margin,
+        }
+    )
+    return labels_df.astype(LABELS_DTYPES), skipped
 
 
 def load_maps_table(output_dir: Path, version: str) -> pd.DataFrame:
