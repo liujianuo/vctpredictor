@@ -184,6 +184,33 @@ def test_match_overwrite_updates(tmp_path):
     assert got.url == "https://www.vlr.gg/1/new-url"
 
 
+def test_list_cached_match_ids_empty_db(tmp_path):
+    # A fresh cache has no matches: the bulk id listing returns an
+    # empty list rather than raising.
+    db = tmp_path / "c.sqlite3"
+    assert cache.list_cached_match_ids(db_path=db) == []
+
+
+def test_list_cached_match_ids_returns_all_stored_ids(tmp_path):
+    # After storing two matches, the bulk id listing returns both ids.
+    # Asserted set-wise (content, not order): the docstring promises a
+    # complete set of ids, not a particular sequence.
+    db = tmp_path / "c.sqlite3"
+    cache.set_cached_match(make_match("1001"), db_path=db)
+    cache.set_cached_match(make_match("1002"), db_path=db)
+    assert set(cache.list_cached_match_ids(db_path=db)) == {"1001", "1002"}
+
+
+def test_list_cached_match_ids_after_overwrite_no_duplicate(tmp_path):
+    # Overwriting a match (the same match_id upserted again) must not
+    # duplicate its id in the bulk listing — the matches table keys on
+    # match_id, so a re-store replaces the row in place.
+    db = tmp_path / "c.sqlite3"
+    cache.set_cached_match(make_match("1001"), db_path=db)
+    cache.set_cached_match(make_match("1001"), db_path=db)
+    assert cache.list_cached_match_ids(db_path=db) == ["1001"]
+
+
 def test_is_stale_no_ttl_never_stale():
     assert cache.is_stale(None, None) is False
     assert cache.is_stale(datetime.now(timezone.utc), None) is False

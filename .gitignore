@@ -15,6 +15,9 @@ run-loop.sh
 # local cache (SQLite DB files)
 cache/
 
+# materialised dataset output (Parquet + report.json, a build artifact)
+data/
+
 # python artifacts
 __pycache__/
 *.pyc

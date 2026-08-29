@@ -247,6 +247,49 @@ def set_cached_match(match: Match, db_path: _DB_PATH_T = None) -> None:
         conn.close()
 
 
+def list_cached_match_ids(db_path: _DB_PATH_T = None) -> list[str]:
+    """Return every cached match id currently stored in the matches table.
+
+    This is the bulk-read primitive the per-row accessors deliberately
+    lack: the module's other functions are all single-row or
+    single-URL lookups, but dataset materialisation (roadmap M8) needs
+    to enumerate the whole cache to know *what* is there before
+    deciding what to read. Ids are returned in SQLite's default rowid
+    order, which for a table written exclusively via
+    :func:`set_cached_match` (the only writer in this module) is
+    insertion order — deterministic for a given cache, so re-running
+    materialisation over an unchanged cache visits ids in the same
+    sequence. No ordering guarantee is part of the contract (content
+    is; callers must not depend on a specific order, only on the set
+    of ids being complete).
+
+    The ids are raw strings exactly as stored in the ``match_id``
+    primary-key column — they are *not* parsed/validated here. Each
+    caller is expected to pass them back into
+    :func:`get_cached_match` one at a time, which applies the module's
+    usual corrupt-vs-illegal error split per row; this function only
+    lists, it does not deserialize anything.
+
+    Args:
+        db_path: Path to the SQLite database file, forwarded to
+            :func:`get_connection`. ``None`` uses the default path.
+
+    Returns:
+        A list of every ``match_id`` string in the ``matches`` table
+        (possibly empty).
+
+    Raises:
+        sqlite3.OperationalError: If the database cannot be opened or
+            queried.
+    """
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute("SELECT match_id FROM matches").fetchall()
+    finally:
+        conn.close()
+    return [row[0] for row in rows]
+
+
 def is_stale(timestamp: Optional[Union[datetime, str]], ttl_seconds: Optional[int]) -> bool:
     """Check whether a cached timestamp is older than a TTL.
 
