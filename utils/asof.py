@@ -1,0 +1,469 @@
+"""Point-in-time (as-of) feature access layer (roadmap M12).
+
+The leakage-safety scaffolding that every downstream feature milestone
+(M13-M17: win rate, Elo, closeness/OT, player form, head-to-head) must
+go through instead of reading ``data/<version>/matches.parquet`` or
+``data/<version>/maps.parquet`` directly. It does **not** compute any
+feature value itself — it only answers one question, and answers it
+safely: *which already-completed matches and maps does a given team
+have as of a given cutoff date?*
+
+The whole module is built around a single, non-negotiable contract:
+
+- **Strict ``<`` boundary.** A row whose date is *equal to* the query
+  date is excluded. Only rows strictly before the cutoff are returned.
+  This is the direct reading of roadmap M12's requirement ("no row
+  dated ≥ the match date can enter a feature") and is locked in by
+  ``tests/test_asof.py``'s core leakage-proof test.
+- **Same-day ties need no tie-break.** Because the boundary is strict
+  ``<``, two matches carrying the *identical* timestamp string never
+  see each other, regardless of insertion order. This is the chosen
+  (safe) resolution of the "how are ties on the same date handled"
+  ambiguity, documented here so a later contributor does not add a
+  tie-breaker that reintroduces leakage.
+- **Dates are parsed, not string-sorted.** The ``date`` columns are
+  ISO-8601 strings; they sort correctly as plain strings only while
+  every row shares one exact format/precision (true for v1). Rather
+  than rely on that, dates are parsed with ``pandas.to_datetime``
+  (matching ``drivers/splits.py``'s ``_chronological_order``
+  convention) and a null or unparseable date — in the query or in any
+  row — raises ``ValueError`` instead of silently mis-ordering.
+- **The team key is ``team_id``, not ``team_name``.** ``team_id`` is
+  the stable identifier (a string such as ``"2593"``, matching
+  ``matches.team1_id``/``team2_id``); display names are not guaranteed
+  unique/stable. No name-to-id resolution is attempted here.
+- **Single-team API.** ``features_as_of(team_id, date, ...)`` filters
+  history for *one* team. A pairwise feature (e.g. M17 head-to-head)
+  is expected to call it twice, once per side, rather than the
+  framework growing a second two-team entry point.
+- **Completed rows only.** Only ``status == "completed"`` matches (and
+  their maps) are eligible: a live/upcoming match carries no usable
+  outcome signal for win-rate/Elo/closeness-style features, so the
+  as-of contract filters it out rather than leaving that to each
+  caller. (A completed match's maps are all finished in practice; see
+  the :func:`maps_as_of` docstring for how unfinished maps are treated.)
+- **Unknown team is empty, not an error.** A new/unseen ``team_id``
+  (or a ``team_id`` whose first match is still in the future of the
+  query date) legitimately yields zero history rows. Feature functions
+  must handle the empty case; this layer returns empty DataFrames
+  rather than raising.
+
+Scope of what is wired up today:
+
+- ``matches.parquet`` and ``maps.parquet`` join cleanly on
+  ``match_id`` and are therefore wired through this framework now.
+- ``veto_actions.parquet`` and ``player_map_stats.parquet`` are
+  **deliberately out of scope** pending an id-resolution step: both
+  carry only a team *name* (or, for veto actions, a short abbreviation
+  like ``"FNC"``) rather than a ``team_id``, so there is no direct
+  join key today. Wiring them (M16/M17) requires resolving those names
+  to ids first; this module's API shape does not preclude that, but it
+  also does not silently paper over the gap with a fragile
+  name-matching join.
+- No performance work (per-team history caching/indexing) is done
+  here — correctness and the leakage proof come first; that is a
+  candidate follow-up, not this task's job.
+
+This module lives in ``utils/`` next to ``utils/scoring.py`` and
+``utils/table_io.py`` per the boundary rule: it is a pure in-memory
+filter over already-materialised DataFrames, with no CLI, no
+``argparse`` entry point, and (except for :func:`load_asof_tables`)
+no file I/O of its own.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from utils.table_io import DEFAULT_OUTPUT_DIR
+
+# Column-name constants for the M8 matches/maps tables this module
+# reads. Kept as module-level names so the functions, the docstrings,
+# and the tests all reference one spelling.
+DATE_COL = "date"
+MATCH_ID_COL = "match_id"
+TEAM1_ID_COL = "team1_id"
+TEAM2_ID_COL = "team2_id"
+STATUS_COL = "status"
+COMPLETED_STATUS = "completed"
+
+# The added orientation column on :func:`maps_as_of`'s output: True
+# when the queried team is the match's ``team1`` (so its score is
+# ``team1_score``), False when it is ``team2`` (its score is
+# ``team2_score``).
+TEAM_ORIENTATION_COL = "team_is_team1"
+
+# The columns :func:`matches_as_of` needs on the matches table.
+_MATCHES_REQUIRED = (TEAM1_ID_COL, TEAM2_ID_COL, DATE_COL, STATUS_COL)
+
+
+@dataclass(eq=False)
+class AsOfBundle:
+    """Structured result returned by :func:`features_as_of`.
+
+    A small, explicit container (rather than a bare ``dict`` or a raw
+    tuple) so downstream feature functions have named attribute access
+    to the two filtered tables. ``eq=False`` is deliberate: the two
+    fields are DataFrames, whose ``==`` produces an element-wise
+    DataFrame rather than a single ``bool``, so a generated ``__eq__``
+    would raise on any bundle comparison.
+
+    Attributes:
+        team_id: The queried team id (echoed unchanged from the call,
+            for convenience/traceability).
+        date: The queried as-of cutoff, exactly as passed in (the
+            original string, not the parsed timestamp).
+        matches: The completed, strictly-earlier matches the team
+            played in (see :func:`matches_as_of` for the exact filter
+            and shape).
+        maps: The completed, strictly-earlier maps belonging to those
+            matches, with an added ``team_is_team1`` orientation flag
+            and the match's ``date`` carried over (see
+            :func:`maps_as_of` for the exact shape).
+    """
+
+    team_id: str
+    date: str
+    matches: pd.DataFrame
+    maps: pd.DataFrame
+
+
+def _require_columns(df: pd.DataFrame, columns: tuple[str, ...], table: str) -> None:
+    """Raise ``KeyError`` if a table is missing required columns.
+
+    The single shared missing-column check used by the as-of functions,
+    so every entry point reports a missing M8 column the same way
+    (matching the existing ``drivers/*`` convention of surfacing the
+    missing name rather than a generic pandas error).
+
+    Args:
+        df: The table to check.
+        columns: The column names that must all be present.
+        table: A human-readable table name for the error message
+            (e.g. ``"matches_df"``).
+
+    Returns:
+        None.
+
+    Raises:
+        KeyError: If any name in ``columns`` is absent from ``df``;
+            the message lists every missing name.
+    """
+    missing = [col for col in columns if col not in df.columns]
+    if missing:
+        raise KeyError(f"{table} is missing required column(s): {missing}")
+
+
+def _parse_query_date(date: str) -> pd.Timestamp:
+    """Parse and validate a single as-of cutoff date.
+
+    Turns the caller's cutoff into a single ``pandas.Timestamp`` that
+    can be compared against the parsed table date column. The parse is
+    done with ``pandas.to_datetime`` (the convention shared with
+    ``drivers.splits``) rather than left as a string, and the result is
+    validated to be exactly one real (non-null, timezone-naive)
+    timestamp, so a null or list-like cutoff fails loudly instead of
+    silently producing an empty or mis-ordered result.
+
+    Args:
+        date: The as-of cutoff. Must be a single ISO-8601 date string
+            (or anything ``pandas.to_datetime`` accepts for a scalar),
+            e.g. ``"2026-04-01T11:00:00"``. List-like inputs are
+            rejected.
+
+    Returns:
+        The cutoff as a single ``pandas.Timestamp``.
+
+    Raises:
+        ValueError: If ``date`` cannot be parsed by
+            ``pandas.to_datetime``; if it is null (``None``/``NaN``,
+            which parse to ``None``/``NaT`` and have no chronological
+            position); or if it parses to a timezone-aware timestamp
+            (the v1 date column is timezone-naive, so a tz-aware
+            cutoff cannot be compared against it).
+        TypeError: If ``date`` is list-like rather than a single
+            scalar timestamp.
+    """
+    try:
+        parsed = pd.to_datetime(date)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise ValueError(
+            f"query date {date!r} is not a parseable timestamp: {exc}"
+        ) from exc
+    if parsed is None or pd.isna(parsed) is True:
+        raise ValueError(
+            f"query date {date!r} is null (None/NaN -> NaT) and has no "
+            "chronological position, so it cannot be an as-of cutoff"
+        )
+    if not isinstance(parsed, pd.Timestamp):
+        raise TypeError(
+            f"query date {date!r} must be a single timestamp, got a "
+            f"{type(parsed).__name__}"
+        )
+    if parsed.tzinfo is not None:
+        raise ValueError(
+            f"query date {date!r} is timezone-aware; the v1 date column "
+            "is timezone-naive, so pass a naive timestamp"
+        )
+    return parsed
+
+
+def _parse_date_column(dates: pd.Series) -> pd.Series:
+    """Parse and null-check a table's date column for as-of filtering.
+
+    Parses the raw (ISO-8601 string) date column with
+    ``pandas.to_datetime`` and rejects any null value, mirroring the
+    null-date guard already established in ``drivers.splits``: a null
+    date parses to ``NaT`` rather than raising, and ``NaT`` has no
+    chronological position, so it must not silently pass (or fail) an
+    as-of comparison.
+
+    Args:
+        dates: The raw date column (typically the ``"date"`` column of
+            M8's matches table).
+
+    Returns:
+        The parsed column as a ``pandas.Series`` of ``datetime64[ns]``
+        values, aligned to the input index.
+
+    Raises:
+        ValueError: If any value cannot be parsed (propagated from
+            ``pandas.to_datetime`` with its default
+            ``errors="raise"``), or if any parsed value is null
+            (``None``/``NaN`` -> ``NaT``).
+    """
+    try:
+        parsed = pd.to_datetime(dates)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise ValueError(f"date column contains an unparseable value: {exc}") from exc
+    null_mask = parsed.isna()
+    if null_mask.any():
+        positions = [int(i) for i in np.flatnonzero(null_mask.to_numpy())]
+        raise ValueError(
+            f"date column contains {len(positions)} null value(s) at row(s) "
+            f"{positions}: a null date (None/NaN) parses to NaT and has no "
+            "chronological position, so it cannot be as-of filtered"
+        )
+    return parsed
+
+
+def matches_as_of(team_id: str, date: str, matches_df: pd.DataFrame) -> pd.DataFrame:
+    """Return the team's completed matches strictly before a cutoff date.
+
+    The match-level half of the as-of access layer. It applies three
+    filters, in this order of intent: the team must be one of the two
+    sides (``team1_id`` or ``team2_id``), the match must be completed
+    (``status == "completed"``), and the match date must be strictly
+    less than the query date. All three are boolean masks, so the
+    original row order and index are preserved and the output is a
+    faithful *subset* of ``matches_df`` — no columns are added, removed,
+    or reordered.
+
+    Args:
+        team_id: The queried team's stable id, as a string matching the
+            dtype of ``team1_id``/``team2_id`` (M8 stores both as
+            object/string). No type coercion is performed: a ``team_id``
+            whose type does not match the stored ids simply matches
+            nothing and yields an empty result.
+        date: The as-of cutoff (see :func:`_parse_query_date`). Rows
+            dated equal to or after this are excluded (strict ``<``).
+        matches_df: The materialised ``matches`` table (M8's
+            ``matches.parquet``). Only ``team1_id``, ``team2_id``,
+            ``date`` and ``status`` are read; every other column is
+            carried through untouched.
+
+    Returns:
+        A ``pandas.DataFrame`` with the same columns and (original)
+        index as ``matches_df``, containing exactly the rows where the
+        team appears on either side, the match is completed, and the
+        parsed match date is strictly before the parsed query date. An
+        unseen team, a team with no prior completed matches, or an
+        empty-but-well-formed input table yields a zero-row frame with
+        the full original column set — an empty result is a normal,
+        non-error outcome.
+
+    Raises:
+        KeyError: If ``matches_df`` lacks any of ``team1_id``,
+            ``team2_id``, ``date`` or ``status``.
+        ValueError: If the query date is null/unparseable/timezone-aware
+            (see :func:`_parse_query_date`), or if any row date is
+            null/unparseable (see :func:`_parse_date_column`).
+        TypeError: If the query date is list-like rather than a single
+            scalar (see :func:`_parse_query_date`).
+    """
+    _require_columns(matches_df, _MATCHES_REQUIRED, "matches_df")
+
+    parsed_dates = _parse_date_column(matches_df[DATE_COL])
+    query = _parse_query_date(date)
+
+    team1 = matches_df[TEAM1_ID_COL]
+    team2 = matches_df[TEAM2_ID_COL]
+    is_team = (team1 == team_id) | (team2 == team_id)
+    is_completed = matches_df[STATUS_COL] == COMPLETED_STATUS
+    is_before = parsed_dates < query
+
+    return matches_df[is_team & is_completed & is_before]
+
+
+def maps_as_of(
+    team_id: str,
+    date: str,
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Return the team's completed maps (with dates + orientation) before a cutoff.
+
+    The map-level half of the as-of access layer. A map has no date or
+    team identity of its own in M8's schema — both only exist via a
+    join back to ``matches`` on ``match_id`` — so this function first
+    runs the match-level filter (:func:`matches_as_of`) and then inner-
+    joins ``maps_df`` against those matches. The inner join is what
+    applies every filter to the maps in one step: a map whose match is
+    the wrong team, not completed, or not strictly before the cutoff
+    is absent from the join keys and therefore dropped.
+
+    Two columns are added to each surviving map row:
+
+    - ``date`` — the match's original (unparsed) date string, carried
+      over from ``matches_df`` so a feature function can see *when* the
+      map happened without re-joining;
+    - ``team_is_team1`` (see :data:`TEAM_ORIENTATION_COL`) — a boolean
+      orientation flag: ``True`` means the queried team is that match's
+      ``team1`` and its score is ``team1_score``; ``False`` means it is
+      ``team2`` and its score is ``team2_score``. This lets a caller
+      tell which score belongs to the queried team without re-deriving
+      it from the team-id columns.
+
+    Args:
+        team_id: The queried team's stable id (see
+            :func:`matches_as_of`).
+        date: The as-of cutoff (see :func:`_parse_query_date`).
+        matches_df: The materialised ``matches`` table; read by
+            :func:`matches_as_of` and used as the join source for
+            ``date``/orientation.
+        maps_df: The materialised ``maps`` table (M8's
+            ``maps.parquet``). Every column is carried through; only
+            ``match_id`` is used as the join key.
+
+    Returns:
+        A ``pandas.DataFrame`` with all of ``maps_df``'s columns (in
+        their original order) followed by ``date`` and then
+        ``team_is_team1``, containing exactly the rows whose match
+        passes the match-level filter. A zero-row result (unseen team,
+        no prior completed maps, or an empty join) carries the full
+        ``maps`` + ``date`` + ``team_is_team1`` column set with
+        ``team_is_team1`` still boolean.
+
+    Raises:
+        KeyError: If ``maps_df`` lacks ``match_id``, or if
+            ``matches_df`` lacks a required column (propagated from
+            :func:`matches_as_of`).
+        ValueError: If the query date or a row date is
+            null/unparseable/timezone-aware (propagated from
+            :func:`matches_as_of` / the parse helpers).
+        TypeError: If the query date is list-like (propagated from
+            :func:`_parse_query_date` via :func:`matches_as_of`).
+    """
+    matches = matches_as_of(team_id, date, matches_df)
+    _require_columns(maps_df, (MATCH_ID_COL,), "maps_df")
+
+    is_team1 = (matches[TEAM1_ID_COL] == team_id).to_numpy()
+    join_frame = pd.DataFrame(
+        {
+            MATCH_ID_COL: matches[MATCH_ID_COL].to_numpy(),
+            DATE_COL: matches[DATE_COL].to_numpy(),
+            TEAM_ORIENTATION_COL: is_team1,
+        }
+    )
+    return maps_df.merge(join_frame, on=MATCH_ID_COL, how="inner")
+
+
+def features_as_of(
+    team_id: str,
+    date: str,
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+) -> AsOfBundle:
+    """Return the as-of bundle a feature function should consume.
+
+    The single public entry point roadmap M12 asks for: it filters both
+    tables as of ``(team_id, date)`` and returns them together in an
+    :class:`AsOfBundle`. Downstream feature functions (M13+) are
+    expected to call this (or the two individual filters) and read the
+    resulting rows instead of touching ``matches.parquet``/
+    ``maps.parquet`` directly — that indirection is the whole point of
+    the leakage-safety layer, because it guarantees the strict-``<``
+    boundary is applied in exactly one place.
+
+    Args:
+        team_id: The queried team's stable id (see
+            :func:`matches_as_of`).
+        date: The as-of cutoff (see :func:`_parse_query_date`).
+        matches_df: The materialised ``matches`` table.
+        maps_df: The materialised ``maps`` table.
+
+    Returns:
+        An :class:`AsOfBundle` whose ``matches`` field is the
+        :func:`matches_as_of` result and whose ``maps`` field is the
+        :func:`maps_as_of` result (the two filters are computed
+        independently, so the match-level filter runs twice — once for
+        the bundle and once inside ``maps_as_of``; that minor
+        redundancy is deliberate, since correctness-first is the
+        priority this task and per-team caching is an explicit
+        follow-up).
+
+    Raises:
+        KeyError: If either table lacks a required column (propagated
+            from :func:`matches_as_of` / :func:`maps_as_of`).
+        ValueError: If the query date or a row date is
+            null/unparseable/timezone-aware (propagated from the parse
+            helpers).
+        TypeError: If the query date is list-like (propagated from
+            :func:`_parse_query_date`).
+    """
+    matches = matches_as_of(team_id, date, matches_df)
+    maps = maps_as_of(team_id, date, matches_df, maps_df)
+    return AsOfBundle(team_id=team_id, date=date, matches=matches, maps=maps)
+
+
+def load_asof_tables(
+    version: str,
+    output_dir: Path | str = DEFAULT_OUTPUT_DIR,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load the materialised matches and maps tables for a version.
+
+    A thin disk-I/O convenience wrapper so callers who do not already
+    hold the DataFrames in memory can still get started with one call.
+    It reads ``<output_dir>/<version>/matches.parquet`` and
+    ``<output_dir>/<version>/maps.parquet`` via ``pandas.read_parquet``
+    (the same convention as ``drivers.splits.load_matches_table`` /
+    ``drivers.labels.load_maps_table``) and hands both to the pure
+    functions above — it does not re-implement any filtering logic.
+
+    Args:
+        version: The dataset version subdirectory name (e.g. ``"v1"``).
+        output_dir: The parent directory the version subdirectory
+            lives under (default :data:`utils.table_io.DEFAULT_OUTPUT_DIR`,
+            i.e. ``Path("data")``).
+
+    Returns:
+        A ``(matches_df, maps_df)`` tuple of the two loaded DataFrames,
+        in that order.
+
+    Raises:
+        FileNotFoundError: If either Parquet file does not exist for
+            this version (i.e. ``materialize.py`` has not been run for
+            it) — propagated as-is from ``pandas.read_parquet`` as a
+            clear "run materialize.py first" signal rather than
+            wrapped.
+        OSError: On any other file-access failure (permissions, etc.),
+            also propagated as-is.
+    """
+    version_dir = Path(output_dir) / version
+    matches_df = pd.read_parquet(version_dir / "matches.parquet")
+    maps_df = pd.read_parquet(version_dir / "maps.parquet")
+    return matches_df, maps_df
