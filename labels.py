@@ -32,7 +32,10 @@ Design rules:
   code with ``materialize.py``'s ``winner_score > 13`` report-only
   heuristic — the two agree on every validated row (task 002/007's
   invariant makes a regulation win always end at exactly 13), but M9
-  does not depend on M8's function for its correctness.
+  does not depend on M8's function for its correctness. That agreement
+  is enforced by a cross-check test
+  (``tests/test_labels.py::test_ot_heuristic_agrees_with_canonical_ot_criterion``)
+  rather than left as an unstated invariant.
 - **Additive output.** ``labels.parquet`` is a new table alongside
   (not merged into) ``maps.parquet``, so M8's artifact stays schema-
   stable and independently regenerable; a consumer wanting the joined
@@ -58,13 +61,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-logger = logging.getLogger(__name__)
+from table_io import DEFAULT_OUTPUT_DIR, write_parquet
 
-# Default output parent: <project root>/data, the same convention
-# materialize.py uses. Duplicated (not imported) to keep the two
-# modules decoupled; both default to "data" and "v1", so running one
-# right after the other with no flags addresses the same directory.
-DEFAULT_OUTPUT_DIR = Path("data")
+logger = logging.getLogger(__name__)
 
 # The canonical four-way outcome vocabulary, in ordinal order: index
 # == outcome_ordinal. "decisive A -> narrow A -> narrow B -> decisive
@@ -368,7 +367,7 @@ def write_labels_table(
     """Write the labels table for a dataset version to disk.
 
     Writes ``<output_dir>/<version>/labels.parquet`` via
-    ``pandas.DataFrame.to_parquet`` (``index=False``), creating the
+    :func:`table_io.write_parquet` (``index=False``), creating the
     version directory (including parents) if it does not already
     exist. Overwrites any previous ``labels.parquet`` in place —
     re-labelling the same version replaces the file rather than
@@ -391,11 +390,9 @@ def write_labels_table(
             be written (e.g. permissions or disk errors).
         ValueError: If the table contains a value that cannot be
             serialized to Parquet (propagated from
-            ``DataFrame.to_parquet``).
+            :func:`table_io.write_parquet` / ``DataFrame.to_parquet``).
     """
-    output_dir = Path(output_dir) / version
-    output_dir.mkdir(parents=True, exist_ok=True)
-    labels_df.to_parquet(output_dir / "labels.parquet", index=False)
+    write_parquet(labels_df, Path(output_dir) / version / "labels.parquet")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

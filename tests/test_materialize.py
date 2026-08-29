@@ -354,6 +354,22 @@ def test_build_maps_table_half_split_columns_carried_through():
     assert pd.isna(df.iloc[0]["team2_def_rounds"])
 
 
+def test_is_finished_map_predicate():
+    # The shared finished-map predicate (review finding: build_maps_table
+    # used to inline ``winner is None`` instead of sharing the
+    # definition with build_player_map_stats_table). winner set ->
+    # finished; winner None -> not finished, so both tables funnel
+    # through one definition that cannot drift.
+    finished = MapResult(
+        map_name="Ascent", team1_score=13, team2_score=11, winner="Alpha"
+    )
+    unfinished = MapResult(
+        map_name="Ascent", team1_score=None, team2_score=None, winner=None
+    )
+    assert materialize._is_finished_map(finished) is True
+    assert materialize._is_finished_map(unfinished) is False
+
+
 # --------------------------------------------------------------------------
 # build_veto_actions_table
 # --------------------------------------------------------------------------
@@ -482,6 +498,42 @@ def test_build_sanity_report_zero_maps_ot_rate_none():
     assert report["ot_rate"] is None
     assert report["format_mix"] == {}
     assert report["row_counts"]["matches"] == 0
+
+
+def test_build_sanity_report_null_score_map_excluded_from_ot_rate(caplog):
+    # A finished map with a winner but a null score (which bypasses
+    # MapResult.__post_init__'s validation) must be warned about and
+    # excluded from the OT denominator, not silently deflate ot_rate
+    # while still counting toward map_count.
+    tables = {
+        "matches": pd.DataFrame([{"best_of": "Bo3"}], columns=["best_of"]),
+        "maps": pd.DataFrame(
+            [
+                {"team1_score": 16, "team2_score": 14},
+                {"team1_score": None, "team2_score": 11},
+            ],
+            columns=["team1_score", "team2_score"],
+        ),
+        "veto_actions": pd.DataFrame(columns=materialize.VETO_ACTIONS_COLUMNS),
+        "player_map_stats": pd.DataFrame(
+            columns=materialize.PLAYER_MAP_STATS_COLUMNS
+        ),
+    }
+    with caplog.at_level(logging.WARNING):
+        report = materialize.build_sanity_report(
+            tables,
+            {
+                "total_cached": 1,
+                "matches_skipped_invalid": 0,
+                "matches_skipped_not_completed": 0,
+            },
+            maps_skipped_incomplete=0,
+        )
+    assert report["map_count"] == 2
+    assert report["maps_skipped_null_score"] == 1
+    # Only the (16, 14) map is classifiable; it is OT, so 1/1.
+    assert report["ot_rate"] == pytest.approx(1.0)
+    assert "null" in caplog.text
 
 
 # --------------------------------------------------------------------------

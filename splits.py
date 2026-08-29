@@ -70,15 +70,12 @@ import sys
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
-logger = logging.getLogger(__name__)
+from table_io import DEFAULT_OUTPUT_DIR, write_parquet
 
-# Default output parent: <project root>/data, the same convention
-# materialize.py and labels.py use. Duplicated (not imported) to keep
-# the root modules decoupled; all three default to "data" and "v1", so
-# running them back to back with no flags addresses the same directory.
-DEFAULT_OUTPUT_DIR = Path("data")
+logger = logging.getLogger(__name__)
 
 # The only two split values. The deliberate absence of a third static
 # "calibration" value is a design decision (see module docstring):
@@ -244,18 +241,27 @@ def _chronological_order(dates: pd.Series, match_ids: pd.Series) -> list[int]:
             ``match_id`` column, which M8 never produces).
     """
     parsed = pd.to_datetime(dates)
-    null_positions = [i for i, value in enumerate(parsed) if pd.isna(value)]
-    if null_positions:
+    null_mask = parsed.isna()
+    if null_mask.any():
+        null_positions = list(np.flatnonzero(null_mask.to_numpy()))
         raise ValueError(
             f"dates contains {len(null_positions)} null value(s) at row(s) "
             f"{null_positions}: a null date (None/NaN) parses to NaT and "
             "has no chronological position, so it cannot be sorted for "
             "the split"
         )
-    return sorted(
-        range(len(dates)),
-        key=lambda i: (parsed.iloc[i], match_ids.iloc[i]),
+    # Vectorized two-key sort: build a frame of positional values
+    # (parsed date, match_id), sort it, and read the resulting
+    # positional order. This replaces the per-comparison Python
+    # ``sorted()`` lambda (two ``Series.iloc`` lookups per comparison)
+    # with one pandas/numpy sort over the whole column.
+    sort_keys = pd.DataFrame(
+        {"date": parsed.to_numpy(), "match_id": match_ids.to_numpy()}
     )
+    order = sort_keys.sort_values(
+        ["date", "match_id"], kind="stable"
+    ).index.to_numpy()
+    return [int(i) for i in order]
 
 
 def split_matches(
@@ -496,9 +502,14 @@ def assemble_out_of_fold_predictions(
             submitted more than once; if ``fold_predictions`` omits one
             of the required fold ids; or if a fold's predicted id set
             does not exactly equal its recomputed ``val_match_ids``
-            (extra = leak, missing = incomplete). Also propagates
-            :func:`walk_forward_folds`'s ``ValueError`` (e.g. training
-            region too small) and ``pandas.to_datetime`` errors.
+            (extra = leak, missing = incomplete). The first three of
+            these (and the set-mismatch case) are the only symptoms a
+            wrong ``n_folds``/``min_fold_block`` produces, so their
+            messages explicitly point at that likely cause instead of
+            leaving the caller to decode a bare id-set error. Also
+            propagates :func:`walk_forward_folds`'s ``ValueError``
+            (e.g. training region too small) and ``pandas.to_datetime``
+            errors.
         KeyError: If a ``predictions_df`` lacks ``id_col`` (or if
             ``train_matches_df`` lacks ``date_col``/``id_col``,
             propagated from :func:`walk_forward_folds`).
@@ -527,13 +538,20 @@ def assemble_out_of_fold_predictions(
         if fold_id not in required_fold_ids:
             raise ValueError(
                 f"fold_id {fold_id} is not one of the recomputed fold "
-                f"ids {required_fold_ids}"
+                f"ids {required_fold_ids} (recomputed with n_folds="
+                f"{n_folds}, min_fold_block={min_fold_block}); this "
+                f"usually means the caller produced fold_predictions "
+                f"with a different fold configuration"
             )
 
     missing = set(required_fold_ids) - set(submitted_fold_ids)
     if missing:
         raise ValueError(
-            f"fold_predictions is missing required fold_ids {sorted(missing)}"
+            f"fold_predictions is missing required fold_ids "
+            f"{sorted(missing)} (recomputed with n_folds={n_folds}, "
+            f"min_fold_block={min_fold_block}); this usually means the "
+            f"caller produced fold_predictions with a different fold "
+            f"configuration"
         )
 
     by_fold = {fold_id: predictions_df for fold_id, predictions_df in fold_predictions}
@@ -552,7 +570,10 @@ def assemble_out_of_fold_predictions(
             raise ValueError(
                 f"fold {fold_id}: predicted match-id set does not match its "
                 f"recomputed validation set "
-                f"(extra={extra or None}, missing={missing_ids or None})"
+                f"(extra={extra or None}, missing={missing_ids or None}); "
+                f"this is either a real leak/incomplete submission or the "
+                f"caller's n_folds/min_fold_block differ from the values "
+                f"used to produce the predictions"
             )
         sub = predictions_df.drop(columns=["fold_id"], errors="ignore").copy()
         sub.insert(0, "fold_id", fold_id)
@@ -624,7 +645,7 @@ def write_splits_table(
     """Write the splits table for a dataset version to disk.
 
     Writes ``<output_dir>/<version>/splits.parquet`` via
-    ``pandas.DataFrame.to_parquet`` (``index=False``), creating the
+    :func:`table_io.write_parquet` (``index=False``), creating the
     version directory (including parents) if it does not already
     exist. Overwrites any previous ``splits.parquet`` in place —
     re-splitting the same version replaces the file rather than
@@ -647,11 +668,9 @@ def write_splits_table(
             be written (e.g. permissions or disk errors).
         ValueError: If the table contains a value that cannot be
             serialized to Parquet (propagated from
-            ``DataFrame.to_parquet``).
+            :func:`table_io.write_parquet` / ``DataFrame.to_parquet``).
     """
-    output_dir = Path(output_dir) / version
-    output_dir.mkdir(parents=True, exist_ok=True)
-    splits_df.to_parquet(output_dir / "splits.parquet", index=False)
+    write_parquet(splits_df, Path(output_dir) / version / "splits.parquet")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

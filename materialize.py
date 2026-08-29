@@ -70,12 +70,9 @@ import pandas as pd
 
 from scraper import cache
 from scraper.models import IllegalScoreError, MapResult, Match
+from table_io import DEFAULT_OUTPUT_DIR, write_parquet
 
 logger = logging.getLogger(__name__)
-
-# Default output parent: <project root>/data (parallel to cache/; both
-# are gitignored build artifacts, see .gitignore).
-DEFAULT_OUTPUT_DIR = Path("data")
 
 # Fixed column order for each table, used both to build non-empty
 # DataFrames in a deterministic order and to give empty runs a
@@ -258,20 +255,43 @@ def load_completed_matches(
     return completed, counts
 
 
+def _is_finished_map(map_result: MapResult) -> bool:
+    """Return whether a map result is finished (materialisable).
+
+    The single definition of "finished" shared by
+    :func:`_iter_finished_maps` and :func:`build_maps_table` so the two
+    cannot drift apart on what counts as a materialisable map: a map is
+    finished exactly when its ``winner`` is set — the same finished
+    signal :meth:`MapResult.__post_init__` gates its validation on, and
+    the one invariant that always holds for a completed match's maps in
+    practice. Any future refinement to the finished-map definition is
+    made here once and flows to both tables.
+
+    Args:
+        map_result: The :class:`MapResult` to test.
+
+    Returns:
+        ``True`` if ``map_result.winner`` is not ``None``, ``False``
+        otherwise.
+
+    Raises:
+        Nothing.
+    """
+    return map_result.winner is not None
+
+
 def _iter_finished_maps(match: Match) -> Iterator[tuple[int, MapResult]]:
     """Yield ``(map_index, MapResult)`` pairs for a match's finished maps.
 
-    Shared by :func:`build_maps_table` and
-    :func:`build_player_map_stats_table` so the two tables cannot drift
-    apart on what counts as a materialisable map: a map is included
-    only when its ``winner`` is set — the same finished signal
-    :meth:`MapResult.__post_init__` gates its validation on, and the
-    one invariant that always holds for a completed match's maps in
-    practice. A map skipped here is skipped by the player-stats table
-    too, so a player row is never orphaned against a map that does not
-    exist in the ``maps`` table; the skip is counted and logged by
-    :func:`build_maps_table` (the layer that defines what "finished"
-    means), which is the one warning the two tables share.
+    Iterates a match's maps using :func:`_is_finished_map` — the single
+    shared finished-map definition also used by
+    :func:`build_maps_table` — so the two tables cannot drift apart on
+    what counts as a materialisable map. A map skipped here is skipped
+    by the player-stats table too, so a player row is never orphaned
+    against a map that does not exist in the ``maps`` table; the skip is
+    counted and logged by :func:`build_maps_table` (the layer that
+    defines what "finished" means), which is the one warning the two
+    tables share.
 
     Args:
         match: The :class:`Match` whose maps to iterate.
@@ -285,7 +305,7 @@ def _iter_finished_maps(match: Match) -> Iterator[tuple[int, MapResult]]:
         Nothing.
     """
     for map_index, map_result in enumerate(match.maps):
-        if map_result.winner is None:
+        if not _is_finished_map(map_result):
             continue
         yield map_index, map_result
 
@@ -374,7 +394,7 @@ def build_maps_table(matches: list[Match]) -> tuple[pd.DataFrame, int]:
     maps_skipped_incomplete = 0
     for match in matches:
         for map_index, map_result in enumerate(match.maps):
-            if map_result.winner is None:
+            if not _is_finished_map(map_result):
                 maps_skipped_incomplete += 1
                 logger.warning(
                     "match %s map %d (%s) has no winner; skipping the "
@@ -507,17 +527,27 @@ def build_sanity_report(
 ) -> dict:
     """Build the JSON-serializable sanity report for a materialisation.
 
-    Pure function (no I/O): computes the report's numbers from the
+    Pure function (no disk I/O): computes the report's numbers from the
     four built tables and the loader's skip counters so it can be unit
-    tested without touching disk. The OT rate is deliberately an ad
+    tested without touching disk. It may emit a ``logger.warning`` when
+    a null-score map is excluded from the OT rate; that does not affect
+    the returned dict. The OT rate is deliberately an ad
     hoc *report-only* heuristic, not a persisted column and not M9's
     formal outcome label: a finished map counts as OT when its winning
     score exceeds 13 rounds (``max(team1_score, team2_score) > 13``),
     which the task 002/007 score-validity invariant makes exact — a
     regulation win is always exactly 13, so ``> 13`` is precisely "went
-    to overtime" for every row that reached the ``maps`` table. The
-    heuristic is written to ``report.json`` only; nothing in the
-    ``maps`` table encodes it.
+    to overtime" for every row that reached the ``maps`` table. This
+    heuristic is deliberately independent of ``labels.py``'s canonical
+    OT criterion (``min(scores) >= 12``); the two agree on every legal
+    scoreline, and that agreement is enforced by
+    ``tests/test_labels.py::test_ot_heuristic_agrees_with_canonical_ot_criterion``
+    rather than left as an unstated external invariant. A finished map
+    with a winner but a null score (which can only bypass
+    ``MapResult.__post_init__``'s validation, e.g. a hand-edited cache
+    row) is warned about and excluded from the OT denominator, so it
+    cannot silently deflate the rate. The heuristic is written to
+    ``report.json`` only; nothing in the ``maps`` table encodes it.
 
     Note on the signature: the plan sketched this function as taking
     ``(matches_df, maps_df, ...)``, but its contract is per-table row
@@ -542,8 +572,11 @@ def build_sanity_report(
         row counts), ``total_cached``, ``matches_skipped_invalid``,
         ``matches_skipped_not_completed``, ``maps_skipped_incomplete``,
         ``map_count`` (row count of the ``maps`` table),
-        ``ot_rate`` (a fraction in ``[0, 1]`` — ``0.083`` means 8.3% —
-        or ``None`` when ``map_count == 0``) and ``format_mix`` (dict
+        ``maps_skipped_null_score`` (the number of finished maps
+        excluded from ``ot_rate`` because ``team1_score`` or
+        ``team2_score`` was null), ``ot_rate`` (a fraction in
+        ``[0, 1]`` — ``0.083`` means 8.3% — or ``None`` when there is
+        no classifiable map) and ``format_mix`` (dict
         mapping each ``best_of`` value to its match count, with the
         key ``"unknown"`` for matches whose ``best_of`` is ``None``).
 
@@ -554,11 +587,30 @@ def build_sanity_report(
     """
     row_counts = {name: len(df) for name, df in tables.items()}
     map_count = row_counts["maps"]
+    maps_df = tables["maps"]
     if map_count == 0:
         ot_rate = None
+        maps_skipped_null_score = 0
     else:
-        winner_scores = tables["maps"][["team1_score", "team2_score"]].max(axis=1)
-        ot_rate = float(int((winner_scores > 13).sum()) / map_count)
+        team1_score = maps_df["team1_score"]
+        team2_score = maps_df["team2_score"]
+        null_score = team1_score.isna() | team2_score.isna()
+        maps_skipped_null_score = int(null_score.sum())
+        if maps_skipped_null_score:
+            logger.warning(
+                "%d finished map(s) have a null team1_score/team2_score "
+                "and are excluded from the OT rate; this bypasses "
+                "MapResult.__post_init__'s validation and should not "
+                "happen via the scraper path",
+                maps_skipped_null_score,
+            )
+        ot_denominator = map_count - maps_skipped_null_score
+        if ot_denominator == 0:
+            ot_rate = None
+        else:
+            winner_scores = maps_df[["team1_score", "team2_score"]].max(axis=1)
+            ot_count = int((winner_scores[~null_score] > 13).sum())
+            ot_rate = ot_count / ot_denominator
     format_mix: dict[str, int] = {}
     for value in tables["matches"]["best_of"]:
         key = "unknown" if pd.isna(value) else str(value)
@@ -572,6 +624,7 @@ def build_sanity_report(
         ],
         "maps_skipped_incomplete": maps_skipped_incomplete,
         "map_count": map_count,
+        "maps_skipped_null_score": maps_skipped_null_score,
         "ot_rate": ot_rate,
         "format_mix": format_mix,
     }
@@ -586,7 +639,7 @@ def write_dataset(
 
     Creates ``output_dir`` (including parents) if it does not exist,
     writes each of the four tables as ``<name>.parquet`` via
-    ``pandas.DataFrame.to_parquet`` (``index=False`` — the tables carry
+    :func:`table_io.write_parquet` (``index=False`` — the tables carry
     no meaningful row index, only their columns) in the fixed order
     ``matches, maps, veto_actions, player_map_stats``, and writes
     ``report.json`` (``json.dumps`` with indent and sorted keys) into
@@ -616,7 +669,7 @@ def write_dataset(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     for name in ("matches", "maps", "veto_actions", "player_map_stats"):
-        tables[name].to_parquet(output_dir / f"{name}.parquet", index=False)
+        write_parquet(tables[name], output_dir / f"{name}.parquet")
     (output_dir / "report.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

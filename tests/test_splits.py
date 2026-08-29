@@ -401,6 +401,19 @@ def test_assemble_invalid_fold_id_raises():
         splits.assemble_out_of_fold_predictions(df, fold_predictions)
 
 
+def test_assemble_config_mismatch_hints_at_fold_parameters():
+    # If the caller produced predictions with a different n_folds than
+    # the one passed here, the recomputed fold set differs and the
+    # error must name the likely cause (n_folds/min_fold_block
+    # mismatch), not just report a bare missing-fold id.
+    df = _dated_matches(40)
+    folds_3 = list(splits.walk_forward_folds(df, n_folds=3))
+    with pytest.raises(ValueError, match="n_folds"):
+        splits.assemble_out_of_fold_predictions(
+            df, _fold_predictions_from_folds(folds_3)
+        )
+
+
 def test_assemble_missing_id_col_raises():
     # A predictions_df lacking id_col surfaces as KeyError (the caller
     # forgot the join key), not a confusing set-membership error.

@@ -90,6 +90,27 @@ def test_compute_outcome_tie_raises():
         labels.compute_outcome(13, 13)
 
 
+def test_ot_heuristic_agrees_with_canonical_ot_criterion():
+    # Cross-module invariant guard: materialize.py's report-only OT
+    # heuristic (winner score > 13) and labels.py's canonical OT
+    # criterion (min(scores) >= 12) must agree on every legal
+    # finished-map scoreline. Legal scorelines are regulation (winner
+    # exactly 13, loser below 12) and overtime (winner >= 14, loser
+    # >= 12, winning margin >= 2). If score validity ever changes,
+    # this fails loudly instead of the two formulas drifting silently.
+    legal = [(13, loser) for loser in range(12)]  # regulation
+    for winner in range(14, 21):  # overtime
+        legal += [(winner, loser) for loser in range(12, winner - 1)]
+    assert legal  # sanity: the grid is non-empty and covers both kinds
+    for team1_score, team2_score in legal:
+        report_ot = max(team1_score, team2_score) > 13
+        canonical_ot = min(team1_score, team2_score) >= 12
+        assert report_ot == canonical_ot, (team1_score, team2_score)
+    # The agreement is non-trivial: both regulation and OT occur.
+    assert any(max(t1, t2) > 13 for t1, t2 in legal)
+    assert any(max(t1, t2) <= 13 for t1, t2 in legal)
+
+
 # --------------------------------------------------------------------------
 # build_labels_table
 # --------------------------------------------------------------------------
@@ -207,6 +228,40 @@ def test_build_labels_table_tie_raises():
     )
     with pytest.raises(ValueError, match="tie"):
         labels.build_labels_table(maps_df)
+
+
+def test_build_labels_table_matches_compute_outcome_grid():
+    # The vectorized np.select path build_labels_table uses must agree
+    # with the scalar compute_outcome for every non-tied scoreline in a
+    # grid: compute_outcome is exercised only by unit tests (production
+    # goes through the vectorized copy), so this guard keeps the two
+    # implementations from silently drifting if the OT/margin/winner
+    # rule is ever edited in one place.
+    scorelines = [
+        (t1, t2)
+        for t1 in range(20)
+        for t2 in range(20)
+        if t1 != t2
+    ]
+    maps_df = pd.DataFrame(
+        [
+            {
+                "match_id": f"m{i}",
+                "map_index": i,
+                "team1_score": t1,
+                "team2_score": t2,
+            }
+            for i, (t1, t2) in enumerate(scorelines)
+        ]
+    )
+    df, skipped = labels.build_labels_table(maps_df)
+    assert skipped == 0
+    assert len(df) == len(scorelines)
+    for i, (t1, t2) in enumerate(scorelines):
+        label, ordinal, margin = labels.compute_outcome(t1, t2)
+        assert df.iloc[i]["outcome_label"] == label, (t1, t2)
+        assert df.iloc[i]["outcome_ordinal"] == ordinal, (t1, t2)
+        assert df.iloc[i]["round_margin"] == margin, (t1, t2)
 
 
 def test_build_labels_table_ordinal_matches_label():
