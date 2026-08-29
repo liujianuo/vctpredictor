@@ -408,22 +408,19 @@ class MapResult:
             self.team2_atk_rounds,
             self.team2_def_rounds,
         )
-        team1_half_present = all(value is not None for value in team1_halves)
-        team2_half_present = all(value is not None for value in team2_halves)
-        team1_half_absent = all(value is None for value in team1_halves)
-        team2_half_absent = all(value is None for value in team2_halves)
-        if not team1_half_present and not team1_half_absent:
-            raise IllegalScoreError(
-                f"map {self.map_name!r} has partial half-split data for "
-                f"team1 {team1_halves}: a finished map's header must "
-                f"render all four of a team's half-split values or none"
-            )
-        if not team2_half_present and not team2_half_absent:
-            raise IllegalScoreError(
-                f"map {self.map_name!r} has partial half-split data for "
-                f"team2 {team2_halves}: a finished map's header must "
-                f"render all four of a team's half-split values or none"
-            )
+        half_present = {}
+        for team_label, halves in (("team1", team1_halves), ("team2", team2_halves)):
+            present = all(value is not None for value in halves)
+            absent = all(value is None for value in halves)
+            if not present and not absent:
+                raise IllegalScoreError(
+                    f"map {self.map_name!r} has partial half-split data for "
+                    f"{team_label} {halves}: a finished map's header must "
+                    f"render all four of a team's half-split values or none"
+                )
+            half_present[team_label] = present
+        team1_half_present = half_present["team1"]
+        team2_half_present = half_present["team2"]
         if team1_half_present != team2_half_present:
             # Completeness: a finished map's header must render both
             # teams' half-split data or neither. Exactly one team
