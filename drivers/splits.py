@@ -9,10 +9,10 @@ match), a walk-forward expanding-window fold generator over the
 validation-block predictions into one out-of-fold (OOF) calibration
 set.
 
-This module sits at the repo root next to ``materialize.py`` and
+This module lives in ``drivers/`` next to ``materialize.py`` and
 ``labels.py`` per the same boundary rule: it reads ``matches.parquet``
-via ``pandas`` and never touches ``config``, ``scraper.cache``, or
-``scraper.models``. It also writes a new additive ``splits.parquet``
+via ``pandas`` and never touches ``utils.config``, ``scraper.cache``,
+or ``scraper.models``. It also writes a new additive ``splits.parquet``
 table alongside (not merged into) M8's artifacts.
 
 Key design rules (mirroring ``labels.py``'s rule list):
@@ -73,7 +73,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from table_io import DEFAULT_OUTPUT_DIR, write_parquet
+from utils.table_io import DEFAULT_OUTPUT_DIR, write_parquet
 
 logger = logging.getLogger(__name__)
 

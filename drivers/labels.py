@@ -6,7 +6,7 @@ the canonical per-map outcome label from each finished map's two
 scores, and writes a new ``data/<version>/labels.parquet`` table
 joined to ``maps`` by ``(match_id, map_index)``.
 
-This module sits at the repo root next to ``materialize.py`` per the
+This module lives in ``drivers/`` next to ``materialize.py`` per the
 same boundary rule tasks 008/009 established: it needs neither
 ``config`` nor the cache — M8 already finished the job of getting the
 scores out of the cache and into a flat column, so this module reads
@@ -61,7 +61,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from table_io import DEFAULT_OUTPUT_DIR, write_parquet
+from utils.table_io import DEFAULT_OUTPUT_DIR, write_parquet
 
 logger = logging.getLogger(__name__)
 

@@ -11,8 +11,7 @@ import logging
 import pandas as pd
 import pytest
 
-import labels
-import materialize
+from drivers import labels, materialize
 
 
 def _full_shape_maps_df(score_rows):

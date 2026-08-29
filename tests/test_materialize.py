@@ -14,7 +14,7 @@ from datetime import datetime
 import pandas as pd
 import pytest
 
-import materialize
+from drivers import materialize
 from scraper import cache
 from scraper.models import MapResult, Match, PlayerStats, Team, VetoAction
 

@@ -11,7 +11,7 @@ from urllib.robotparser import RobotFileParser
 
 import pytest
 
-import scrape
+from drivers import scrape
 from scraper import vlr
 from scraper.models import IllegalScoreError
 

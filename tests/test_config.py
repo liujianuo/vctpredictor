@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
-import config
-from config import Config, ConfigError, Era, load_config, normalize_map_name
+from utils import config
+from utils.config import Config, ConfigError, Era, load_config, normalize_map_name
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_CONFIG = REPO_ROOT / "config.json"

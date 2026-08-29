@@ -37,8 +37,8 @@ import logging
 import sys
 from typing import List, Optional, Sequence
 
-import config
 from scraper import vlr
+from utils import config
 
 logger = logging.getLogger(__name__)
 

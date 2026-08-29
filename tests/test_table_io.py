@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-import table_io
+from utils import table_io
 
 
 def test_default_output_dir_is_data():

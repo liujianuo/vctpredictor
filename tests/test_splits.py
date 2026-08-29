@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 from pandas import Timedelta, Timestamp
 
-import splits
+from drivers import splits
 
 
 def _dated_matches(n, start=None):

@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 # Default config location: <project root>/config.json
-DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 
 _PATH_T = Union[str, Path, None]
 

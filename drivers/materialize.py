@@ -11,10 +11,10 @@ broken scrape (e.g. one event's matches never made it into the cache)
 is visible the moment the dataset is materialised rather than
 discovered three milestones later.
 
-This module sits at the repo root (next to ``scrape.py``/``config.py``)
-per the same boundary rule task 008 established: it is the driver that
-ties persistence (``scraper.cache``) and data shape
-(``scraper.models``) together, and it does not need ``config`` — it
+This module lives in ``drivers/`` (next to ``scrape.py``) per the same
+boundary rule task 008 established: it is the driver that ties
+persistence (``scraper.cache``) and data shape (``scraper.models``)
+together, and it does not need ``utils.config`` — it
 reads only what is already in the cache, never re-deriving the map
 pool or era.
 
@@ -70,7 +70,7 @@ import pandas as pd
 
 from scraper import cache
 from scraper.models import IllegalScoreError, MapResult, Match
-from table_io import DEFAULT_OUTPUT_DIR, write_parquet
+from utils.table_io import DEFAULT_OUTPUT_DIR, write_parquet
 
 logger = logging.getLogger(__name__)
 
