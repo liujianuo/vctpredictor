@@ -75,7 +75,7 @@ Extract per-map first/second half and side (atk/def) round counts onto
 - Size: **S**
 - Depends on: M1
 
-### M7. Scrape driver + rate limiting / robots
+### M7. Scrape driver + rate limiting / robots [x]
 CLI entry point that walks the configured events, applies a polite delay and a
 robots.txt check, and writes every match through the cache. Idempotent re-runs.
 - Size: **M**
