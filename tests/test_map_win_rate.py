@@ -15,8 +15,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from features import map_win_rate as mwr
 from utils import asof
-from utils import map_win_rate as mwr
 
 QUERY_DATE = "2026-01-03T00:00:00"
 

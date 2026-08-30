@@ -6,7 +6,7 @@ filter), the fail-loud event-stage parser, days-since-last-match
 (including the empty-history ``None`` and the strict-``<`` same-day
 exclusion), roster change (identical / 1-swap / 3-swap / insufficient
 history, plus the decay at ``days_since_change == 0`` and ``== half_life``),
-the leakage-safety proof across all as-of features, the ``utils/`` ->
+the leakage-safety proof across all as-of features, the ``features/`` ->
 no-``drivers/`` layering rule, and a skip-guarded real-``data/v1`` sanity
 pass.
 """
@@ -17,7 +17,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from utils import h2h_context
+from features import h2h_context
 
 QUERY = "2026-01-05T10:00:00"
 
@@ -566,8 +566,8 @@ def test_leakage_future_rows_excluded_across_features():
 # --------------------------------------------------------------------------
 
 
-def test_no_drivers_import_in_utils_h2h_context():
-    # The utils/ layering rule: utils modules must not import from
+def test_no_drivers_import_in_h2h_context():
+    # The features/ layering rule: feature modules must not import from
     # drivers/. Assert the literal import is absent from the module source.
     source = Path(h2h_context.__file__).read_text(encoding="utf-8")
     assert "from drivers" not in source

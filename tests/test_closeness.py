@@ -17,7 +17,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from utils import asof, closeness
+from features import closeness
+from utils import asof
 
 QUERY = "2026-01-03T00:00:00"
 D1 = "2026-01-01T10:00:00"

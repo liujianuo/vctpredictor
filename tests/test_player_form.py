@@ -6,7 +6,7 @@ null stats skip-and-count), the two-stage aggregation (per-map unweighted
 roster mean, then recency-weighted last-N window), validation of ``n``
 and ``decay_rate``, the leakage-safety proof (a poison map dated at or
 after the query never changes the value — asserted by *value*, not just
-row count), and the ``utils/`` -> no-``drivers/`` layering rule. A
+row count), and the ``features/`` -> no-``drivers/`` layering rule. A
 skip-guarded smoke test repeats a basic sanity assertion at real
 ``data/v1`` scale.
 """
@@ -16,7 +16,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from utils import player_form
+from features import player_form
 
 D1 = "2026-01-01T10:00:00"
 D2 = "2026-01-02T10:00:00"
@@ -753,8 +753,8 @@ def test_invalid_decay_rate_raises(bad_d):
 # --------------------------------------------------------------------------
 
 
-def test_no_drivers_import_in_utils_player_form():
-    # The utils/ layering rule: utils modules must not import from
+def test_no_drivers_import_in_player_form():
+    # The features/ layering rule: feature modules must not import from
     # drivers/. Assert the literal import is absent from the module source.
     source = Path(player_form.__file__).read_text(encoding="utf-8")
     assert "from drivers" not in source

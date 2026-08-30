@@ -16,7 +16,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from utils import asof, elo
+from features import elo
+from utils import asof
 
 _MATCHES_COLS = ["match_id", "date", "team1_id", "team2_id", "status"]
 _MAPS_COLS = [
