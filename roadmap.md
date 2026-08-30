@@ -143,7 +143,7 @@ feature the OT model needs).
 - Size: **M**
 - Depends on: M12
 
-### M15. Closeness and overtime features
+### M15. Closeness and overtime features [x]
 Per-team frequency of close maps (≤2 round margin), heavily-shrunk per-team OT
 rate, and per-map historical variance of round margins. The global OT base rate
 is estimated from a wider pooled slice than the v1 era, since the team-level
