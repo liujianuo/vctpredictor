@@ -925,7 +925,7 @@ def predict_proba(
             the model has coefficients (a feature-vector/model mismatch
             would silently misalign).
     """
-    x_arr = np.asarray(x, dtype=float)
+    x_arr = np.asarray(x, dtype=float).ravel()
     if x_arr.shape[0] != len(model.coefficients):
         raise ValueError(
             f"feature vector has {x_arr.shape[0]} entries but the model "
