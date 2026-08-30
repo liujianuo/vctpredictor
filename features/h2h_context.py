@@ -175,8 +175,8 @@ from features._shared import (
     TEAM_NAME_COL,
     _build_match_name_lookup,
     _chronological_maps,
-    _validated_roster,
     _validate_k,
+    _validated_roster,
     _wins_from_oriented_maps,
 )
 from utils import asof, config
