@@ -47,6 +47,9 @@ Data-shape findings recorded per plan item 1 (re-derived against real
   caller passing ``"breeze"`` or ``" Breeze "`` matches ``"Breeze"``.
 - No map row has ``team1_score == team2_score`` (0 ties in v1); the
   tie guard is defensive fail-loudly coverage, not a live-data fix.
+- No map row has a non-null ``winner`` with a null ``team1_score`` or
+  ``team2_score`` (0 such rows in v1); the null-score guard added in
+  task 017 is defensive fail-loudly coverage, not a live-data fix.
 
 Boundary note: :func:`select_k` imports ``utils.splits``
 (``split_matches`` + ``walk_forward_folds``) to reuse the chronological
@@ -184,9 +187,12 @@ def _wins_from_oriented_maps(maps: pd.DataFrame) -> int:
     For each row the queried team's score is ``team1_score`` when
     ``team_is_team1`` is truthy, else ``team2_score``; the opponent's is
     the other column. A win is the queried team's score strictly
-    exceeding the opponent's. A tie raises ``ValueError`` (fail loudly,
-    matching the ``drivers/labels.py`` convention) rather than being
-    silently counted as a loss.
+    exceeding the opponent's. A null/NaN score raises ``ValueError``
+    before the tie check (NaN compares neither equal nor greater to
+    anything, so an unguarded comparison would silently count the row
+    as a loss); a tie also raises ``ValueError`` (fail loudly, matching
+    the ``drivers/labels.py`` convention) rather than being silently
+    counted as a loss.
 
     Args:
         maps: The as-of-filtered maps DataFrame; needs at least
@@ -198,15 +204,25 @@ def _wins_from_oriented_maps(maps: pd.DataFrame) -> int:
         The number of wins as an ``int``.
 
     Raises:
-        ValueError: If any row has ``team1_score == team2_score`` (an
-            impossible finished map); the message lists the offending
-            ``match_id`` values.
+        ValueError: If any row has a null/NaN ``team1_score`` or
+            ``team2_score`` (an impossible finished map), or if any row
+            has ``team1_score == team2_score`` (an impossible finished
+            map); the message lists the offending ``match_id`` values.
         KeyError: If a required column is missing (propagated from
             pandas).
     """
     is_team1 = maps[asof.TEAM_ORIENTATION_COL].astype(bool)
     our = maps[TEAM1_SCORE_COL].where(is_team1, maps[TEAM2_SCORE_COL])
     their = maps[TEAM2_SCORE_COL].where(is_team1, maps[TEAM1_SCORE_COL])
+    null_mask = our.isna() | their.isna()
+    if null_mask.any():
+        offending = maps.loc[null_mask, asof.MATCH_ID_COL].tolist()
+        raise ValueError(
+            f"{len(offending)} as-of map(s) have a null/NaN score "
+            "(team1_score or team2_score is missing), which is "
+            "impossible for a finished map; offending match_id(s): "
+            f"{offending[:5]}"
+        )
     tie_mask = our == their
     if tie_mask.any():
         offending = maps.loc[tie_mask, asof.MATCH_ID_COL].tolist()
@@ -251,10 +267,10 @@ def team_overall_win_rate(
     Raises:
         KeyError: If either table lacks a required column (propagated
             from :func:`utils.asof.maps_as_of`).
-        ValueError: If an as-of map has tied scores (see
-            :func:`_wins_from_oriented_maps`); or if the query date or a
-            row date is null/unparseable/timezone-aware (propagated from
-            :func:`utils.asof.maps_as_of`).
+        ValueError: If an as-of map has a null/NaN score or tied scores
+            (see :func:`_wins_from_oriented_maps`); or if the query date
+            or a row date is null/unparseable/timezone-aware (propagated
+            from :func:`utils.asof.maps_as_of`).
         TypeError: If the query date is list-like (propagated from
             :func:`utils.asof.maps_as_of`).
     """
@@ -312,9 +328,10 @@ def team_map_win_rate(
 
     Raises:
         ValueError: If ``k`` is not a positive finite real number (see
-            :func:`_validate_k`); if an as-of map has tied scores (see
-            :func:`_wins_from_oriented_maps`); or if the query date or a
-            row date is null/unparseable/timezone-aware (propagated from
+            :func:`_validate_k`); if an as-of map has a null/NaN score
+            or tied scores (see :func:`_wins_from_oriented_maps`); or
+            if the query date or a row date is
+            null/unparseable/timezone-aware (propagated from
             :func:`utils.asof.maps_as_of`).
         KeyError: If either table lacks a required column (propagated
             from :func:`utils.asof.maps_as_of`; includes ``map_name``,
@@ -368,8 +385,8 @@ def _collect_validation_instances(
     each side is an independent as-of query and a genuine test of the
     shrinkage estimate (plan assumption 8). ``won`` is derived from the
     map's scores with the same rule as the estimator (1 if that side's
-    score strictly exceeds the opponent's, 0 otherwise); a tie raises
-    ``ValueError``.
+    score strictly exceeds the opponent's, 0 otherwise); a null/NaN
+    score or a tie raises ``ValueError``.
 
     Args:
         matches_df: The materialised ``matches`` table (needs
@@ -389,7 +406,8 @@ def _collect_validation_instances(
 
     Raises:
         ValueError: If a validation ``match_id`` is absent from
-            ``matches_df``, or if a map has tied scores.
+            ``matches_df``, if a map has a null/NaN score, or if a map
+            has tied scores.
         KeyError: If ``maps_df`` lacks a required column (propagated
             from pandas).
     """
@@ -416,6 +434,12 @@ def _collect_validation_instances(
             for map_row in match_maps.itertuples(index=False):
                 t1_score = getattr(map_row, TEAM1_SCORE_COL)
                 t2_score = getattr(map_row, TEAM2_SCORE_COL)
+                if pd.isna(t1_score) or pd.isna(t2_score):
+                    raise ValueError(
+                        f"map for match {mid!r} has a null/NaN score "
+                        f"({t1_score!r} vs {t2_score!r}); a finished map "
+                        "must have both scores present"
+                    )
                 if t1_score == t2_score:
                     raise ValueError(
                         f"map for match {mid!r} has tied scores "
@@ -499,9 +523,9 @@ def select_k(
             :func:`utils.splits.split_matches` /
             :func:`utils.splits.walk_forward_folds`); if the folds
             produce zero scoreable validation instances; if a validation
-            map has tied scores or its ``match_id`` is missing (see
-            :func:`_collect_validation_instances`); or if an as-of query
-            inside scoring fails (propagated from
+            map has a null/NaN score or tied scores or its ``match_id``
+            is missing (see :func:`_collect_validation_instances`); or if
+            an as-of query inside scoring fails (propagated from
             :func:`team_map_win_rate`).
         KeyError: If a table lacks a required column (propagated from
             pandas / :func:`team_map_win_rate`).

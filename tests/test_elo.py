@@ -304,6 +304,55 @@ def test_tied_map_raises():
         elo.elo_rating("A", "2026-01-02T00:00:00", matches_df, maps_df)
 
 
+def test_null_score_on_finished_map_raises_not_silently_misattributed():
+    # A "finished" map (winner non-null) with a NaN team1_score must
+    # raise ValueError before the tie comparison: IEEE-754 NaN compares
+    # neither equal nor greater to anything, so the unguarded code path
+    # would silently record team2 as the winner instead of failing.
+    matches_df = _matches_df(
+        [{"match_id": "m1", "date": D1, "team1_id": "A",
+          "team2_id": "B", "status": "completed"}]
+    )
+    maps_df = _maps_df(
+        [{"match_id": "m1", "map_index": 0, "map_name": "Haven",
+          "team1_score": float("nan"), "team2_score": 8, "winner": "A"}]
+    )
+    with pytest.raises(ValueError, match="null/NaN"):
+        elo.elo_rating("A", "2026-01-02T00:00:00", matches_df, maps_df)
+
+
+def test_null_score_team2_raises():
+    # The same guard fires when the *other* score column is NaN.
+    matches_df = _matches_df(
+        [{"match_id": "m1", "date": D1, "team1_id": "A",
+          "team2_id": "B", "status": "completed"}]
+    )
+    maps_df = _maps_df(
+        [{"match_id": "m1", "map_index": 0, "map_name": "Haven",
+          "team1_score": 13, "team2_score": float("nan"), "winner": "A"}]
+    )
+    with pytest.raises(ValueError, match="null/NaN"):
+        elo.elo_rating("A", "2026-01-02T00:00:00", matches_df, maps_df)
+
+
+def test_tie_still_raises_tie_message_not_null_message():
+    # Check ordering: a genuine tie (both scores non-null) hits the tie
+    # branch, whose message mentions "tied scores", never the
+    # null-score branch added before it (a null score is not a tie and
+    # must not be reported as one).
+    matches_df = _matches_df(
+        [{"match_id": "m1", "date": D1, "team1_id": "A",
+          "team2_id": "B", "status": "completed"}]
+    )
+    maps_df = _maps_df(
+        [{"match_id": "m1", "map_index": 0, "map_name": "Haven",
+          "team1_score": 12, "team2_score": 12, "winner": "A"}]
+    )
+    with pytest.raises(ValueError, match="tied scores") as excinfo:
+        elo.elo_rating("A", "2026-01-02T00:00:00", matches_df, maps_df)
+    assert "null" not in str(excinfo.value)
+
+
 # --------------------------------------------------------------------------
 # elo_rating
 # --------------------------------------------------------------------------

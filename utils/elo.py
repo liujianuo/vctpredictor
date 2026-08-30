@@ -65,7 +65,11 @@ the size budget does not justify.
   Team 1 won a map iff ``team1_score > team2_score``; team 2 won
   otherwise. A tied map raises ``ValueError`` (a finished map must have
   a winner; a draw score is never a live code path and is not silently
-  defined).
+  defined). A finished map with a null/NaN ``team1_score`` or
+  ``team2_score`` also raises ``ValueError`` *before* the tie check:
+  NaN compares neither equal nor greater to anything (including
+  itself), so an unguarded comparison would silently record team 2 as
+  the winner — the guard makes that fail loudly instead.
 - **Same-date tie-break is ``(date, match_id, map_index)``.** ``date``
   and ``match_id`` match ``utils.splits._chronological_order``'s
   existing convention; ``map_index`` (0-indexed per match in M8's
@@ -84,6 +88,9 @@ the size budget does not justify.
   ``data/v1``.
 - No map row has ``team1_score == team2_score`` (0 ties in v1); the
   tie guard is defensive fail-loudly coverage, not a live-data fix.
+- No map row has a non-null ``winner`` with a null ``team1_score`` or
+  ``team2_score`` (0 such rows in v1); the null-score guard added in
+  task 017 is defensive fail-loudly coverage, not a live-data fix.
 
 **Module docstring note on the league-wide filter (item 2).**
 ``utils.asof``'s filters are single-team by design, so this module
@@ -419,7 +426,9 @@ def _replay_ratings_as_of(
     Raises:
         KeyError: If either table lacks a required column (propagated
             from :func:`_league_maps_as_of`).
-        ValueError: If an as-of map has tied scores
+        ValueError: If an as-of map has a null/NaN score
+            (``team1_score`` or ``team2_score`` is missing, checked
+            before the tie comparison) or tied scores
             (``team1_score == team2_score``); if ``k`` or
             ``initial_rating`` is invalid (see :func:`_validate_k` /
             :func:`_validate_initial_rating`); or if the query date or a
@@ -456,6 +465,12 @@ def _replay_ratings_as_of(
 
         team1_score = maps[TEAM1_SCORE_COL].iloc[position]
         team2_score = maps[TEAM2_SCORE_COL].iloc[position]
+        if pd.isna(team1_score) or pd.isna(team2_score):
+            raise ValueError(
+                f"map for match {maps[asof.MATCH_ID_COL].iloc[position]!r} has "
+                f"a null/NaN score ({team1_score!r} vs {team2_score!r}); a "
+                "finished map must have both scores present"
+            )
         if team1_score == team2_score:
             raise ValueError(
                 f"map for match {maps[asof.MATCH_ID_COL].iloc[position]!r} has "
@@ -509,9 +524,9 @@ def elo_rating(
         KeyError: If either table lacks a required column (propagated
             from :func:`_replay_ratings_as_of`).
         ValueError: If ``k`` or ``initial_rating`` is invalid; if an
-            as-of map has tied scores; or if the query date or a row
-            date is null/unparseable/timezone-aware (all propagated from
-            :func:`_replay_ratings_as_of`).
+            as-of map has a null/NaN score or tied scores; or if the
+            query date or a row date is null/unparseable/timezone-aware
+            (all propagated from :func:`_replay_ratings_as_of`).
         TypeError: If the query date is list-like (propagated from
             :func:`_replay_ratings_as_of`).
     """
@@ -560,9 +575,9 @@ def elo_differential(
         KeyError: If either table lacks a required column (propagated
             from :func:`_replay_ratings_as_of`).
         ValueError: If ``k`` or ``initial_rating`` is invalid; if an
-            as-of map has tied scores; or if the query date or a row
-            date is null/unparseable/timezone-aware (all propagated from
-            :func:`_replay_ratings_as_of`).
+            as-of map has a null/NaN score or tied scores; or if the
+            query date or a row date is null/unparseable/timezone-aware
+            (all propagated from :func:`_replay_ratings_as_of`).
         TypeError: If the query date is list-like (propagated from
             :func:`_replay_ratings_as_of`).
     """

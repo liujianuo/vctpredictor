@@ -484,6 +484,56 @@ def test_team_map_win_rate_tie_raises():
         mwr.team_map_win_rate("T1", "Haven", QUERY_DATE, matches_df, tie_maps, 10.0)
 
 
+def test_team_overall_win_rate_null_score_raises():
+    # A finished map (winner non-null) with a NaN team1_score must raise
+    # ValueError before the tie check, not silently count the row as a
+    # loss (NaN compares neither equal nor greater to anything).
+    matches_df, _ = _core_tables()
+    null_maps = _maps_df(
+        [
+            {"match_id": "m1", "map_index": 0, "map_name": "Haven",
+             "team1_score": float("nan"), "team2_score": 8, "winner": "T1"},
+        ]
+    )
+    with pytest.raises(ValueError, match="null/NaN"):
+        mwr.team_overall_win_rate("T1", QUERY_DATE, matches_df, null_maps)
+
+
+def test_team_map_win_rate_null_score_raises():
+    # The same null-score guard fires through the shrink estimator path.
+    matches_df, _ = _core_tables()
+    null_maps = _maps_df(
+        [
+            {"match_id": "m1", "map_index": 0, "map_name": "Haven",
+             "team1_score": float("nan"), "team2_score": 8, "winner": "T1"},
+        ]
+    )
+    with pytest.raises(ValueError, match="null/NaN"):
+        mwr.team_map_win_rate("T1", "Haven", QUERY_DATE, matches_df, null_maps, 10.0)
+
+
+def test_collect_validation_instances_null_score_raises():
+    # The CV ground-truth collection reads scores from finished maps
+    # directly; a NaN score must raise rather than be silently
+    # mislabelled as a team2 win (the same bug class the estimator-side
+    # guard fixes).
+    matches_df = _matches_df(
+        [
+            {"match_id": "m1", "date": "2026-01-01T10:00:00", "team1_id": "T1",
+             "team2_id": "T2", "status": "completed"},
+        ]
+    )
+    maps_df = _maps_df(
+        [
+            {"match_id": "m1", "map_index": 0, "map_name": "Haven",
+             "team1_score": float("nan"), "team2_score": 8, "winner": "T1"},
+        ]
+    )
+    folds = [(0, [], ["m1"])]
+    with pytest.raises(ValueError, match="null/NaN"):
+        mwr._collect_validation_instances(matches_df, maps_df, folds)
+
+
 @pytest.mark.parametrize("bad_k", [0, -1, 0.0, float("nan"), float("inf")])
 def test_team_map_win_rate_invalid_k_raises(bad_k):
     # k <= 0 (or NaN/inf) is rejected: k=0 would drop the prior term
