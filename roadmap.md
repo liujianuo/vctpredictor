@@ -136,7 +136,7 @@ estimate; choose k by cross-validation.
 - Size: **S**
 - Depends on: M12
 
-### M14. Elo rating + team parity
+### M14. Elo rating + team parity [x]
 Sequential rating updated map-by-map in chronological order, queryable as-of a
 date; exposes both the signed differential and its absolute value (the parity
 feature the OT model needs).
