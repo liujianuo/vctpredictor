@@ -59,9 +59,7 @@ def test_no_utils_module_imports_another_utils_module():
         source = Path("utils", module).read_text(encoding="utf-8")
         for line in source.splitlines():
             stripped = line.strip()
-            if stripped.startswith("from utils.") or stripped.startswith(
-                "from utils import"
-            ):
+            if stripped.startswith(("from utils.", "from utils import")):
                 assert stripped == ALLOWED_UTILS_CROSS_IMPORT, (
                     f"utils/{module} has a lateral utils-to-utils import "
                     f"other than the allowed {ALLOWED_UTILS_CROSS_IMPORT!r}: "
