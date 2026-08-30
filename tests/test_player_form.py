@@ -797,3 +797,54 @@ def test_real_data_smoke_sane_numbers():
         gap_team = gap_match.iloc[0]["team1_id"]
         gap_res = player_form.team_player_form(gap_team, query, matches, maps, pms)
         assert gap_res.skipped_maps > 0
+
+
+def test_same_team_name_collision_raises_value_error():
+    # Deliverable-B regression: a match whose two side names are identical
+    # ("Same Team") with distinct team ids. Absent the guard, team A's
+    # resolved name "Same Team" would match ALL 10 player rows (5 real-A
+    # rows with acs 100 + 5 real-B rows with acs 0) and silently average
+    # them to acs 50.0. With the guard, the query must fail loudly naming
+    # the match id and the colliding name instead of returning that
+    # contaminated number.
+    matches = _matches_df(
+        [
+            {
+                "match_id": "m1",
+                "date": D1,
+                "team1_id": "A",
+                "team2_id": "B",
+                "team1_name": "Same Team",
+                "team2_name": "Same Team",
+                "status": "completed",
+            }
+        ]
+    )
+    maps = _maps_df(
+        [
+            {
+                "match_id": "m1",
+                "map_index": 0,
+                "map_name": "Haven",
+                "team1_score": 13,
+                "team2_score": 8,
+                "winner": "A",
+            }
+        ]
+    )
+    pms = _pms_df(
+        [
+            {"match_id": "m1", "map_index": 0, "player_name": f"a{i}",
+             "team_name": "Same Team", "rating": 1.0, "acs": 100.0}
+            for i in range(5)
+        ]
+        + [
+            {"match_id": "m1", "map_index": 0, "player_name": f"b{i}",
+             "team_name": "Same Team", "rating": 0.1, "acs": 0.0}
+            for i in range(5)
+        ]
+    )
+    with pytest.raises(ValueError, match="team1_name == team2_name") as excinfo:
+        player_form.team_player_form("A", QUERY, matches, maps, pms)
+    assert "m1" in str(excinfo.value)
+    assert "Same Team" in str(excinfo.value)

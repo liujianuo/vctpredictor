@@ -132,6 +132,12 @@ assumed):**
   match's ``team1_name`` or ``team2_name``); 16 distinct teams, all
   name<->id mappings currently 1:1 (a favourable current-data fact, not
   a guaranteed invariant — which is why no global crosswalk is built).
+- 0 rows with ``team1_name == team2_name`` (and 0 with
+  ``team1_id == team2_id``): the same-team-name guard added in task 019
+  (Deliverable B) is defensive fail-loudly coverage, not a live-data fix
+  — verified against real ``data/v1/matches.parquet`` (98 rows, 0
+  collisions), matching task 017's "defensive, no behavior change on
+  real data" precedent language.
 - 0 null ``acs`` and 0 null ``rating`` values across all 2420 rows; the
   per-row null skip is defensive-only (matching task 017's precedent).
 
@@ -324,7 +330,8 @@ def _build_match_name_lookup(matches_df: pd.DataFrame) -> dict:
     name from the same match row that already carries its orientation.
     It also validates the two extra ``matches_df`` columns this module
     needs (``team1_name``/``team2_name``) beyond what ``utils.asof``
-    itself requires.
+    itself requires, and rejects the same-team-name collision case
+    (``team1_name == team2_name``) before any roster filtering can run.
 
     Args:
         matches_df: The materialised ``matches`` table (needs
@@ -342,15 +349,30 @@ def _build_match_name_lookup(matches_df: pd.DataFrame) -> dict:
         KeyError: If ``matches_df`` lacks ``team1_name`` or
             ``team2_name`` (propagated from
             :func:`utils.asof._require_columns`).
+        ValueError: If any match row has
+            ``team1_name == team2_name`` (a side-name collision). The
+            message names the ``match_id`` and the colliding name. This
+            is the fail-loud guard that keeps opponent rows from being
+            silently merged into the queried team's roster: with the two
+            names identical, the ``team_name == resolved_name`` filter
+            in :func:`_validated_roster` cannot distinguish the two
+            sides.
     """
     asof._require_columns(matches_df, _MATCHES_REQUIRED, "matches_df")
-    return {
-        getattr(row, asof.MATCH_ID_COL): (
-            getattr(row, TEAM1_NAME_COL),
-            getattr(row, TEAM2_NAME_COL),
-        )
-        for row in matches_df.itertuples(index=False)
-    }
+    lookup: dict = {}
+    for row in matches_df.itertuples(index=False):
+        match_id = getattr(row, asof.MATCH_ID_COL)
+        team1_name = getattr(row, TEAM1_NAME_COL)
+        team2_name = getattr(row, TEAM2_NAME_COL)
+        if team1_name == team2_name:
+            raise ValueError(
+                f"matches_df match {match_id!r} has team1_name == team2_name "
+                f"== {team1_name!r}; the two side names must be distinct, "
+                "otherwise opponent rows cannot be distinguished from the "
+                "queried team's roster and would be silently merged into it"
+            )
+        lookup[match_id] = (team1_name, team2_name)
+    return lookup
 
 
 def _chronological_maps(maps: pd.DataFrame) -> pd.DataFrame:
@@ -545,7 +567,11 @@ def team_player_form(
             ``team1_name``/``team2_name``, ``map_index``, and the
             ``player_map_stats`` columns).
         ValueError: If ``n`` or ``decay_rate`` is invalid (see the
-            validate helpers); if a ``player_map_stats`` ``team_name``
+            validate helpers); if a match's two side names are identical
+            (``team1_name == team2_name``, propagated from
+            :func:`_build_match_name_lookup` — the fail-loud guard that
+            prevents opponent rows from being silently merged into the
+            queried team's roster); if a ``player_map_stats`` ``team_name``
             matches neither side of its match (name mismatch); or if the
             query date or a row date is null/unparseable/timezone-aware
             (propagated from :func:`utils.asof.maps_as_of`).
