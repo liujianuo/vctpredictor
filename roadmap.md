@@ -157,7 +157,7 @@ level.
 - Size: **S**
 - Depends on: M12, M5
 
-### M17. Head-to-head + context features
+### M17. Head-to-head + context features [x]
 Heavily-shrunk H2H (overall and per-map), event stage, days since last match, and
 a roster-change flag with post-change feature decay.
 - Size: **M**
