@@ -207,7 +207,10 @@ def build_held_out_maps(
     # left-attaches the split column and guards against stale datasets.
     split_maps = splits.join_split_to_maps(joined, splits_df)
     held_out = split_maps[split_maps["split"] == split]
-    held_out = held_out[HELD_OUT_COLUMNS]
+    # ``list(...)``: a bare tuple column selector would be read by
+    # pandas as a hierarchical/MultiIndex key rather than a plain
+    # column list.
+    held_out = held_out[list(HELD_OUT_COLUMNS)]
     if len(held_out) == 0:
         raise ValueError(
             f"no held-out maps for split {split!r}: joining maps to "
