@@ -152,7 +152,8 @@ def build_held_out_maps(
     "already-labelled maps only" behavior: a map whose label row is
     absent (the skipped-null-score case ``drivers.labels`` permits,
     where labels can legitimately have fewer rows than maps) is
-    silently excluded from evaluation rather than treated as an error.
+    silently excluded from the evaluation rather than treated as an
+    error.
 
     Args:
         matches_df: The materialised ``matches`` table (needs

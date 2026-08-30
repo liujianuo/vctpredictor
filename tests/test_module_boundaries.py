@@ -1,5 +1,5 @@
-"""Architecture-boundary regression tests for the utils/ <-> features/ split
-and the models/ layer on top of it.
+"""Architecture-boundary regression tests for the utils/ <-> features/ split,
+the models/ layer on top of it, and the evaluation/ layer above that.
 
 Encodes the module-boundary standard as executable assertions, read from
 module *source* via ``Path(<module>.py).read_text()`` (matching the
@@ -24,6 +24,13 @@ The rules enforced here:
   edges), and a ``models/`` module may only depend downward on
   ``features.*`` / ``utils.*`` — never on ``drivers.*`` or on a
   sibling ``models/`` module.
+- One more rung above ``models/``: ``evaluation/`` may depend downward
+  on ``models.*`` / ``features.*`` / ``utils.*`` but never on
+  ``drivers.*`` or on a sibling ``evaluation/`` module, and nothing in
+  ``utils/``, ``features/`` or ``models/`` may depend upward on
+  ``evaluation/`` (no ``utils/ -> evaluation``, ``features/ ->
+  evaluation`` or ``models/ -> evaluation`` edges; the DAG stays
+  rooted at ``utils/``).
 """
 
 from pathlib import Path
@@ -64,6 +71,15 @@ ALLOWED_UTILS_CROSS_IMPORT = "from utils.table_io import DEFAULT_OUTPUT_DIR"
 # unrelated to scraper.models (the scraper's pure cache dataclasses).
 MODELS_MODULES = (
     "four_way_baseline.py",
+)
+
+# The modules that live under evaluation/ (the generic map-outcome
+# evaluation harness, roadmap M19). Update this constant list whenever
+# a module is added to or removed from evaluation/ so the test's
+# coverage stays legible and does not silently grow or shrink with the
+# filesystem.
+EVALUATION_MODULES = (
+    "harness.py",
 )
 
 
@@ -155,4 +171,54 @@ def test_models_module_imports_only_features_and_utils():
         assert "import models" not in source, (
             f"models/{module} imports a sibling models/ module; models/ "
             "modules must stand alone laterally"
+        )
+
+
+def test_no_utils_features_or_models_module_imports_evaluation():
+    # evaluation/ is the top of the dependency DAG above models/: nothing
+    # in utils/, features/ or models/ may depend upward on it (an
+    # evaluation import from below would invert the layering and invite
+    # circular imports, exactly like the models/ rung's own rule).
+    for directory, modules in (
+        ("utils", UTILS_MODULES),
+        ("features", FEATURE_MODULES),
+        ("models", MODELS_MODULES),
+    ):
+        for module in modules:
+            source = Path(directory, module).read_text(encoding="utf-8")
+            assert "from evaluation" not in source, (
+                f"{directory}/{module} imports from evaluation/; "
+                f"{directory}/ must not depend on evaluation/"
+            )
+            assert "import evaluation" not in source, (
+                f"{directory}/{module} imports evaluation/; {directory}/ "
+                "must not depend on evaluation/"
+            )
+
+
+def test_evaluation_module_imports_only_features_models_and_utils():
+    # An evaluation/ module may only depend downward on models.* /
+    # features.* / utils.*; importing from drivers/ (the CLI pipeline
+    # layer, which is the layer above evaluation/ in the DAG) or from a
+    # sibling evaluation/ module would break the DAG. Only explicit
+    # ``import`` / ``from`` statements are scanned (stdlib and
+    # third-party imports such as pandas/collections are fine and are
+    # not flagged).
+    for module in EVALUATION_MODULES:
+        source = Path("evaluation", module).read_text(encoding="utf-8")
+        assert "from drivers" not in source, (
+            f"evaluation/{module} imports from drivers/; evaluation/ must "
+            "not depend on drivers/"
+        )
+        assert "import drivers" not in source, (
+            f"evaluation/{module} imports drivers/; evaluation/ must not "
+            "depend on drivers/"
+        )
+        assert "from evaluation" not in source, (
+            f"evaluation/{module} imports from a sibling evaluation/ "
+            "module; evaluation/ modules must stand alone laterally"
+        )
+        assert "import evaluation" not in source, (
+            f"evaluation/{module} imports a sibling evaluation/ module; "
+            "evaluation/ modules must stand alone laterally"
         )
