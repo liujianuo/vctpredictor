@@ -7,14 +7,15 @@ This module adds only the CLI/IO glue: argument parsing
 ``load_*_table`` helpers from :mod:`drivers.evaluate` plus that module's
 :func:`drivers.evaluate.load_player_map_stats_table`), assembling the
 training design matrix via
-:func:`models.ordinal_logit.build_feature_vector` over the M10 train
-split (reusing :func:`evaluation.harness.build_held_out_maps` with
-``split="train"` — no new join logic is written), calling
+:func:`drivers.training_data.assemble_design_matrix` (which wraps
+:func:`evaluation.harness.build_held_out_maps` with ``split="train"`
+and calls :func:`models._shared.build_feature_vector` per row — the
+shared helper every fitted-model driver in this milestone uses), calling
 :func:`models.ordinal_logit.fit`, and writing the serialized model
 artifact ``data/<version>/ordinal_logit_model.json``.
 
 The training-set assembly needs :mod:`evaluation.harness`'s
-:func:`build_held_out_maps`, which this ``drivers/`` module is allowed
+:func:`build_held_out_maps`, which ``drivers/`` modules are allowed
 to use (drivers sit at the top of the dependency DAG); the same
 assembly cannot live inside ``models/ordinal_logit.py``, which must stay
 downward-only (see that module's docstring).
@@ -45,10 +46,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-import numpy as np
-
-from drivers import evaluate
-from evaluation import harness
+from drivers import evaluate, training_data
 from models import ordinal_logit
 from utils.table_io import DEFAULT_OUTPUT_DIR
 
@@ -113,11 +111,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     (matches/maps/labels/splits via the ``drivers.evaluate`` helpers,
     plus ``player_map_stats`` via
     :func:`drivers.evaluate.load_player_map_stats_table`), the training
-    map set is assembled (:func:`evaluation.harness.build_held_out_maps`
-    with ``split="train"`` — the M10 train slice, 209 maps at v1
-    scale), the raw ``(n_train x 11)`` design matrix and ``(n_train,)``
-    label vector are built by calling
-    :func:`models.ordinal_logit.build_feature_vector` per training row,
+    map set is assembled
+    (:func:`drivers.training_data.assemble_design_matrix` with
+    ``split="train"` — the M10 train slice, 209 maps at v1 scale),
     the model is fit (:func:`models.ordinal_logit.fit` — which fits the
     per-feature standardizer on this training matrix only and then runs
     gradient descent, so the returned artifact carries the
@@ -143,9 +139,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             ``load_*`` helpers).
         ValueError: If the train split is empty, a label is invalid, or
             a feature computation fails (propagated from
-            :func:`evaluation.harness.build_held_out_maps` /
-            :func:`models.ordinal_logit.fit` /
-            :func:`models.ordinal_logit.build_feature_vector`).
+            :func:`drivers.training_data.assemble_design_matrix` /
+            :func:`models.ordinal_logit.fit`).
         KeyError: If any input table lacks a required column (propagated
             from the feature modules / harness).
         OSError / TypeError: If the artifact cannot be written
@@ -166,26 +161,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_dir, args.version
     )
 
-    train_rows = harness.build_held_out_maps(
-        matches_df, maps_df, labels_df, splits_df, split="train"
+    X, y = training_data.assemble_design_matrix(
+        matches_df,
+        maps_df,
+        labels_df,
+        splits_df,
+        player_map_stats_df,
+        split="train",
     )
-    X_rows: list[np.ndarray] = []
-    y_rows: list[int] = []
-    for row in train_rows.itertuples(index=False):
-        X_rows.append(
-            ordinal_logit.build_feature_vector(
-                row.team1_id,
-                row.team2_id,
-                row.map_name,
-                row.date,
-                matches_df,
-                maps_df,
-                player_map_stats_df,
-            )
-        )
-        y_rows.append(int(row.outcome_ordinal))
-    X = np.asarray(X_rows, dtype=float)
-    y = np.asarray(y_rows, dtype=int)
 
     model = ordinal_logit.fit(X, y)
 

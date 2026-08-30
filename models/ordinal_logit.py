@@ -97,7 +97,7 @@ Design decisions (recorded here, do not re-derive in later milestones):
   both *require* that table. This module resolves the gap by closing
   over ``player_map_stats_df`` at model-load time in
   :func:`make_model_fn` (the returned closure captures the table and
-  passes it into :func:`build_feature_vector`), rather than by changing
+  passes it into :func:`models._shared.build_feature_vector`), rather than by changing
   the shared interface. That is only correct because callers (the M19
   harness and the evaluation driver) always invoke the returned closure
   with the same ``matches_df``/``maps_df`` that came from the same
@@ -116,82 +116,42 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from features import closeness, elo, h2h_context, map_win_rate, player_form
-from utils import asof
-
-# The 11 features in the fixed order the model consumes, one shared
-# coefficient each. Team-specific features are expressed as A-minus-B
-# differences (A = team1_id, B = team2_id, matching the
-# ``drivers.labels``/``models.four_way_baseline`` convention) so one
-# coefficient vector applies regardless of which side is "A" in a given
-# match row. See the module docstring and :func:`build_feature_vector`
-# for the exact per-feature recipe and the missing-value fallbacks.
-FEATURE_NAMES = (
-    "map_win_rate_diff",
-    "elo_differential",
-    "close_map_freq_diff",
-    "ot_rate_diff",
-    "map_round_margin_variance",
-    "acs_form_diff",
-    "rating_form_diff",
-    "h2h_win_rate_centered",
-    "event_stage",
-    "days_since_diff",
-    "roster_decay_diff",
+from models._shared import (
+    _ARMIJO_C,
+    _LINE_SEARCH_MAX_STEPS,
+    _N_CATEGORIES,
+    _PROB_CLIP_EPS,
+    FEATURE_NAMES,
+    OUTCOME_LABELS,
+    _sigmoid,
+    _validate_l2_lambda,
+    _validate_positive_float,
+    _validate_positive_int,
+    apply_standardizer,
+    build_feature_vector,
+    fit_standardizer,
 )
 
-# The four outcome categories in ordinal order, mirroring
-# ``drivers.labels.OUTCOME_LABELS`` (documented, deliberately *not*
-# imported: this module must not depend on ``drivers/``). Index 0 is
-# "A-regulation", 1 "A-OT", 2 "B-OT", 3 "B-regulation" — the order
-# :func:`predict_proba` returns and ``utils.scoring``'s metrics expect.
-OUTCOME_LABELS = ("A-regulation", "A-OT", "B-OT", "B-regulation")
-
-# Clip epsilon for the category probabilities before the log in the
-# negative log-likelihood (same epsilon convention as
-# ``features.map_win_rate._PROB_CLIP_EPS``). The strict threshold
-# ordering guarantees every ``P_j`` is strictly positive for any finite
-# ``eta``, so the clip is defensive floor/sky coverage for extreme
-# inputs, not a live-data fix.
-_PROB_CLIP_EPS = 1e-12
-
-# Armijo line-search constants: the sufficient-decrease parameter and
-# the maximum number of step halvings (step starts at 1.0, halving up to
-# this many times) before an iteration is declared unable to make
-# progress.
-_ARMIJO_C = 1e-4
-_LINE_SEARCH_MAX_STEPS = 50
-
-# Number of categories (the length of OUTCOME_LABELS / the K of the
-# ordinal model).
-_N_CATEGORIES = 4
-
-
-def _sigmoid(x: float) -> float:
-    """Return the logistic sigmoid of ``x``, computed stably.
-
-    ``1 / (1 + exp(-x))`` evaluated in the numerically-stable branch
-    that avoids ``exp(-x)`` overflowing to ``inf`` for large negative
-    ``x`` (and, symmetrically, avoids ``exp(x)`` overflowing for large
-    positive ``x``). ``sigmoid`` is strictly increasing, so with
-    strictly increasing thresholds the three ``C_j`` stay strictly
-    ordered.
-
-    Args:
-        x: The scalar argument (typically ``theta_j + eta``).
-
-    Returns:
-        The sigmoid value as a ``float`` in ``(0, 1)`` (asymptotically
-        approaching but never reaching 0 and 1 for finite ``x``).
-
-    Raises:
-        Nothing (the formula is total for any finite input).
-    """
-    if x >= 0.0:
-        z = math.exp(-x)
-        return 1.0 / (1.0 + z)
-    z = math.exp(x)
-    return z / (1.0 + z)
+# The module's public API, declared explicitly so the linter treats the
+# names re-exported from models._shared (OUTCOME_LABELS et al., which
+# tests import via ``from models.ordinal_logit import ...`` and must
+# therefore keep resolving here) as intentional re-exports rather than
+# unused imports. Mirrors the identical convention in
+# ``drivers/splits.py``'s ``__all__``.
+__all__ = (
+    "FEATURE_NAMES",
+    "OUTCOME_LABELS",
+    "OrdinalLogitModel",
+    "apply_standardizer",
+    "build_feature_vector",
+    "fit",
+    "fit_standardizer",
+    "from_dict",
+    "make_model_fn",
+    "predict_proba",
+    "to_dict",
+    "total_log_likelihood",
+)
 
 
 def _softplus(a: float) -> float:
@@ -704,93 +664,6 @@ class OrdinalLogitModel:
     loss_trace: tuple[float, ...] = ()
 
 
-def _validate_l2_lambda(l2_lambda) -> float:
-    """Validate the L2 strength and return it as a float.
-
-    The L2 strength must be a non-negative finite real: a negative value
-    would anti-regularize (grow coefficients unboundedly) and NaN/inf
-    would poison every gradient step.
-
-    Args:
-        l2_lambda: The proposed L2 strength.
-
-    Returns:
-        ``l2_lambda`` as a ``float``.
-
-    Raises:
-        ValueError: If it cannot be coerced to a float, or if the result
-            is NaN, infinite, or negative.
-    """
-    try:
-        value = float(l2_lambda)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"l2_lambda must be a non-negative finite real number, got {l2_lambda!r}"
-        ) from exc
-    if not math.isfinite(value) or value < 0.0:
-        raise ValueError(
-            f"l2_lambda must be a non-negative finite real number, got {l2_lambda!r}"
-        )
-    return value
-
-
-def _validate_positive_int(value, name: str) -> int:
-    """Validate a positive integer parameter and return it as an ``int``.
-
-    Used for ``max_iter``: rejects bools (which are int-coercible but
-    never intended), non-integral values, and non-positive values.
-
-    Args:
-        value: The proposed parameter value.
-        name: The parameter name for the error message.
-
-    Returns:
-        ``value`` as a positive ``int``.
-
-    Raises:
-        ValueError: If ``value`` is a bool, not integer-valued, or
-            ``<= 0``.
-    """
-    if type(value) is bool:
-        raise ValueError(f"{name} must be a positive integer, got {value!r}")
-    try:
-        result = int(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{name} must be a positive integer, got {value!r}") from exc
-    if result != value or result <= 0:
-        raise ValueError(f"{name} must be a positive integer, got {value!r}")
-    return result
-
-
-def _validate_positive_float(value, name: str) -> float:
-    """Validate a positive finite parameter and return it as a ``float``.
-
-    Used for ``grad_tol``/``loss_tol``: both are convergence tolerances
-    that must be strictly positive and finite (zero or negative would
-    disable or invert the convergence checks; NaN/inf would poison them).
-
-    Args:
-        value: The proposed parameter value.
-        name: The parameter name for the error message.
-
-    Returns:
-        ``value`` as a positive finite ``float``.
-
-    Raises:
-        ValueError: If it cannot be coerced to a float, or if the result
-            is NaN, infinite, or ``<= 0``.
-    """
-    try:
-        result = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be a positive real number, got {value!r}") from exc
-    if not math.isfinite(result) or result <= 0.0:
-        raise ValueError(
-            f"{name} must be a positive finite real number, got {value!r}"
-        )
-    return result
-
-
 def fit(
     X: np.ndarray,
     y: np.ndarray,
@@ -946,355 +819,6 @@ def predict_proba(
         float(probs[1]),
         float(probs[2]),
         float(probs[3]),
-    )
-
-
-def fit_standardizer(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Fit the per-feature z-score standardizer on a design matrix.
-
-    Computes the per-column ``(mean, std)`` of ``X`` (population std,
-    matching numpy's ``std`` convention). A zero-variance column's std
-    is replaced with ``1.0`` rather than raising, so
-    :func:`apply_standardizer` turns that column into ``0.0`` for every
-    row (a degenerate/constant training column contributes no signal);
-    see the module docstring's standardization bullet.
-
-    Args:
-        X: The design matrix to compute statistics from, ``(n, p)``
-            floats.
-
-    Returns:
-        A ``(means, stds)`` tuple of ``(p,)`` numpy arrays: the
-        per-column means and the per-column stds (zero-variance columns
-        carry ``1.0``).
-
-    Raises:
-        ValueError: If ``X`` is empty or is not a 2-D array (no
-            per-column statistics exist for an empty matrix).
-    """
-    X_arr = np.asarray(X, dtype=float)
-    if X_arr.ndim != 2 or X_arr.shape[0] == 0:
-        raise ValueError(
-            "fit_standardizer requires a non-empty 2-D design matrix, got "
-            f"shape {X_arr.shape}"
-        )
-    means = X_arr.mean(axis=0)
-    stds = X_arr.std(axis=0)
-    zero_variance = stds == 0.0
-    stds = np.where(zero_variance, 1.0, stds)
-    return means, stds
-
-
-def apply_standardizer(
-    X: np.ndarray,
-    means: np.ndarray,
-    stds: np.ndarray,
-) -> np.ndarray:
-    """Standardize a design matrix with pre-computed (mean, std) statistics.
-
-    Applies ``(X - means) / stds`` column-wise. With the
-    :func:`fit_standardizer` zero-variance guard (``std == 1.0`` for a
-    constant column), a zero-variance column standardizes to ``0.0`` for
-    every row instead of dividing by zero.
-
-    Args:
-        X: The design matrix to standardize, ``(n, p)`` floats.
-        means: The per-column means, length ``p``.
-        stds: The per-column stds, length ``p`` (all non-zero; see
-            :func:`fit_standardizer`).
-
-    Returns:
-        The standardized matrix as a ``(n, p)`` numpy array of ``float``.
-
-    Raises:
-        ValueError: If ``means``/``stds`` do not have exactly as many
-            entries as ``X`` has columns (a shape mismatch would
-            silently misalign columns).
-    """
-    X_arr = np.asarray(X, dtype=float)
-    means_arr = np.asarray(means, dtype=float)
-    stds_arr = np.asarray(stds, dtype=float)
-    if X_arr.ndim != 2:
-        raise ValueError(
-            f"apply_standardizer requires a 2-D design matrix, got shape {X_arr.shape}"
-        )
-    if means_arr.shape[0] != X_arr.shape[1] or stds_arr.shape[0] != X_arr.shape[1]:
-        raise ValueError(
-            f"standardizer has {means_arr.shape[0]} means / {stds_arr.shape[0]} "
-            f"stds but X has {X_arr.shape[1]} columns; they must match"
-        )
-    return (X_arr - means_arr) / stds_arr
-
-
-def _match_id_for(
-    team1_id: str,
-    team2_id: str,
-    date: str,
-    matches_df: pd.DataFrame,
-) -> str:
-    """Resolve the unique match row for a (team1, team2, date) triple.
-
-    Feature ``event_stage`` needs the *match*'s ``event_name`` (and
-    therefore its ``match_id``), but the fixed feature-builder signature
-    carries no ``match_id`` argument. This helper recovers it by locating
-    the unique match row matching the two team ids and the as-of date.
-    At v1 scale the ``(team1_id, team2_id, date)`` triple is unique per
-    match (verified against the real data: every match has a distinct
-    timestamp), so the lookup is unambiguous; the guard below fails
-    loudly if a future dataset makes it ambiguous, rather than silently
-    picking an arbitrary row.
-
-    Args:
-        team1_id: The queried team1's stable id ("A").
-        team2_id: The queried team2's stable id ("B").
-        date: The match's own date string (the as-of cutoff).
-        matches_df: The materialised ``matches`` table (needs
-            ``team1_id``, ``team2_id``, ``date``, ``match_id``).
-
-    Returns:
-        The ``match_id`` of the unique matching row, as a ``str``.
-
-    Raises:
-        KeyError: If ``matches_df`` lacks a required column (propagated
-            from :func:`utils.asof.require_columns`).
-        ValueError: If zero or more than one match row matches the
-            triple (the event-stage feature would be undefined or
-            ambiguous).
-    """
-    asof.require_columns(
-        matches_df,
-        (asof.TEAM1_ID_COL, asof.TEAM2_ID_COL, asof.DATE_COL, asof.MATCH_ID_COL),
-        "matches_df",
-    )
-    matches = matches_df[
-        (matches_df[asof.TEAM1_ID_COL] == team1_id)
-        & (matches_df[asof.TEAM2_ID_COL] == team2_id)
-        & (matches_df[asof.DATE_COL] == date)
-    ]
-    if len(matches) != 1:
-        raise ValueError(
-            f"expected exactly one match for (team1_id={team1_id!r}, "
-            f"team2_id={team2_id!r}, date={date!r}) to resolve the "
-            f"event-stage match_id, found {len(matches)}"
-        )
-    return matches.iloc[0][asof.MATCH_ID_COL]
-
-
-def build_feature_vector(
-    team1_id: str,
-    team2_id: str,
-    map_name: str,
-    date: str,
-    matches_df: pd.DataFrame,
-    maps_df: pd.DataFrame,
-    player_map_stats_df: pd.DataFrame,
-) -> np.ndarray:
-    """Build the 11-feature vector for one map, in FEATURE_NAMES order.
-
-    Computes every feature exactly as section A specifies, each as of
-    the map's own match ``date`` (strict ``<`` boundary, inherited
-    unchanged from each feature module's own ``utils.asof`` usage — this
-    model adds no new date filtering), with team-specific features
-    expressed as A-minus-B differences (A = ``team1_id``, B =
-    ``team2_id``). The missing-value fallback policy from the module
-    docstring is applied per-side *before* differencing. No
-    normalization/standardization happens here — the returned values are
-    raw feature values; standardization is :func:`fit_standardizer` /
-    :func:`apply_standardizer`'s job (training-side only).
-
-    Args:
-        team1_id: The queried team1's stable id ("A").
-        team2_id: The queried team2's stable id ("B").
-        map_name: The map to predict for (normalized inside each feature
-            estimator, so case/whitespace never break a match).
-        date: The as-of cutoff; rows dated ``>=`` this are excluded
-            (strict ``<``).
-        matches_df: The materialised ``matches`` table.
-        maps_df: The materialised ``maps`` table.
-        player_map_stats_df: The materialised ``player_map_stats`` table
-            (needed by the M16/M17 features; required because the fixed
-            model interface does not pass it — see the module docstring
-            and :func:`make_model_fn`).
-
-    Returns:
-        An 11-vector numpy array of ``float`` in :data:`FEATURE_NAMES`
-        order: ``map_win_rate_diff, elo_differential,
-        close_map_freq_diff, ot_rate_diff, map_round_margin_variance,
-        acs_form_diff, rating_form_diff, h2h_win_rate_centered,
-        event_stage, days_since_diff, roster_decay_diff``.
-
-    Raises:
-        ValueError: If a feature's as-of history contains a null/tied
-            score or a null/unparseable date, if ``k``/window/threshold
-            hyperparameters are invalid, if the match row for
-            ``(team1_id, team2_id, date)`` is not unique (see
-            :func:`_match_id_for`), if a ``player_map_stats`` team name
-            matches neither side of its match, or if the two side names
-            of a match collide (all propagated from the individual
-            feature modules).
-        KeyError: If any table lacks a required column (propagated from
-            the individual feature modules / :func:`_match_id_for`).
-        TypeError: If the query date is list-like (propagated from
-            ``utils.asof`` via the feature modules).
-        ConfigError: If ``map_name`` or an as-of map's ``map_name`` is
-            not a string (propagated from
-            :func:`utils.config.normalize_map_name` via the feature
-            modules).
-    """
-    # 1. map_win_rate_diff — shrunk per-map win rate, A minus B.
-    map_win_a = map_win_rate.team_map_win_rate(
-        team1_id, map_name, date, matches_df, maps_df, map_win_rate.DEFAULT_K
-    ).mean
-    map_win_b = map_win_rate.team_map_win_rate(
-        team2_id, map_name, date, matches_df, maps_df, map_win_rate.DEFAULT_K
-    ).mean
-    map_win_rate_diff = map_win_a - map_win_b
-
-    # 2. elo_differential — signed A-minus-B already, from one shared
-    #    league replay.
-    elo_diff = elo.elo_differential(
-        team1_id,
-        team2_id,
-        date,
-        matches_df,
-        maps_df,
-        k=elo.DEFAULT_K,
-        initial_rating=elo.INITIAL_RATING,
-    ).differential
-
-    # 3. close_map_freq_diff — unshrunk close-map frequency, A minus B.
-    close_a = closeness.team_close_map_frequency(
-        team1_id, date, matches_df, maps_df
-    ).rate
-    close_b = closeness.team_close_map_frequency(
-        team2_id, date, matches_df, maps_df
-    ).rate
-    close_map_freq_diff = close_a - close_b
-
-    # 4. ot_rate_diff — heavily-shrunk team OT rate, A minus B.
-    ot_a = closeness.team_ot_rate(
-        team1_id,
-        date,
-        matches_df,
-        maps_df,
-        k=closeness.DEFAULT_OT_K,
-    ).mean
-    ot_b = closeness.team_ot_rate(
-        team2_id,
-        date,
-        matches_df,
-        maps_df,
-        k=closeness.DEFAULT_OT_K,
-    ).mean
-    ot_rate_diff = ot_a - ot_b
-
-    # 5. map_round_margin_variance — match-level (not a team diff);
-    #    NaN (n <= 1) replaced with 0.0 per the documented fallback.
-    margin_var = closeness.map_round_margin_variance(
-        map_name, date, matches_df, maps_df
-    ).variance
-    if math.isnan(margin_var):
-        map_round_margin_variance = 0.0
-    else:
-        map_round_margin_variance = float(margin_var)
-
-    # 6/7. acs_form_diff / rating_form_diff — recency-weighted form,
-    #    A minus B, with the either-side-None -> 0.0 fallback.
-    form_a = player_form.team_player_form(
-        team1_id,
-        date,
-        matches_df,
-        maps_df,
-        player_map_stats_df,
-        n=player_form.DEFAULT_FORM_WINDOW,
-        decay_rate=player_form.DEFAULT_DECAY_RATE,
-    )
-    form_b = player_form.team_player_form(
-        team2_id,
-        date,
-        matches_df,
-        maps_df,
-        player_map_stats_df,
-        n=player_form.DEFAULT_FORM_WINDOW,
-        decay_rate=player_form.DEFAULT_DECAY_RATE,
-    )
-    if form_a.acs.mean is None or form_b.acs.mean is None:
-        acs_form_diff = 0.0
-    else:
-        acs_form_diff = form_a.acs.mean - form_b.acs.mean
-    if form_a.rating.mean is None or form_b.rating.mean is None:
-        rating_form_diff = 0.0
-    else:
-        rating_form_diff = form_a.rating.mean - form_b.rating.mean
-
-    # 8. h2h_win_rate_centered — shrunk H2H mean minus the 0.5 prior
-    #    (0 = no/even history, matching the estimator's own
-    #    full-shrinkage default).
-    h2h_mean = h2h_context.team_pair_h2h(
-        team1_id,
-        team2_id,
-        date,
-        matches_df,
-        maps_df,
-        k=h2h_context.DEFAULT_H2H_K,
-    ).mean
-    h2h_win_rate_centered = h2h_mean - h2h_context.H2H_PRIOR
-
-    # 9. event_stage — the match's own stage (match-level int), resolved
-    #    through the unique (team1, team2, date) match row.
-    match_id = _match_id_for(team1_id, team2_id, date, matches_df)
-    event_stage = float(
-        h2h_context.match_event_stage(match_id, matches_df)
-    )
-
-    # 10. days_since_diff — rest gap, A minus B, with None (unseen team
-    #     / no strictly-prior match) treated as 0 per the fallback.
-    days_a = h2h_context.days_since_last_match(team1_id, date, matches_df)
-    days_b = h2h_context.days_since_last_match(team2_id, date, matches_df)
-    days_since_diff = (days_a if days_a is not None else 0) - (
-        days_b if days_b is not None else 0
-    )
-
-    # 11. roster_decay_diff — post-change decay multiplier, A minus B,
-    #     with None (changed is None/False) treated as 1.0 per the
-    #     fallback.
-    roster_a = h2h_context.team_roster_change(
-        team1_id,
-        date,
-        matches_df,
-        maps_df,
-        player_map_stats_df,
-        jaccard_threshold=h2h_context.DEFAULT_JACCARD_THRESHOLD,
-        half_life_days=h2h_context.DEFAULT_HALF_LIFE_DAYS,
-    )
-    roster_b = h2h_context.team_roster_change(
-        team2_id,
-        date,
-        matches_df,
-        maps_df,
-        player_map_stats_df,
-        jaccard_threshold=h2h_context.DEFAULT_JACCARD_THRESHOLD,
-        half_life_days=h2h_context.DEFAULT_HALF_LIFE_DAYS,
-    )
-    decay_a = roster_a.decay_multiplier if roster_a.decay_multiplier is not None else 1.0
-    decay_b = roster_b.decay_multiplier if roster_b.decay_multiplier is not None else 1.0
-    roster_decay_diff = decay_a - decay_b
-
-    return np.asarray(
-        [
-            map_win_rate_diff,
-            elo_diff,
-            close_map_freq_diff,
-            ot_rate_diff,
-            map_round_margin_variance,
-            acs_form_diff,
-            rating_form_diff,
-            h2h_win_rate_centered,
-            event_stage,
-            days_since_diff,
-            roster_decay_diff,
-        ],
-        dtype=float,
     )
 
 
@@ -1535,3 +1059,56 @@ def make_model_fn(
         return predict_proba(x, model)
 
     return model_fn
+def total_log_likelihood(
+    X: np.ndarray,
+    y: np.ndarray,
+    model: OrdinalLogitModel,
+) -> float:
+    """Return the model's total log-likelihood on a training batch.
+
+    Computes ``sum(log(P_y))`` over the batch by calling the module's own
+    public :func:`predict_proba` once per row (each probability clipped
+    into ``[eps, 1 - eps]``, so every log is finite) — deliberately
+    implemented through the public prediction path rather than by
+    duplicating the internal NLL loop, so there is exactly one place per
+    model that computes a probability from a raw feature vector. Consumed
+    by :func:`evaluation.proportional_odds.build_diagnostic_report` (M21),
+    which needs the training log-likelihoods of both the ordinal and the
+    multinomial arm for the AIC/BIC comparison.
+
+    Args:
+        X: The raw (unstandardized) training design matrix, ``(n, 11)``
+            floats in :data:`FEATURE_NAMES` order. Rows are standardized
+            inside :func:`predict_proba` with the model's stored
+            training-population statistics.
+        y: The true outcome ordinals, ``(n,)`` ints in ``{0, 1, 2, 3}``.
+        model: The fitted model whose predictions are evaluated.
+
+    Returns:
+        The total log-likelihood as a ``float`` (``<= 0``; exactly zero
+        only for a degenerate batch where every ``P_y`` is 1).
+
+    Raises:
+        ValueError: If ``X`` rows and ``y`` entries do not match, if a
+            ``y`` value is outside ``{0, 1, 2, 3}``, or if a feature
+            vector length mismatches the model (propagated from
+            :func:`predict_proba`).
+    """
+    X_arr = np.asarray(X, dtype=float)
+    y_arr = np.asarray(y, dtype=int)
+    if X_arr.shape[0] != len(y_arr):
+        raise ValueError(
+            f"X has {X_arr.shape[0]} rows but y has {len(y_arr)} entries; "
+            "they must match"
+        )
+    if set(np.unique(y_arr).tolist()) - set(range(_N_CATEGORIES)):
+        raise ValueError(
+            f"y must contain only outcome ordinals 0..{_N_CATEGORIES - 1}, "
+            f"got values {sorted(set(np.unique(y_arr).tolist()))}"
+        )
+    total = 0.0
+    for i in range(len(y_arr)):
+        probs = predict_proba(X_arr[i], model)
+        total += math.log(probs[y_arr[i]])
+    return total
+
