@@ -48,12 +48,12 @@ Data-shape findings recorded per plan item 1 (re-derived against real
 - No map row has ``team1_score == team2_score`` (0 ties in v1); the
   tie guard is defensive fail-loudly coverage, not a live-data fix.
 
-Boundary note: :func:`select_k` imports ``drivers.splits``
+Boundary note: :func:`select_k` imports ``utils.splits``
 (``split_matches`` + ``walk_forward_folds``) to reuse the chronological
-fold machinery rather than reimplementing it. That is the single
-``utils`` -> ``drivers`` dependency in this module, deliberate per the
-M13 plan, and it imports only pure functions/constants — no CLI entry
-point is invoked and no file I/O happens at import time.
+fold machinery rather than reimplementing it. That dependency is
+``utils`` -> ``utils`` (both modules are pure in-memory libraries with
+no CLI entry point and no file I/O at import time), so it no longer
+inverts the established ``drivers`` -> ``utils`` layering rule.
 """
 
 from __future__ import annotations
@@ -63,14 +63,14 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from drivers.splits import (
+from utils import asof, config, scoring
+from utils.splits import (
     DEFAULT_N_FOLDS,
     DEFAULT_TEST_FRAC,
     MIN_FOLD_BLOCK_MATCHES,
     split_matches,
     walk_forward_folds,
 )
-from utils import asof, config, scoring
 
 # Column names this module reads. ``team_is_team1`` and ``date`` come
 # from utils.asof's maps output; the score/map-name columns are M8's
@@ -380,7 +380,7 @@ def _collect_validation_instances(
             Only finished maps (``winner`` non-null) contribute an
             outcome.
         folds: The ``(fold_id, train_ids, val_ids)`` tuples from
-            :func:`drivers.splits.walk_forward_folds`.
+            :func:`utils.splits.walk_forward_folds`.
 
     Returns:
         A list of ``(team_id, map_name, date, won)`` tuples in fold
@@ -481,9 +481,9 @@ def select_k(
         k_grid: The candidate strengths to search; any iterable of
             positive finite reals (default :data:`DEFAULT_K_GRID`).
             Duplicate values collapse to one dict entry.
-        n_folds: Passed to :func:`drivers.splits.walk_forward_folds`.
-        min_fold_block: Passed to :func:`drivers.splits.walk_forward_folds`.
-        test_frac: Passed to :func:`drivers.splits.split_matches`.
+        n_folds: Passed to :func:`utils.splits.walk_forward_folds`.
+        min_fold_block: Passed to :func:`utils.splits.walk_forward_folds`.
+        test_frac: Passed to :func:`utils.splits.split_matches`.
 
     Returns:
         A ``(best_k, scores_by_k)`` tuple. ``best_k`` is the grid value
@@ -496,8 +496,8 @@ def select_k(
             a positive finite real number (see :func:`_validate_k`); if
             the completed matches table is too small for the split/fold
             machinery (propagated from
-            :func:`drivers.splits.split_matches` /
-            :func:`drivers.splits.walk_forward_folds`); if the folds
+            :func:`utils.splits.split_matches` /
+            :func:`utils.splits.walk_forward_folds`); if the folds
             produce zero scoreable validation instances; if a validation
             map has tied scores or its ``match_id`` is missing (see
             :func:`_collect_validation_instances`); or if an as-of query

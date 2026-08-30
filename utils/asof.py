@@ -25,7 +25,7 @@ The whole module is built around a single, non-negotiable contract:
   ISO-8601 strings; they sort correctly as plain strings only while
   every row shares one exact format/precision (true for v1). Rather
   than rely on that, dates are parsed with ``pandas.to_datetime``
-  (matching ``drivers/splits.py``'s ``_chronological_order``
+  (matching ``utils/splits.py``'s ``_chronological_order``
   convention) and a null or unparseable date — in the query or in any
   row — raises ``ValueError`` instead of silently mis-ordering.
 - **The team key is ``team_id``, not ``team_name``.** ``team_id`` is
@@ -176,7 +176,7 @@ def _parse_query_date(date: str) -> pd.Timestamp:
     Turns the caller's cutoff into a single ``pandas.Timestamp`` that
     can be compared against the parsed table date column. The parse is
     done with ``pandas.to_datetime`` (the convention shared with
-    ``drivers.splits``) rather than left as a string, and the result is
+    ``utils.splits``) rather than left as a string, and the result is
     validated to be exactly one real (non-null, timezone-naive)
     timestamp, so a null or list-like cutoff fails loudly instead of
     silently producing an empty or mis-ordered result.
@@ -229,7 +229,7 @@ def _parse_date_column(dates: pd.Series) -> pd.Series:
 
     Parses the raw (ISO-8601 string) date column with
     ``pandas.to_datetime`` and rejects any null value, mirroring the
-    null-date guard already established in ``drivers.splits``: a null
+    null-date guard already established in ``utils.splits``: a null
     date parses to ``NaT`` rather than raising, and ``NaT`` has no
     chronological position, so it must not silently pass (or fail) an
     as-of comparison.
