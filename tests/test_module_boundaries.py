@@ -71,6 +71,7 @@ ALLOWED_UTILS_CROSS_IMPORT = "from utils.table_io import DEFAULT_OUTPUT_DIR"
 # unrelated to scraper.models (the scraper's pure cache dataclasses).
 MODELS_MODULES = (
     "four_way_baseline.py",
+    "ordinal_logit.py",
 )
 
 # The modules that live under evaluation/ (the generic map-outcome

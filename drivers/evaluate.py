@@ -3,15 +3,16 @@
 Thin command-line wrapper around :mod:`evaluation.harness`, which owns
 the pure scoring/calibration logic. This module adds only the
 CLI/IO glue: argument parsing (:func:`parse_args`), the model-name to
-callable registry (:data:`MODEL_REGISTRY`), loading the four input
-tables (:func:`load_matches_table` / :func:`load_maps_table` /
-:func:`load_labels_table` / :func:`load_splits_table`), writing the
+factory registry (:data:`MODEL_REGISTRY`), loading the input tables
+(:func:`load_matches_table` / :func:`load_maps_table` /
+:func:`load_labels_table` / :func:`load_splits_table` /
+:func:`load_player_map_stats_table`), writing the
 two evaluation artifacts (:func:`write_predictions_table` /
 :func:`write_report`), and the :func:`main` entry point.
 
 For the evaluation semantics — held-out split choice, the generic
-``ModelFn`` interface, metric definitions, and calibration conventions
-— see :mod:`evaluation.harness`'s module docstring.
+model interface, metric definitions, and calibration conventions — see
+:mod:`evaluation.harness`'s module docstring.
 
 Artifacts written per run (scoped by dataset version and model name so
 re-running with a different model does not clobber the previous one):
@@ -40,23 +41,99 @@ import argparse
 import json
 import logging
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pandas as pd
 
 from evaluation import harness
+from models import ordinal_logit
 from utils.table_io import DEFAULT_OUTPUT_DIR, write_parquet
 
 logger = logging.getLogger(__name__)
 
-# The registry of runnable model names -> ModelFn callables. M20+ models
-# add an entry here rather than changing the harness itself. The value
-# is the callable directly (four_way_baseline_model is already a
-# ModelFn-shaped function); a stateful fitted model would register a
-# bound method/closure instead.
-MODEL_REGISTRY: dict[str, harness.ModelFn] = {
-    "four_way_baseline": harness.four_way_baseline_model,
+# A model factory: given the dataset location, return the ready-to-call
+# model function. Stateless models (like the M18 baseline) ignore the
+# arguments and return a constant callable; stateful fitted models (like
+# M20's ordinal logit) load their artifact and any extra tables from
+# ``<output_dir>/<version>`` and return a closure over them. M20+ models
+# add an entry here rather than changing the harness itself.
+ModelFactory = Callable[[Path, str], harness.ModelFn]
+
+
+def _four_way_baseline_factory(output_dir: Path, version: str) -> harness.ModelFn:
+    """Return the M18 four-way baseline as a model function.
+
+    The trivial stateless factory: it ignores both the dataset location
+    arguments (the baseline needs no fitted artifact and no extra
+    tables) and returns :func:`evaluation.harness.four_way_baseline_model`
+    unchanged, which is already a valid model function.
+
+    Args:
+        output_dir: The parent directory the version subdirectory
+            lives under (ignored by this factory).
+        version: The dataset version subdirectory name (ignored by this
+            factory).
+
+    Returns:
+        :func:`evaluation.harness.four_way_baseline_model` itself.
+
+    Raises:
+        Nothing.
+    """
+    return harness.four_way_baseline_model
+
+
+def _ordinal_logit_factory(output_dir: Path, version: str) -> harness.ModelFn:
+    """Load the fitted ordinal-logit artifact and return its model function.
+
+    The stateful factory for M20's ordinal logistic regression: it reads
+    ``<output_dir>/<version>/ordinal_logit_model.json`` (produced by
+    ``drivers/train_ordinal_logit.py``), parses it via
+    :func:`models.ordinal_logit.from_dict`, loads the
+    ``player_map_stats`` table for the same version (the seventh table
+    the generic model interface does not pass; see
+    :func:`models.ordinal_logit.make_model_fn`), and returns the closure
+    :func:`models.ordinal_logit.make_model_fn` builds — which must be
+    invoked with the same ``matches_df``/``maps_df`` from this same
+    ``<output_dir>/<version>``.
+
+    Args:
+        output_dir: The parent directory the version subdirectory
+            lives under (e.g. ``Path("data")``).
+        version: The dataset version subdirectory name (e.g. ``"v1"``).
+
+    Returns:
+        A model function (the 6-argument generic shape) that predicts
+        with the fitted ordinal-logit model and the loaded
+        ``player_map_stats`` table.
+
+    Raises:
+        FileNotFoundError: If ``ordinal_logit_model.json`` or
+            ``player_map_stats.parquet`` does not exist for this
+            version (i.e. ``train_ordinal_logit.py``/``materialize.py``
+            have not been run) — propagated as-is from
+            ``json.load``/``pandas.read_parquet``.
+        ValueError / KeyError: If the artifact dict is malformed or
+            shape-inconsistent (propagated from
+            :func:`models.ordinal_logit.from_dict`).
+    """
+    artifact_path = Path(output_dir) / version / "ordinal_logit_model.json"
+    with open(artifact_path, encoding="utf-8") as handle:
+        artifact = json.load(handle)
+    model = ordinal_logit.from_dict(artifact)
+    player_map_stats_df = load_player_map_stats_table(output_dir, version)
+    return ordinal_logit.make_model_fn(model, player_map_stats_df)
+
+
+# The registry of runnable model names -> factories. Each value is a
+# :data:`ModelFactory` callable ``(output_dir, version) -> ModelFn``;
+# :func:`main` invokes the selected factory with the dataset location
+# to obtain the model function, then scores it. ``--model``'s
+# ``choices=sorted(MODEL_REGISTRY)`` picks up new keys automatically.
+MODEL_REGISTRY: dict[str, ModelFactory] = {
+    "four_way_baseline": _four_way_baseline_factory,
+    "ordinal_logit": _ordinal_logit_factory,
 }
 
 
@@ -75,13 +152,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ``"v1"``), ``output_dir`` (``str``, the parent directory the
         version subdirectory lives under, default ``"data"``), and
         ``model`` (``str``, the registered model name to evaluate,
-        default ``"four_way_baseline"``). Together they locate the four
-        input tables under ``<output_dir>/<version>/*.parquet`` and the
-        two output artifacts ``eval_predictions_<model>.parquet`` /
+        default ``"four_way_baseline"``). Together they locate the
+        input tables under ``<output_dir>/<version>/*.parquet``
+        (``matches``/``maps``/``labels``/``splits`` always, plus
+        ``player_map_stats`` for the fitted ``ordinal_logit`` model)
+        and the two output artifacts
+        ``eval_predictions_<model>.parquet`` /
         ``eval_report_<model>.json`` under the same directory. There is
         deliberately no ``--k`` flag: the shrinkage strength is a
         per-model concern a caller tunes by registering their own
-        partially-applied ``ModelFn`` (see
+        partially-applied model function (see
         :func:`evaluation.harness.four_way_baseline_model`), not a CLI
         concern.
 
@@ -228,6 +308,37 @@ def load_splits_table(output_dir: Path, version: str) -> pd.DataFrame:
     return pd.read_parquet(Path(output_dir) / version / "splits.parquet")
 
 
+def load_player_map_stats_table(output_dir: Path, version: str) -> pd.DataFrame:
+    """Load the materialised player_map_stats table for a dataset version.
+
+    Thin wrapper around ``pandas.read_parquet`` isolating the file I/O
+    into one function (see :func:`load_matches_table`). This is the
+    fifth input table: the fitted ``ordinal_logit`` model needs it at
+    load time (its feature vector consumes M16/M17 features that read
+    player rows), while the stateless baseline and the harness itself do
+    not — so only the ``ordinal_logit`` factory calls this helper.
+
+    Args:
+        output_dir: The parent directory the version subdirectory
+            lives under (e.g. ``Path("data")``).
+        version: The dataset version subdirectory name (e.g.
+            ``"v1"``).
+
+    Returns:
+        The contents of ``<output_dir>/<version>/player_map_stats.parquet``
+        as a ``pandas.DataFrame`` (M8's ``player_map_stats`` table).
+
+    Raises:
+        FileNotFoundError: If ``player_map_stats.parquet`` does not
+            exist for this version (i.e. ``materialize.py`` has not
+            been run for it) — propagated as-is from
+            ``pandas.read_parquet``.
+        OSError: On any other file-access failure (permissions, etc.),
+            also propagated as-is.
+    """
+    return pd.read_parquet(Path(output_dir) / version / "player_map_stats.parquet")
+
+
 def write_predictions_table(
     scored_df: pd.DataFrame,
     output_dir: Path,
@@ -320,12 +431,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the model evaluation end to end.
 
     Logging is configured first so the summary line is visible from the
-    CLI. The four input tables are loaded for the requested version
-    (see the ``load_*`` helpers), the held-out map set is assembled
+    CLI. The evaluation tables are loaded for the requested version
+    (``matches``/``maps``/``labels``/``splits`` via the ``load_*``
+    helpers; ``player_map_stats`` is loaded lazily inside the
+    ``ordinal_logit`` factory), the held-out map set is assembled
     (:func:`evaluation.harness.build_held_out_maps`), the registered
-    model is scored over it (:func:`evaluation.harness.score_held_out_maps`),
-    the report is built (:func:`evaluation.harness.build_evaluation_report`),
-    both artifacts are written (see :func:`write_predictions_table` /
+    model's factory is invoked with the dataset location to obtain the
+    model function, which is scored over the held-out set
+    (:func:`evaluation.harness.score_held_out_maps`), the report is
+    built (:func:`evaluation.harness.build_evaluation_report`), both
+    artifacts are written (see :func:`write_predictions_table` /
     :func:`write_report`), and a one-line summary of the headline
     numbers is logged (mirroring ``materialize.py``/``labels.py``'s
     summary-line convention).
@@ -342,9 +457,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             doctrine rather than a second success/failure channel.
 
     Raises:
-        FileNotFoundError: If any of the four input tables does not
-            exist for the requested version (propagated from the
-            ``load_*`` helpers).
+        FileNotFoundError: If any of the evaluation tables (or the
+            ``player_map_stats`` table, for the ``ordinal_logit``
+            model) does not exist for the requested version
+            (propagated from the ``load_*`` helpers).
         SystemExit: If ``--model`` is not a registered name (rejected
             by argparse ``choices=`` in :func:`parse_args`).
         ValueError: If the held-out set is empty, a model output is
@@ -365,7 +481,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     labels_df = load_labels_table(output_dir, args.version)
     splits_df = load_splits_table(output_dir, args.version)
 
-    model_fn = MODEL_REGISTRY[args.model]
+    model_fn = MODEL_REGISTRY[args.model](output_dir, args.version)
     held_out_df = harness.build_held_out_maps(
         matches_df, maps_df, labels_df, splits_df
     )
