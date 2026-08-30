@@ -22,8 +22,15 @@ The rules enforced here:
 - The dependency graph is a DAG with ``models/`` on top: no ``utils/``
   or ``features/`` module may import from ``models/`` (no upward
   edges), and a ``models/`` module may only depend downward on
-  ``features.*`` / ``utils.*`` — never on ``drivers.*`` or on a
-  sibling ``models/`` module.
+  ``features.*`` / ``utils.*`` — never on ``drivers.*``. The one
+  lateral exception is the explicitly-shared
+  ``models/_shared.py`` (the exact analogue of the
+  ``features/_shared.py`` carve-out above): ``ordinal_logit.py`` and
+  ``multinomial_logit.py`` both import from it, and it is deliberately
+  excluded from ``MODELS_MODULES`` just as ``features/_shared.py`` is
+  excluded from ``FEATURE_MODULES`` (the pre-existing gap that
+  ``features/_shared.py`` itself is not scanned is inherited
+  unchanged here, not newly introduced).
 - One more rung above ``models/``: ``evaluation/`` may depend downward
   on ``models.*`` / ``features.*`` / ``utils.*`` but never on
   ``drivers.*`` or on a sibling ``evaluation/`` module, and nothing in
@@ -64,14 +71,19 @@ FEATURE_MODULES = (
 # exception so the rule below has no blanket carve-outs.
 ALLOWED_UTILS_CROSS_IMPORT = "from utils.table_io import DEFAULT_OUTPUT_DIR"
 
-# The modules that live under models/. Update this constant list whenever
-# a module is added to or removed from models/ so the test's coverage
-# stays legible and does not silently grow or shrink with the
+# The modules that live under models/ (excluding _shared.py, which is
+# the explicitly-shared model-support module every other models module
+# may import from — the exact analogue of the features/_shared.py
+# carve-out one rung down, deliberately not scanned here just as
+# features/_shared.py is not scanned either). Update this constant list
+# whenever a module is added to or removed from models/ so the test's
+# coverage stays legible and does not silently grow or shrink with the
 # filesystem. Note this is the top-level models/ package (roadmap M18),
 # unrelated to scraper.models (the scraper's pure cache dataclasses).
 MODELS_MODULES = (
     "four_way_baseline.py",
     "ordinal_logit.py",
+    "multinomial_logit.py",
 )
 
 # The modules that live under evaluation/ (the generic map-outcome
@@ -81,6 +93,7 @@ MODELS_MODULES = (
 # filesystem.
 EVALUATION_MODULES = (
     "harness.py",
+    "proportional_odds.py",
 )
 
 
@@ -152,9 +165,14 @@ def test_no_utils_or_features_module_imports_models():
 def test_models_module_imports_only_features_and_utils():
     # A models/ module may only depend downward on features.* / utils.*;
     # importing from drivers/ (the CLI pipeline layer) or from a sibling
-    # models/ module would break the DAG. Only explicit ``import`` /
-    # ``from`` statements are scanned (stdlib and third-party imports
-    # such as pandas/dataclasses are fine and are not flagged).
+    # models/ module would break the DAG. The one lateral exception is
+    # the explicitly-shared models/_shared.py (mirroring the
+    # features/_shared.py carve-out in
+    # test_no_feature_module_imports_sibling_feature_module): scan each
+    # ``from models.`` line and assert the imported submodule name is
+    # exactly ``_shared``. Only explicit ``import`` / ``from``
+    # statements are scanned (stdlib and third-party imports such as
+    # pandas/dataclasses are fine and are not flagged).
     for module in MODELS_MODULES:
         source = Path("models", module).read_text(encoding="utf-8")
         assert "from drivers" not in source, (
@@ -165,14 +183,20 @@ def test_models_module_imports_only_features_and_utils():
             f"models/{module} imports drivers/; models/ must not depend "
             "on drivers/"
         )
-        assert "from models" not in source, (
-            f"models/{module} imports from a sibling models/ module; "
-            "models/ modules must stand alone laterally"
-        )
         assert "import models" not in source, (
             f"models/{module} imports a sibling models/ module; models/ "
             "modules must stand alone laterally"
         )
+        for line in source.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("from models."):
+                continue
+            imported = stripped[len("from models.") :].split()[0]
+            assert imported == "_shared", (
+                f"models/{module} imports {imported!r} from a sibling "
+                "models/ module; only models._shared may be imported "
+                "laterally"
+            )
 
 
 def test_no_utils_features_or_models_module_imports_evaluation():
