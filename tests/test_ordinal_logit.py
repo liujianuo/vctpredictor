@@ -883,10 +883,13 @@ def test_predict_proba_accepts_both_vector_shapes():
 def test_evaluate_registry_is_factory_dict_with_ordinal_logit():
     # plan#10: MODEL_REGISTRY values are (output_dir, version) ->
     # ModelFn factories; the four_way_baseline factory is the trivial
-    # stateless one returning the harness adapter unchanged, and the new
+    # stateless one returning the harness adapter unchanged, and the
     # ordinal_logit key is present (so --model choices pick it up
-    # automatically).
-    assert set(evaluate.MODEL_REGISTRY) == {"four_way_baseline", "ordinal_logit"}
+    # automatically). The multinomial_logit key (added by task 024) is
+    # asserted in tests/test_multinomial_logit.py.
+    assert "four_way_baseline" in evaluate.MODEL_REGISTRY
+    assert "ordinal_logit" in evaluate.MODEL_REGISTRY
+    assert "multinomial_logit" in evaluate.MODEL_REGISTRY
     model_fn = evaluate.MODEL_REGISTRY["four_way_baseline"](Path("data"), "v1")
     assert model_fn is evaluate.harness.four_way_baseline_model
 
