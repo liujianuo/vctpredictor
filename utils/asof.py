@@ -105,6 +105,13 @@ WINNER_COL = "winner"
 # ``team2_score``).
 TEAM_ORIENTATION_COL = "team_is_team1"
 
+# The per-match map-ordering key carried through on :func:`maps_as_of`'s
+# output (an original maps-table column, 0-indexed per match in M8's
+# ``maps.parquet``). Feature modules use it to order a match's maps in
+# play order; it is a shared constant here so they do not each redefine
+# the spelling.
+MAP_INDEX_COL = "map_index"
+
 # The columns :func:`matches_as_of` needs on the matches table.
 _MATCHES_REQUIRED = (TEAM1_ID_COL, TEAM2_ID_COL, DATE_COL, STATUS_COL)
 
