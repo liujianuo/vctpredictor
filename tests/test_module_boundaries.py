@@ -1,4 +1,5 @@
-"""Architecture-boundary regression tests for the utils/ <-> features/ split.
+"""Architecture-boundary regression tests for the utils/ <-> features/ split
+and the models/ layer on top of it.
 
 Encodes the module-boundary standard as executable assertions, read from
 module *source* via ``Path(<module>.py).read_text()`` (matching the
@@ -18,6 +19,11 @@ The rules enforced here:
 - No ``features/`` module may import a sibling ``features/`` module
   other than the explicitly shared ``_shared.py`` (no lateral
   feature-to-feature private-helper imports).
+- The dependency graph is a DAG with ``models/`` on top: no ``utils/``
+  or ``features/`` module may import from ``models/`` (no upward
+  edges), and a ``models/`` module may only depend downward on
+  ``features.*`` / ``utils.*`` — never on ``drivers.*`` or on a
+  sibling ``models/`` module.
 """
 
 from pathlib import Path
@@ -50,6 +56,15 @@ FEATURE_MODULES = (
 # function/method/private-helper import. Kept as an explicit, named
 # exception so the rule below has no blanket carve-outs.
 ALLOWED_UTILS_CROSS_IMPORT = "from utils.table_io import DEFAULT_OUTPUT_DIR"
+
+# The modules that live under models/. Update this constant list whenever
+# a module is added to or removed from models/ so the test's coverage
+# stays legible and does not silently grow or shrink with the
+# filesystem. Note this is the top-level models/ package (roadmap M18),
+# unrelated to scraper.models (the scraper's pure cache dataclasses).
+MODELS_MODULES = (
+    "four_way_baseline.py",
+)
 
 
 def test_no_utils_module_imports_another_utils_module():
@@ -98,3 +113,46 @@ def test_no_feature_module_imports_sibling_feature_module():
                 "feature module; only features._shared may be imported "
                 "laterally"
             )
+
+
+def test_no_utils_or_features_module_imports_models():
+    # models/ is the top of the dependency DAG: nothing in utils/ or
+    # features/ may depend upward on it (a models import from below
+    # would invert the layering and invite circular imports).
+    for directory, modules in (("utils", UTILS_MODULES), ("features", FEATURE_MODULES)):
+        for module in modules:
+            source = Path(directory, module).read_text(encoding="utf-8")
+            assert "from models" not in source, (
+                f"{directory}/{module} imports from models/; {directory}/ "
+                "must not depend on models/"
+            )
+            assert "import models" not in source, (
+                f"{directory}/{module} imports models/; {directory}/ must "
+                "not depend on models/"
+            )
+
+
+def test_models_module_imports_only_features_and_utils():
+    # A models/ module may only depend downward on features.* / utils.*;
+    # importing from drivers/ (the CLI pipeline layer) or from a sibling
+    # models/ module would break the DAG. Only explicit ``import`` /
+    # ``from`` statements are scanned (stdlib and third-party imports
+    # such as pandas/dataclasses are fine and are not flagged).
+    for module in MODELS_MODULES:
+        source = Path("models", module).read_text(encoding="utf-8")
+        assert "from drivers" not in source, (
+            f"models/{module} imports from drivers/; models/ must not "
+            "depend on drivers/"
+        )
+        assert "import drivers" not in source, (
+            f"models/{module} imports drivers/; models/ must not depend "
+            "on drivers/"
+        )
+        assert "from models" not in source, (
+            f"models/{module} imports from a sibling models/ module; "
+            "models/ modules must stand alone laterally"
+        )
+        assert "import models" not in source, (
+            f"models/{module} imports a sibling models/ module; models/ "
+            "modules must stand alone laterally"
+        )
