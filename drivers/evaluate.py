@@ -47,7 +47,7 @@ from pathlib import Path
 import pandas as pd
 
 from evaluation import harness
-from models import ordinal_logit
+from models import multinomial_logit, ordinal_logit
 from utils.table_io import DEFAULT_OUTPUT_DIR, write_parquet
 
 logger = logging.getLogger(__name__)
@@ -126,6 +126,49 @@ def _ordinal_logit_factory(output_dir: Path, version: str) -> harness.ModelFn:
     return ordinal_logit.make_model_fn(model, player_map_stats_df)
 
 
+def _multinomial_logit_factory(output_dir: Path, version: str) -> harness.ModelFn:
+    """Load the fitted multinomial-logit artifact and return its model function.
+
+    The stateful factory for M21's multinomial logistic regression: it
+    reads ``<output_dir>/<version>/multinomial_logit_model.json``
+    (produced by ``drivers/train_multinomial_logit.py``), parses it via
+    :func:`models.multinomial_logit.from_dict`, loads the
+    ``player_map_stats`` table for the same version (the seventh table
+    the generic model interface does not pass; see
+    :func:`models.multinomial_logit.make_model_fn`), and returns the
+    closure :func:`models.multinomial_logit.make_model_fn` builds —
+    which must be invoked with the same ``matches_df``/``maps_df`` from
+    this same ``<output_dir>/<version>``. Mirrors
+    :func:`_ordinal_logit_factory` exactly.
+
+    Args:
+        output_dir: The parent directory the version subdirectory
+            lives under (e.g. ``Path("data")``).
+        version: The dataset version subdirectory name (e.g. ``"v1"``).
+
+    Returns:
+        A model function (the 6-argument generic shape) that predicts
+        with the fitted multinomial-logit model and the loaded
+        ``player_map_stats`` table.
+
+    Raises:
+        FileNotFoundError: If ``multinomial_logit_model.json`` or
+            ``player_map_stats.parquet`` does not exist for this
+            version (i.e. ``train_multinomial_logit.py``/
+            ``materialize.py`` have not been run) — propagated as-is
+            from ``json.load``/``pandas.read_parquet``.
+        ValueError / KeyError: If the artifact dict is malformed or
+            shape-inconsistent (propagated from
+            :func:`models.multinomial_logit.from_dict`).
+    """
+    artifact_path = Path(output_dir) / version / "multinomial_logit_model.json"
+    with open(artifact_path, encoding="utf-8") as handle:
+        artifact = json.load(handle)
+    model = multinomial_logit.from_dict(artifact)
+    player_map_stats_df = load_player_map_stats_table(output_dir, version)
+    return multinomial_logit.make_model_fn(model, player_map_stats_df)
+
+
 # The registry of runnable model names -> factories. Each value is a
 # :data:`ModelFactory` callable ``(output_dir, version) -> ModelFn``;
 # :func:`main` invokes the selected factory with the dataset location
@@ -134,6 +177,7 @@ def _ordinal_logit_factory(output_dir: Path, version: str) -> harness.ModelFn:
 MODEL_REGISTRY: dict[str, ModelFactory] = {
     "four_way_baseline": _four_way_baseline_factory,
     "ordinal_logit": _ordinal_logit_factory,
+    "multinomial_logit": _multinomial_logit_factory,
 }
 
 
@@ -155,7 +199,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default ``"four_way_baseline"``). Together they locate the
         input tables under ``<output_dir>/<version>/*.parquet``
         (``matches``/``maps``/``labels``/``splits`` always, plus
-        ``player_map_stats`` for the fitted ``ordinal_logit`` model)
+        ``player_map_stats`` for the fitted ``ordinal_logit``/
+        ``multinomial_logit`` models)
         and the two output artifacts
         ``eval_predictions_<model>.parquet`` /
         ``eval_report_<model>.json`` under the same directory. There is
@@ -313,10 +358,11 @@ def load_player_map_stats_table(output_dir: Path, version: str) -> pd.DataFrame:
 
     Thin wrapper around ``pandas.read_parquet`` isolating the file I/O
     into one function (see :func:`load_matches_table`). This is the
-    fifth input table: the fitted ``ordinal_logit`` model needs it at
-    load time (its feature vector consumes M16/M17 features that read
-    player rows), while the stateless baseline and the harness itself do
-    not — so only the ``ordinal_logit`` factory calls this helper.
+    fifth input table: the fitted ``ordinal_logit``/``multinomial_logit``
+    models need it at load time (their feature vectors consume M16/M17
+    features that read player rows), while the stateless baseline and
+    the harness itself do not — so only the two fitted-model factories
+    call this helper.
 
     Args:
         output_dir: The parent directory the version subdirectory
@@ -434,7 +480,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     CLI. The evaluation tables are loaded for the requested version
     (``matches``/``maps``/``labels``/``splits`` via the ``load_*``
     helpers; ``player_map_stats`` is loaded lazily inside the
-    ``ordinal_logit`` factory), the held-out map set is assembled
+    ``ordinal_logit``/``multinomial_logit`` factories), the held-out
+    map set is assembled
     (:func:`evaluation.harness.build_held_out_maps`), the registered
     model's factory is invoked with the dataset location to obtain the
     model function, which is scored over the held-out set
@@ -458,8 +505,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     Raises:
         FileNotFoundError: If any of the evaluation tables (or the
-            ``player_map_stats`` table, for the ``ordinal_logit``
-            model) does not exist for the requested version
+            ``player_map_stats`` table, for the ``ordinal_logit``/
+            ``multinomial_logit`` models) does not exist for the requested version
             (propagated from the ``load_*`` helpers).
         SystemExit: If ``--model`` is not a registered name (rejected
             by argparse ``choices=`` in :func:`parse_args`).
