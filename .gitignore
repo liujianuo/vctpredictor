@@ -11,6 +11,7 @@ description.txt
 /tasks
 /.ruff_cache
 run-loop.sh
+roadmap.md
 
 # local cache (SQLite DB files)
 cache/
