@@ -151,7 +151,7 @@ signal is too sparse to stand alone.
 - Size: **M**
 - Depends on: M12, M9
 
-### M16. Player-form features
+### M16. Player-form features [x]
 Recency-weighted rolling mean ACS/rating over the last N maps, aggregated to team
 level.
 - Size: **S**
