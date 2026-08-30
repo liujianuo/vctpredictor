@@ -364,6 +364,18 @@ pipeline worth it?" comparison against M32.
 
 ---
 
+## Housekeeping / refactors (not numbered milestones)
+- [x] `tasks/020-feature-module-split`: split `utils/` into genuine
+  leaf-level utilities (`config`, `table_io`, `scoring`, `asof`,
+  `splits`) vs. a new `features/` package for trainable-feature
+  estimators (`map_win_rate`, `elo`, `closeness`, `player_form`,
+  `h2h_context`); eliminated all cross-util method references
+  (`h2h_context` lateral imports lifted into `features/_shared.py`);
+  promoted `asof` private column/date helpers to public API; added
+  `tests/test_module_boundaries.py` to enforce the DAG rule. The
+  "Module boundary standard" is now documented in the BUILD section of
+  AGENTS.md/CLAUDE.md. REVIEW|CLEAN.
+
 ## Notes and deferrals
 - **Deferred to v2:** round-differential regression (model the margin
   continuously, integrate onto the four buckets). More statistically efficient in
