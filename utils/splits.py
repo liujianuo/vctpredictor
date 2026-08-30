@@ -15,9 +15,9 @@ configuration, and no file I/O of its own. The CLI entry point and the
 Parquet-reading/writing glue live in ``drivers/splits.py``, which
 re-exports every name defined here (see its module docstring). Keeping
 the pure split/fold/assembly logic here — rather than in a driver
-module — lets other ``utils`` modules (e.g. ``utils/map_win_rate.py``)
+module — lets other modules (e.g. ``features/map_win_rate.py``)
 reuse it without importing a driver, preserving the established
-``drivers -> utils`` layering rule.
+``drivers -> utils -> features`` layering rule.
 
 Key design rules (mirroring ``labels.py``'s rule list):
 

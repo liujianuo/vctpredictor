@@ -151,7 +151,7 @@ class AsOfBundle:
     maps: pd.DataFrame
 
 
-def _require_columns(df: pd.DataFrame, columns: tuple[str, ...], table: str) -> None:
+def require_columns(df: pd.DataFrame, columns: tuple[str, ...], table: str) -> None:
     """Raise ``KeyError`` if a table is missing required columns.
 
     The single shared missing-column check used by the as-of functions,
@@ -177,7 +177,7 @@ def _require_columns(df: pd.DataFrame, columns: tuple[str, ...], table: str) -> 
         raise KeyError(f"{table} is missing required column(s): {missing}")
 
 
-def _parse_query_date(date: str) -> pd.Timestamp:
+def parse_query_date(date: str) -> pd.Timestamp:
     """Parse and validate a single as-of cutoff date.
 
     Turns the caller's cutoff into a single ``pandas.Timestamp`` that
@@ -231,7 +231,7 @@ def _parse_query_date(date: str) -> pd.Timestamp:
     return parsed
 
 
-def _parse_date_column(dates: pd.Series) -> pd.Series:
+def parse_date_column(dates: pd.Series) -> pd.Series:
     """Parse and null-check a table's date column for as-of filtering.
 
     Parses the raw (ISO-8601 string) date column with
@@ -288,7 +288,7 @@ def matches_as_of(team_id: str, date: str, matches_df: pd.DataFrame) -> pd.DataF
             object/string). No type coercion is performed: a ``team_id``
             whose type does not match the stored ids simply matches
             nothing and yields an empty result.
-        date: The as-of cutoff (see :func:`_parse_query_date`). Rows
+        date: The as-of cutoff (see :func:`parse_query_date`). Rows
             dated equal to or after this are excluded (strict ``<``).
         matches_df: The materialised ``matches`` table (M8's
             ``matches.parquet``). Only ``team1_id``, ``team2_id``,
@@ -309,15 +309,15 @@ def matches_as_of(team_id: str, date: str, matches_df: pd.DataFrame) -> pd.DataF
         KeyError: If ``matches_df`` lacks any of ``team1_id``,
             ``team2_id``, ``date`` or ``status``.
         ValueError: If the query date is null/unparseable/timezone-aware
-            (see :func:`_parse_query_date`), or if any row date is
-            null/unparseable (see :func:`_parse_date_column`).
+            (see :func:`parse_query_date`), or if any row date is
+            null/unparseable (see :func:`parse_date_column`).
         TypeError: If the query date is list-like rather than a single
-            scalar (see :func:`_parse_query_date`).
+            scalar (see :func:`parse_query_date`).
     """
-    _require_columns(matches_df, _MATCHES_REQUIRED, "matches_df")
+    require_columns(matches_df, _MATCHES_REQUIRED, "matches_df")
 
-    parsed_dates = _parse_date_column(matches_df[DATE_COL])
-    query = _parse_query_date(date)
+    parsed_dates = parse_date_column(matches_df[DATE_COL])
+    query = parse_query_date(date)
 
     team1 = matches_df[TEAM1_ID_COL]
     team2 = matches_df[TEAM2_ID_COL]
@@ -371,7 +371,7 @@ def maps_as_of(
     Args:
         team_id: The queried team's stable id (see
             :func:`matches_as_of`).
-        date: The as-of cutoff (see :func:`_parse_query_date`).
+        date: The as-of cutoff (see :func:`parse_query_date`).
         matches_df: The materialised ``matches`` table; read by
             :func:`matches_as_of` and used as the join source for
             ``date``/orientation.
@@ -400,10 +400,10 @@ def maps_as_of(
             null/unparseable/timezone-aware (propagated from
             :func:`matches_as_of` / the parse helpers).
         TypeError: If the query date is list-like (propagated from
-            :func:`_parse_query_date` via :func:`matches_as_of`).
+            :func:`parse_query_date` via :func:`matches_as_of`).
     """
     matches = matches_as_of(team_id, date, matches_df)
-    _require_columns(maps_df, _MAPS_REQUIRED, "maps_df")
+    require_columns(maps_df, _MAPS_REQUIRED, "maps_df")
 
     if not matches[MATCH_ID_COL].is_unique:
         duplicates = matches.loc[
@@ -448,7 +448,7 @@ def features_as_of(
     Args:
         team_id: The queried team's stable id (see
             :func:`matches_as_of`).
-        date: The as-of cutoff (see :func:`_parse_query_date`).
+        date: The as-of cutoff (see :func:`parse_query_date`).
         matches_df: The materialised ``matches`` table.
         maps_df: The materialised ``maps`` table.
 
@@ -471,7 +471,7 @@ def features_as_of(
             null/unparseable/timezone-aware (propagated from the parse
             helpers).
         TypeError: If the query date is list-like (propagated from
-            :func:`_parse_query_date`).
+            :func:`parse_query_date`).
     """
     matches = matches_as_of(team_id, date, matches_df)
     maps = maps_as_of(team_id, date, matches_df, maps_df)
