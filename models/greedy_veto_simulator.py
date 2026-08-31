@@ -94,6 +94,7 @@ Design decisions (recorded here, do not re-derive in later milestones):
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import pandas as pd
@@ -165,6 +166,85 @@ class SimulatedVetoAction:
         }
 
 
+def team_map_scores(
+    team_id: str,
+    pool: Sequence[str],
+    date: str,
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+    k,
+) -> dict[str, float]:
+    """Score every map in a pool for one team at one as-of cutoff.
+
+    The shared per-team per-map score computation the greedy rule is
+    built on, extracted out of :func:`simulate_veto` so the M26 veto
+    evaluation harness can build the same softmax-over-score
+    distribution without duplicating the dict comprehension. For every
+    map in ``pool`` it returns the mean of
+    :func:`features.map_win_rate.team_map_win_rate` for ``team_id`` at
+    the single as-of ``date`` (decision 5 of the module docstring: the
+    as-of snapshot cannot change mid-simulation, so a veto evaluates
+    every pool map at one cutoff, not at the map's hypothetical play
+    order). Each pool entry is normalized via
+    :func:`utils.config.normalize_map_name` before the lookup and the
+    dict key uses the normalized name, so case/whitespace never break
+    a match and the dict is keyed the same way the ``remaining`` set
+    of :func:`simulate_veto` is.
+
+    Args:
+        team_id: The stable id of the team to score for (the same id
+            ``features.map_win_rate.team_map_win_rate`` and
+            ``utils.asof`` consume).
+        pool: An iterable of map names to score; every entry is
+            normalized via :func:`utils.config.normalize_map_name`
+            (the caller's already-normalized pool passes through
+            unchanged, since normalization is idempotent).
+        date: The single as-of cutoff used for every win-rate lookup
+            (e.g. the simulated match's own ISO-8601 timestamp). Maps
+            dated ``>=`` this are excluded (strict ``<``), so no score
+            ever sees the match being vetoed or anything later.
+        matches_df: The materialised ``matches`` table.
+        maps_df: The materialised ``maps`` table (needs ``map_name``,
+            ``team1_score``, ``team2_score`` in addition to the
+            columns ``utils.asof.maps_as_of`` already requires).
+        k: The shrinkage strength (effective prior sample size) passed
+            to :func:`features.map_win_rate.team_map_win_rate`; must
+            be a positive finite real number.
+
+    Returns:
+        A ``{normalized_map_name: mean}`` dict with one entry per pool
+        map, in ``pool``'s iteration order, where ``mean`` is the
+        shrunk win-rate posterior mean of
+        :func:`features.map_win_rate.team_map_win_rate` for that map.
+        Two distinct pool entries that normalize to the same name
+        collapse into one dict key (the caller's already-validated
+        pools never do this; duplicate detection lives in
+        :func:`simulate_veto`).
+
+    Raises:
+        ValueError: If an as-of map has a null/NaN score or tied
+            scores, or ``k`` is not a positive finite real, or
+            ``date`` is null/unparseable/timezone-aware (all
+            propagated from
+            :func:`features.map_win_rate.team_map_win_rate`).
+        KeyError: If either table lacks a required column (propagated
+            from :func:`features.map_win_rate.team_map_win_rate` /
+            :func:`utils.asof.maps_as_of`).
+        TypeError: If ``date`` is list-like rather than a single
+            scalar timestamp (propagated from
+            :func:`utils.asof.parse_query_date`).
+        ConfigError: If a pool entry or any as-of map's ``map_name``
+            value is not a string (propagated from
+            :func:`utils.config.normalize_map_name`).
+    """
+    return {
+        config.normalize_map_name(name): map_win_rate.team_map_win_rate(
+            team_id, name, date, matches_df, maps_df, k
+        ).mean
+        for name in pool
+    }
+
+
 def simulate_veto(
     team_a_id: str,
     team_b_id: str,
@@ -179,11 +259,11 @@ def simulate_veto(
 
     Runs one of the fixed :data:`ACTION_SEQUENCES` action lists over
     the resolved 7-map pool. Each team's score for every pool map is
-    computed exactly once — the mean of
+    computed exactly once via :func:`team_map_scores` — the mean of
     :func:`features.map_win_rate.team_map_win_rate` at the single
     as-of ``date`` passed in (decision 5: the as-of snapshot cannot
-    change mid-simulation) — giving two ``{normalized_map_name: mean}``
-    dicts. The walk then alternates turns strictly by step-index parity
+    change mid-simulation) — giving two
+    ``{normalized_map_name: mean}`` dicts. The walk then alternates turns strictly by step-index parity
     (even -> ``team_a_id``, odd -> ``team_b_id``; decision 2), removes
     each chosen map from the ``remaining`` set, and picks:
 
@@ -308,18 +388,12 @@ def simulate_veto(
             "set and desync the veto walk"
         )
 
-    scores_a = {
-        name: map_win_rate.team_map_win_rate(
-            team_a_id, name, date, matches_df, maps_df, k
-        ).mean
-        for name in pool
-    }
-    scores_b = {
-        name: map_win_rate.team_map_win_rate(
-            team_b_id, name, date, matches_df, maps_df, k
-        ).mean
-        for name in pool
-    }
+    # Each team's score for every pool map is computed exactly once via
+    # the shared team_map_scores helper (extracted in M26 so the veto
+    # evaluation harness reuses the same computation rather than
+    # duplicating it).
+    scores_a = team_map_scores(team_a_id, pool, date, matches_df, maps_df, k)
+    scores_b = team_map_scores(team_b_id, pool, date, matches_df, maps_df, k)
 
     remaining = set(pool)
     actions: list[SimulatedVetoAction] = []

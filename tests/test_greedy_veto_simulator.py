@@ -20,6 +20,7 @@ from models.greedy_veto_simulator import (
     ACTION_SEQUENCES,
     SimulatedVetoAction,
     simulate_veto,
+    team_map_scores,
 )
 from utils import config
 
@@ -250,8 +251,65 @@ def _leak_tables():
 
 
 # --------------------------------------------------------------------------
-# plan#5a: Bo3 shape end-to-end + per-step independent argmin/argmax
+# plan#14: team_map_scores directly (the M26 extraction)
 # --------------------------------------------------------------------------
+
+
+def test_team_map_scores_matches_simulate_veto_values():  
+    # team_map_scores must return exactly the per-map means simulate_veto
+    # relies on: for each team, its shrunk win-rate posterior mean on
+    # every pool map, keyed by the normalized map name, computed
+    # independently with a direct team_map_win_rate call. The refactor
+    # changed no existing test's expected output, so this is the
+    # cross-check that keeps the two computation paths pinned together.
+    matches_df, maps_df = _league_tables()
+    for team_id in ("A", "B"):
+        scores = team_map_scores(
+            team_id, POOL, QUERY_DATE, matches_df, maps_df,
+            map_win_rate.DEFAULT_K,
+        )
+        assert set(scores) == set(POOL)
+        expected = {
+            name: map_win_rate.team_map_win_rate(
+                team_id, name, QUERY_DATE, matches_df, maps_df,
+                map_win_rate.DEFAULT_K,
+            ).mean
+            for name in POOL
+        }
+        for name in POOL:
+            assert scores[name] == pytest.approx(expected[name])
+
+
+def test_team_map_scores_normalizes_pool_names():
+    # The keys are normalized map names: a messy pool with mixed case
+    # and stray whitespace must produce the identical dict to the clean
+    # pool, with every key in canonical title-case form — the same
+    # normalization guarantee simulate_veto's caller-supplied pool gets.
+    matches_df, maps_df = _league_tables()
+    messy = (" abyss ", "ASCENT", "haven", "  lotus", "Split ", "SUMMIT", "Sunset ")
+    messy_scores = team_map_scores(
+        "A", messy, QUERY_DATE, matches_df, maps_df, map_win_rate.DEFAULT_K
+    )
+    clean_scores = team_map_scores(
+        "A", POOL, QUERY_DATE, matches_df, maps_df, map_win_rate.DEFAULT_K
+    )
+    assert messy_scores == clean_scores
+    assert set(messy_scores) == set(POOL)
+
+
+def test_team_map_scores_unknown_team_full_shrinkage():
+    # An unseen team has no history, so every shrunk mean collapses to
+    # the 0.5 prior on all maps — the full-shrinkage edge case the
+    # greedy walk's alphabetical tie-break relies on (the empty-league
+    # Bo3 test). The dict must still cover the whole pool with 0.5s.
+    matches_df, maps_df = _build([], [])
+    scores = team_map_scores(
+        "A", POOL, QUERY_DATE, matches_df, maps_df, map_win_rate.DEFAULT_K
+    )
+    assert set(scores) == set(POOL)
+    for name in POOL:
+        assert scores[name] == pytest.approx(0.5)
+
 
 
 def test_bo3_shape_and_independent_cross_check():
