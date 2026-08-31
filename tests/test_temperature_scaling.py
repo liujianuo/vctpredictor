@@ -27,6 +27,7 @@ Covers, in order of the M24 plan's checklist:
 
 import json
 import math
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -363,3 +364,98 @@ def test_from_dict_rejects_malformed_dicts():
         )
     with pytest.raises(KeyError):
         temperature_scaling.from_dict({k: v for k, v in good.items() if k != "temperature"})
+
+
+# --------------------------------------------------------------------------
+# plan#7: drivers/train_temperature_scaling.py
+# --------------------------------------------------------------------------
+
+
+def test_train_temperature_scaling_parse_args_defaults():
+    # The driver takes only --version (default v1) and --output-dir
+    # (default data); the grid/fold hyperparameters stay at the
+    # documented library defaults (decisions C/F), so there are no
+    # other flags to parse.
+    from drivers import train_temperature_scaling
+
+    args = train_temperature_scaling.parse_args([])
+    assert args.version == "v1"
+    assert args.output_dir == "data"
+
+
+@pytest.mark.skipif(
+    not _real_v1_available(),
+    reason="materialised v1 dataset not present (run materialize.py first)",
+)
+def test_train_temperature_scaling_raises_on_missing_base_artifact(tmp_path):
+    # The base ordinal_logit_model.json is the prerequisite: with the
+    # five tables present but the artifact absent, main() must fail
+    # fast with a clear FileNotFoundError (the "run train_ordinal_logit.py
+    # first" signal) rather than silently fitting against nothing.
+    from drivers import train_temperature_scaling
+
+    v1_dir = tmp_path / "v1"
+    v1_dir.mkdir()
+    for name in _REAL_V1_TABLES:
+        shutil.copy2(Path(f"data/v1/{name}.parquet"), v1_dir / f"{name}.parquet")
+    assert not (v1_dir / "ordinal_logit_model.json").exists()
+    with pytest.raises(FileNotFoundError):
+        train_temperature_scaling.main(
+            ["--version", "v1", "--output-dir", str(tmp_path)]
+        )
+
+
+@pytest.mark.skipif(
+    not _real_v1_available(),
+    reason="materialised v1 dataset + ordinal artifact not present (run "
+    "materialize.py and train_ordinal_logit.py first)",
+)
+def test_real_v1_train_temperature_scaling_end_to_end():
+    # The full M24 training loop against real data/v1: run the CLI
+    # (which assembles the walk-forward OOF calibration rows — 5
+    # per-fold ordinal refits over the 209-map train region — fits T by
+    # grid search, and writes data/v1/temperature_scaling_model.json),
+    # reload the artifact through from_dict, and assert the plan's
+    # artifact contract: 0 < temperature < 20 (the grid is clipped to
+    # [0.05, 20.0]), calibration_nll_at_t_star <= calibration_nll_at_t1
+    # (decision F's structural invariant), and the stored thresholds
+    # exactly equal the base ordinal_logit_model.json's thresholds (the
+    # decision-E provenance copy).
+    from drivers import train_temperature_scaling
+
+    rc = train_temperature_scaling.main(["--version", "v1"])
+    assert rc == 0
+
+    artifact_path = Path("data/v1/temperature_scaling_model.json")
+    assert artifact_path.exists()
+    model = temperature_scaling.from_dict(
+        json.loads(artifact_path.read_text(encoding="utf-8"))
+    )
+    assert 0.0 < model.temperature < 20.0
+    assert model.n_calibration > 0
+    assert model.calibration_nll_at_t_star <= (
+        model.calibration_nll_at_t1 + 1e-12
+    )
+    assert math.isfinite(model.calibration_nll_at_t1)
+    assert model.t_grid_min == 0.05
+    assert model.t_grid_max == 20.0
+    assert set(model.oof_coverage.keys()) == {
+        "train_matches",
+        "covered_matches",
+        "warmup_excluded_ids",
+        "warmup_excluded_count",
+    }
+
+    base_model = ordinal_logit.from_dict(
+        json.loads(
+            Path("data/v1/ordinal_logit_model.json").read_text(encoding="utf-8")
+        )
+    )
+    assert model.thresholds == pytest.approx(base_model.thresholds)
+    print(
+        "M24 temperature scaling on real v1 OOF calibration set: "
+        f"temperature={model.temperature!r} "
+        f"n_calibration={model.n_calibration!r} "
+        f"calibration_nll_at_t1={model.calibration_nll_at_t1!r} "
+        f"calibration_nll_at_t_star={model.calibration_nll_at_t_star!r}"
+    )
