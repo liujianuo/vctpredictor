@@ -923,6 +923,109 @@ def test_iter_teacher_forced_steps_rejects_unknown_acting_team():
         )
 
 
+def test_build_pick_training_examples_hand_checked_labels_and_opponents():
+    # The decision-14 builder on the hand-checked synthetic Bo3: two
+    # examples (one per pick step), each with the sorted remaining
+    # candidate list, the true picked map's index within it, and the
+    # opponent = the other id of {team1_id, team2_id}. The decider row
+    # is absent from the examples (its last remaining map is forced,
+    # not chosen).
+    held = _full_held_out_frame(_SYN_BO3_FULL_ROWS)
+    examples = ve.build_pick_training_examples(
+        held, _matches_df([]), _maps_df([]), map_pool=POOL
+    )
+    assert len(examples) == 2
+    expected = [
+        ("A", "B", ["Ascent", "Haven", "Lotus", "Summit", "Sunset"], 0),
+        ("B", "A", ["Haven", "Lotus", "Summit", "Sunset"], 1),
+    ]
+    for example, (acting, opponent, remaining, true_index) in zip(examples, expected):
+        assert example.acting_team_id == acting
+        assert example.opponent_team_id == opponent
+        assert list(example.remaining_maps) == remaining
+        assert example.true_map_index == true_index
+        assert example.date == "2026-08-23T12:15:00"
+
+
+def test_build_pick_training_examples_rejects_no_pick_rows():
+    # A held-out table with zero pick actions (only bans and a
+    # decider) has nothing to train a pick model on; fail loudly
+    # rather than returning an empty example list.
+    rows = [
+        ("syn1", 0, "A", "ban", "Abyss", "2026-08-23T12:15:00", "A", "B"),
+        ("syn1", 1, "B", "ban", "Split", "2026-08-23T12:15:00", "A", "B"),
+        ("syn1", 2, "A", "ban", "Ascent", "2026-08-23T12:15:00", "A", "B"),
+        ("syn1", 3, "B", "ban", "Lotus", "2026-08-23T12:15:00", "A", "B"),
+        ("syn1", 4, "A", "ban", "Haven", "2026-08-23T12:15:00", "A", "B"),
+        ("syn1", 5, "B", "ban", "Summit", "2026-08-23T12:15:00", "A", "B"),
+        ("syn1", 6, None, "decider", "Sunset", "2026-08-23T12:15:00", "A", "B"),
+    ]
+    held = _full_held_out_frame(rows)
+    with pytest.raises(ValueError, match="no pick veto actions"):
+        ve.build_pick_training_examples(
+            held, _matches_df([]), _maps_df([]), map_pool=POOL
+        )
+
+
+def test_build_pick_training_examples_excludes_deciders_by_action_filter():
+    # The decision-14 decider-exclusion regression: the number of pick
+    # training examples must equal the count of action == "pick" rows
+    # in the held-out table — never the count of decider (or ban) rows
+    # — so a future refactor of the shared generator's action tagging
+    # cannot silently leak a decider into the pick training set without
+    # failing this test.
+    held = _full_held_out_frame(_SYN_BO3_FULL_ROWS)
+    n_pick_rows = int((held["action"] == "pick").sum())
+    n_decider_rows = int((held["action"] == "decider").sum())
+    n_ban_rows = int((held["action"] == "ban").sum())
+    assert n_pick_rows == 2
+    assert n_decider_rows == 1
+    assert n_ban_rows == 4
+    examples = ve.build_pick_training_examples(
+        held, _matches_df([]), _maps_df([]), map_pool=POOL
+    )
+    assert len(examples) == n_pick_rows
+    assert len(examples) != n_decider_rows
+    assert len(examples) != n_ban_rows
+    # Every example must carry a real (non-decider) acting team and a
+    # resolved opponent.
+    for example in examples:
+        assert example.acting_team_id is not None
+        assert example.opponent_team_id is not None
+        assert example.opponent_team_id != example.acting_team_id
+        assert 0 <= example.true_map_index < len(example.remaining_maps)
+
+
+@pytest.mark.skipif(
+    not _real_v1_available(),
+    reason="materialised v1 dataset not present (run materialize.py and "
+    "splits.py first)",
+)
+def test_real_v1_pick_training_examples_on_train_split():
+    # The decision-14 builder on real v1 train split: 79 Bo3 matches
+    # (2 pick steps each = 158) plus 2 Bo5 matches (4 pick steps each =
+    # 8) give exactly 166 pick training examples, each with a resolved
+    # opponent (never None), a sorted remaining list whose true-map
+    # index is in range, and a date equal to its match's date. The
+    # 81 decider rows of the train split are excluded by the
+    # action == "pick" filter.
+    import pandas as pd
+
+    veto_df = pd.read_parquet("data/v1/veto_actions.parquet")
+    matches_df = pd.read_parquet("data/v1/matches.parquet")
+    splits_df = pd.read_parquet("data/v1/splits.parquet")
+    maps_df = pd.read_parquet("data/v1/maps.parquet")
+    held = ve.build_held_out_veto_matches(veto_df, matches_df, splits_df, split="train")
+    examples = ve.build_pick_training_examples(held, matches_df, maps_df)
+    assert len(examples) == 166
+    assert len({e.acting_team_id for e in examples}) > 1
+    for example in examples:
+        assert example.opponent_team_id is not None
+        assert example.opponent_team_id != example.acting_team_id
+        assert 0 <= example.true_map_index < len(example.remaining_maps)
+        assert sorted(example.remaining_maps) == list(example.remaining_maps)
+
+
 # A third scored arm for the multi-arm report tests: every step has
 # cross-entropy 0.5, top-1 True and top-3 True, so its aggregates are
 # mean_ce 0.5, top1 1.0, top3 1.0.

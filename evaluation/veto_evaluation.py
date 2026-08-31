@@ -189,6 +189,22 @@ BUILD and later milestones do not re-derive them):
     :func:`build_veto_evaluation_report` block and one delta block per
     non-baseline arm (``deltas_vs_<baseline_arm>``). The 2-arm builder
     is unchanged and still used by ``drivers/evaluate_veto.py``.
+14. **Pick training examples come from the same replay (M28), and the
+    decider exclusion falls out for free.**
+    :func:`build_pick_training_examples` walks the same shared
+    teacher-forced replay (:func:`_iter_teacher_forced_steps`,
+    unchanged — no edits needed to the M26/M27 generator itself) and
+    keeps only rows whose ``action == "pick"``, returning one frozen
+    :class:`PickTrainingExample` per pick step. **This is the entire
+    decider-exclusion mechanism**: the shared walk already tags each
+    step's real action (``"ban"``, ``"pick"``, or ``"decider"``), so
+    filtering to ``action == "pick"`` automatically drops every
+    decider row from the likelihood with no additional guard code —
+    exactly the same mechanism decision 12's
+    :func:`build_ban_training_examples` already uses to drop
+    picks/deciders when it filters to ``action == "ban"``. No
+    featurization happens at this layer (module-boundary standard,
+    unchanged from decision 12).
 
 Dependency rung: ``utils/ -> features/ -> models/ -> evaluation/ ->
 drivers/``. This module may depend downward on ``models.*``,
@@ -1183,6 +1199,138 @@ def build_ban_training_examples(
         raise ValueError(
             "build_ban_training_examples produced zero examples; the "
             "held-out table contains no ban veto actions"
+        )
+    return examples
+
+
+@dataclass(frozen=True)
+class PickTrainingExample:
+    """One teacher-forced training example for a per-step pick model (M28).
+
+    The raw (unfeaturized) record of one real pick step, produced by
+    :func:`build_pick_training_examples` from the shared teacher-forced
+    replay: the acting team, its opponent, the candidate set the pick
+    was made over, the as-of date, and the position of the real picked
+    map within that set. ``remaining_maps`` is the alphabetically
+    sorted (by normalized name) list of maps still in play at the step
+    (decision 3's ordering convention), so ``true_map_index`` is the
+    label a per-step softmax over ``remaining_maps`` is scored against
+    (the index whose probability the cross-entropy objective raises).
+    No featurization happens at this layer — that is the consuming
+    model's job, per the module-boundary standard (decision 14).
+
+    Attributes:
+        acting_team_id: The picking team's stable id (a string from
+            the resolved veto table's ``team_id`` column).
+        opponent_team_id: The other team's stable id (the other of the
+            match's ``{team1_id, team2_id}`` pair).
+        remaining_maps: The sorted tuple of candidate map names still
+            in play at this step (normalized, alphabetically ordered).
+        date: The step's as-of date string (the match's own date).
+        true_map_index: The index of the real picked map within
+            ``remaining_maps``.
+    """
+
+    acting_team_id: str
+    opponent_team_id: str
+    remaining_maps: tuple[str, ...]
+    date: str
+    true_map_index: int
+
+
+def build_pick_training_examples(
+    held_out_df: pd.DataFrame,
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+    map_pool=None,
+) -> list[PickTrainingExample]:
+    """Build the per-step pick training examples from a held-out veto table.
+
+    Walks the shared teacher-forced replay
+    (:func:`_iter_teacher_forced_steps`) and keeps only the rows whose
+    ``action == "pick"``, returning one frozen
+    :class:`PickTrainingExample` per pick step: the acting team, the
+    opponent (the other of the match's ``{team1_id, team2_id}`` pair),
+    the sorted remaining candidate list, the date, and
+    ``true_map_index = remaining_maps.index(true_map)`` — the position
+    of the real picked map within its own sorted candidate list, the
+    label a per-step softmax is scored against (decision 14).
+
+    **This filter is the entire decider-exclusion mechanism.** The
+    shared teacher-forced replay already tags every step's real action
+    (``"ban"``, ``"pick"``, or ``"decider"``), so filtering to
+    ``action == "pick"`` automatically drops every decider row from
+    the likelihood — the last remaining map at a decider step is
+    forced, not chosen, and must be excluded — with no additional
+    guard code. This is exactly the same mechanism
+    :func:`build_ban_training_examples` already uses to drop
+    picks/deciders when it filters to ``action == "ban"`` (decision
+    14; the roadmap's "decider steps must be excluded from the
+    likelihood" requirement is satisfied by construction, not by a
+    special case). The function returns raw ids/dates/candidate-lists
+    only; featurization of each candidate map is the consuming model's
+    job (decision 14's module-boundary note).
+
+    Args:
+        held_out_df: The held-out veto-step table from
+            :func:`build_held_out_veto_matches` (needs
+            :data:`HELD_OUT_VETO_COLUMNS` — at minimum ``match_id``,
+            ``step_index``, ``team_id``, ``action``, ``map_name``,
+            ``date``, plus ``team1_id``/``team2_id`` for opponent
+            resolution).
+        matches_df: The full materialised ``matches`` table, passed
+            through to the shared walk (used only by the optional
+            ``map_pool=None`` config-era resolution path).
+        maps_df: The full materialised ``maps`` table, passed through
+            to the shared walk unused.
+        map_pool: The pool to veto over, as an iterable of map names;
+            ``None`` (the default) resolves it per match from
+            ``config.json`` via :meth:`utils.config.Config.era_as_of`
+            on the match date's calendar date, exactly like
+            ``simulate_veto``.
+
+    Returns:
+        A list of :class:`PickTrainingExample` objects in
+        ``(match_id, step_index)`` replay order, one per pick step of
+        the held-out table. Never empty: a held-out table with no pick
+        rows raises instead.
+
+    Raises:
+        ValueError: If the held-out table contains no pick rows at all;
+            if a match's real normalized map-name set does not exactly
+            equal the resolved pool; if a pick row's acting ``team_id``
+            is neither of the match's ``team1_id``/``team2_id`` (an
+            unresolvable opponent); if ``map_pool=None`` and no era
+            covers the match's date or the config is invalid
+            (propagated from :meth:`utils.config.Config.era_as_of` /
+            :func:`utils.config.load_config`); or if ``date`` is
+            null/unparseable/timezone-aware (propagated from
+            :func:`utils.asof.parse_query_date`).
+        KeyError: If ``held_out_df`` lacks a required column
+            (propagated from pandas column indexing).
+        TypeError: If a match date is list-like (propagated from
+            :func:`utils.asof.parse_query_date`).
+    """
+    examples: list[PickTrainingExample] = []
+    for step in _iter_teacher_forced_steps(
+        held_out_df, matches_df, maps_df, map_pool
+    ):
+        if step["action"] != "pick":
+            continue
+        remaining_maps = step["sorted_remaining_maps"]
+        examples.append(
+            PickTrainingExample(
+                acting_team_id=step["acting_team_id"],
+                opponent_team_id=step["opponent_team_id"],
+                remaining_maps=tuple(remaining_maps),
+                date=step["date"],
+                true_map_index=remaining_maps.index(step["true_map"]),
+            )
+        )
+    if not examples:
+        raise ValueError(
+            "build_pick_training_examples produced zero examples; the "
+            "held-out table contains no pick veto actions"
         )
     return examples
 
