@@ -82,6 +82,7 @@ ALLOWED_UTILS_CROSS_IMPORT = "from utils.table_io import DEFAULT_OUTPUT_DIR"
 # unrelated to scraper.models (the scraper's pure cache dataclasses).
 MODELS_MODULES = (
     "binary_logit.py",
+    "conditional_logit_ban.py",
     "four_way_baseline.py",
     "greedy_veto_simulator.py",
     "multinomial_logit.py",
