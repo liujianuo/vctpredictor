@@ -455,9 +455,12 @@ def test_evaluate_registry_has_multinomial_logit(tmp_path):
     # plan#6: MODEL_REGISTRY must now hold the multinomial_logit key
     # (so --model choices pick it up automatically), and the stateful
     # factory must raise FileNotFoundError on a missing artifact.
+    # (The M24 ordinal_logit_temperature key was added by task 026 and
+    # is asserted here too so the exact-set guard stays current.)
     assert set(evaluate.MODEL_REGISTRY) == {
         "four_way_baseline",
         "ordinal_logit",
+        "ordinal_logit_temperature",
         "multinomial_logit",
     }
     model_fn = evaluate.MODEL_REGISTRY["four_way_baseline"](Path("data"), "v1")
