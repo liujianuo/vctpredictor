@@ -99,6 +99,7 @@ EVALUATION_MODULES = (
     "harness.py",
     "proportional_odds.py",
     "temperature_calibration.py",
+    "veto_evaluation.py",
 )
 
 

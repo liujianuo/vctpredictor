@@ -498,6 +498,32 @@ def load_splits_table(output_dir: Path, version: str) -> pd.DataFrame:
     return pd.read_parquet(Path(output_dir) / version / "splits.parquet")
 
 
+def load_veto_actions_table(output_dir: Path, version: str) -> pd.DataFrame:
+    """Load the materialised veto_actions table for a dataset version.
+
+    Thin wrapper around ``pandas.read_parquet`` isolating the file I/O
+    into one function (see :func:`load_matches_table`).
+
+    Args:
+        output_dir: The parent directory the version subdirectory
+            lives under (e.g. ``Path("data")``).
+        version: The dataset version subdirectory name (e.g.
+            ``"v1"``).
+
+    Returns:
+        The contents of ``<output_dir>/<version>/veto_actions.parquet``
+        as a ``pandas.DataFrame`` (M4's ``veto_actions`` table).
+
+    Raises:
+        FileNotFoundError: If ``veto_actions.parquet`` does not exist
+            for this version (i.e. ``materialize.py`` has not been run
+            for it) — propagated as-is from ``pandas.read_parquet``.
+        OSError: On any other file-access failure, also propagated
+            as-is.
+    """
+    return pd.read_parquet(Path(output_dir) / version / "veto_actions.parquet")
+
+
 def load_player_map_stats_table(output_dir: Path, version: str) -> pd.DataFrame:
     """Load the materialised player_map_stats table for a dataset version.
 
