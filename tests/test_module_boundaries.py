@@ -83,8 +83,9 @@ ALLOWED_UTILS_CROSS_IMPORT = "from utils.table_io import DEFAULT_OUTPUT_DIR"
 MODELS_MODULES = (
     "binary_logit.py",
     "four_way_baseline.py",
-    "ordinal_logit.py",
     "multinomial_logit.py",
+    "ordinal_logit.py",
+    "temperature_scaling.py",
 )
 
 # The modules that live under evaluation/ (the generic map-outcome
