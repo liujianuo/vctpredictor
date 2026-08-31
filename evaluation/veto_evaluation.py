@@ -154,6 +154,41 @@ BUILD and later milestones do not re-derive them):
     the CLI driver. This module must not import
     ``evaluation.harness`` (the module-boundary test forbids
     evaluation-to-evaluation imports) or anything from ``drivers/``.
+11. **The teacher-forced replay is a single shared walk (M27).** The
+    per-match pool resolution, the ``real_maps == pool`` guard, and the
+    ``remaining``-tracking walk over ``ordered.itertuples()`` live in
+    one private generator, :func:`_iter_teacher_forced_steps`, which
+    yields one record per *every* step (deciders included, tagged) with
+    ``match_id``, ``step_index``, ``action``, ``acting_team_id``,
+    ``opponent_team_id`` (the other id of the match's ``{team1_id,
+    team2_id}`` pair, resolved from the held-out row's own columns),
+    ``sorted_remaining_maps``, ``date`` and ``true_map``.
+    :func:`score_veto_steps` is a thin consumer of that generator, and
+    it gained an optional ``actions_to_score`` filter (default
+    ``None`` = score every non-decider step, exactly M26's behavior):
+    when given (e.g. ``{"ban"}``) steps whose action is not in the set
+    are skipped from scoring like deciders but still consumed for
+    ``remaining`` bookkeeping — this is what lets M27 score ban-only on
+    the same teacher-forced replay without a second bespoke loop.
+12. **Ban training examples come from the same replay (M27).**
+    :func:`build_ban_training_examples` walks
+    :func:`_iter_teacher_forced_steps` and keeps only ``action ==
+    "ban"`` rows, returning one frozen :class:`BanTrainingExample` per
+    ban step: acting/opponent team ids, the sorted remaining candidate
+    list, the date, and ``true_map_index`` (the position of the real
+    banned map within its own sorted candidate list — the label a
+    per-step softmax is scored against). No featurization happens here:
+    the function returns raw ids/dates/candidate-lists only, because
+    feature building is ``models/``'s job per the module-boundary
+    standard.
+13. **N-arm comparison report (M27).**
+    :func:`build_veto_multi_arm_report` generalises the 2-arm
+    :func:`build_veto_comparison_report` to any number of arms: the
+    same row-alignment guard (all arms must describe the identical
+    held-out rows at identical positions) plus one per-arm
+    :func:`build_veto_evaluation_report` block and one delta block per
+    non-baseline arm (``deltas_vs_<baseline_arm>``). The 2-arm builder
+    is unchanged and still used by ``drivers/evaluate_veto.py``.
 
 Dependency rung: ``utils/ -> features/ -> models/ -> evaluation/ ->
 drivers/``. This module may depend downward on ``models.*``,
@@ -165,6 +200,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -745,88 +781,80 @@ def most_frequent_map_baseline_model(
     return [value / renorm for value in floored]
 
 
-def score_veto_steps(
-    predictor_fn: VetoStepPredictorFn,
+def _iter_teacher_forced_steps(
     held_out_df: pd.DataFrame,
     matches_df: pd.DataFrame,
     maps_df: pd.DataFrame,
     map_pool=None,
-) -> pd.DataFrame:
-    """Teacher-forced per-step scoring of a predictor over held-out vetoes.
+):
+    """Yield one record per real veto step of every held-out match.
 
-    Replays each held-out match's *real* veto sequence (decision 4):
-    grouped by ``match_id`` (rows processed in ``step_index`` order),
-    it seeds ``remaining`` from ``map_pool`` or, if ``None``, from
+    The single shared teacher-forced replay (decision 11), extracted
+    from :func:`score_veto_steps`'s original loop body so the
+    bookkeeping is never duplicated: grouped by ``match_id`` (rows
+    processed in ``step_index`` order) it seeds ``remaining`` from
+    ``map_pool`` or, if ``None``, from
     ``utils.config.Config.era_as_of`` on the match's date — mirroring
-    ``models.greedy_veto_simulator.simulate_veto``'s resolution exactly.
-    For every non-decider step it calls
-    ``predictor_fn(acting_team_id, action, sorted(remaining), date,
-    matches_df, maps_df)`` (``sorted`` = alphabetical by normalized
-    name, decision 3), validates the returned vector's length equals
-    ``len(remaining)``, finds the true map's index within the sorted
-    list, computes the cross-entropy via ``utils.scoring.log_loss``,
-    computes the map's rank (probability descending, ties ascending by
-    name — decision 8), and then removes the *real* map from
-    ``remaining`` regardless of what the predictor favored (decision
-    4's teacher forcing). Decider steps are skipped entirely (decision
-    5) after removing nothing further.
-
-    Before replaying a match, the scorer verifies the match's real
-    normalized map-name set exactly equals the resolved pool (decision
-    2's fail-loud clause): if a future dataset version's real veto
-    mentions a map outside the era pool, or fails to consume the whole
-    pool, teacher forcing would silently mis-track ``remaining``, so
-    the mismatch raises instead.
+    ``models.greedy_veto_simulator.simulate_veto``'s resolution exactly
+    — verifies the match's real normalized map-name set exactly equals
+    the resolved pool (decision 2's fail-loud clause), and walks the
+    real sequence maintaining ``remaining``. Every step is yielded
+    *including* deciders (tagged by their ``action``), and after each
+    yield the *real* chosen map is removed from ``remaining``
+    regardless of any predictor's favorite (decision 4's teacher
+    forcing), so the yielded ``sorted_remaining_maps`` for step ``i``
+    is exactly the candidate set the real history so far leaves in
+    play.
 
     Args:
-        predictor_fn: Any callable satisfying
-            :data:`VetoStepPredictorFn` (returns a probability
-            distribution over the passed sorted ``remaining_maps``).
         held_out_df: The held-out veto-step table from
             :func:`build_held_out_veto_matches` (needs
             :data:`HELD_OUT_VETO_COLUMNS` — at minimum ``match_id``,
             ``step_index``, ``team_id``, ``action``, ``map_name``,
-            ``date``).
-        matches_df: The full materialised ``matches`` table, passed
-            through to ``predictor_fn`` unchanged.
+            ``date``; ``team1_id``/``team2_id`` optional, used only to
+            resolve the opponent id when present).
+        matches_df: The full materialised ``matches`` table (only used
+            for the optional ``map_pool=None`` config-era resolution
+            path; otherwise passed through unused).
         maps_df: The full materialised ``maps`` table, passed through
-            to ``predictor_fn`` unchanged.
+            unused (kept in the signature so consumers share the same
+            call shape).
         map_pool: The pool to veto over, as an iterable of map names;
             ``None`` (the default) resolves it per match from
             ``config.json`` via :meth:`utils.config.Config.era_as_of`
             on the match date's calendar date, exactly like
             ``simulate_veto``.
 
-    Returns:
-        A ``pandas.DataFrame`` with exactly :data:`SCORED_STEP_COLUMNS`
-        (``match_id, step_index, action, n_remaining, cross_entropy,
-        top1_correct, top3_correct``), one row per scored non-decider
-        step in ``(match_id, step_index)`` order. ``cross_entropy`` is
-        the per-step ``log_loss``, ``top1_correct``/``top3_correct``
-        are the per-step ranking booleans (decision 8), and
-        ``n_remaining`` is the candidate-set size at that step.
+    Yields:
+        One dict per veto step (deciders included) with keys:
+        ``match_id`` (the group's match id), ``step_index``,
+        ``action``, ``acting_team_id`` (the row's ``team_id``, or
+        ``None`` on decider rows), ``opponent_team_id`` (the other id
+        of the match's ``{team1_id, team2_id}`` pair when the row
+        carries those columns and the acting team is one of the two,
+        else ``None`` — on decider rows no acting side exists so no
+        opponent is resolved), ``sorted_remaining_maps`` (the sorted
+        list of maps still in play at this step, before this step's
+        choice is removed), ``date`` (the row's date), and ``true_map``
+        (the row's normalized map name).
 
     Raises:
-        ValueError: If ``predictor_fn`` returns a vector whose length
-            differs from ``len(remaining)`` (with the offending
-            match/step named); if ``scored_df`` would be empty (no
-            non-decider steps at all); if a match's real normalized
-            map-name set does not exactly equal the resolved pool; if
-            the true map's probability is 0 or the returned vector
-            fails the simplex validation (propagated from
-            :func:`utils.scoring.log_loss`); if ``map_pool=None`` and
-            no era covers the match's date or the config is invalid
-            (propagated from :meth:`utils.config.Config.era_as_of` /
+        ValueError: If a match's real normalized map-name set does not
+            exactly equal the resolved pool; if a non-decider row's
+            acting ``team_id`` is neither of the match's ``team1_id``/
+            ``team2_id`` (an unresolvable opponent — fail loudly
+            rather than emit a wrong training label); if
+            ``map_pool=None`` and no era covers the match's date or the
+            config is invalid (propagated from
+            :meth:`utils.config.Config.era_as_of` /
             :func:`utils.config.load_config`); or if ``date`` is
             null/unparseable/timezone-aware (propagated from
             :func:`utils.asof.parse_query_date`).
-        KeyError: If ``held_out_df`` lacks a required column or a
-            required table column is missing (propagated from pandas
-            and the predictor's own lookups).
+        KeyError: If ``held_out_df`` lacks a required column
+            (propagated from pandas column indexing).
         TypeError: If a match date is list-like (propagated from
             :func:`utils.asof.parse_query_date`).
     """
-    rows: list[dict] = []
     for match_id, group in held_out_df.groupby("match_id", sort=True):
         ordered = group.sort_values("step_index")
         match_date = ordered["date"].iloc[0]
@@ -848,52 +876,188 @@ def score_veto_steps(
         remaining = set(pool)
         for row in ordered.itertuples(index=False):
             action = row.action
-            if action == "decider":
-                # Decision 5: forced, not chosen — nothing to score and
-                # (trivially) nothing left to remove afterward.
-                continue
-            sorted_maps = sorted(remaining)
-            probs = list(
-                predictor_fn(
-                    row.team_id,
-                    action,
-                    sorted_maps,
-                    row.date,
-                    matches_df,
-                    maps_df,
-                )
-            )
-            if len(probs) != len(sorted_maps):
-                raise ValueError(
-                    f"predictor_fn returned {len(probs)} probabilities "
-                    f"for match {match_id!r} step {row.step_index} "
-                    f"(action {action!r}, {len(sorted_maps)} maps "
-                    "remaining); expected exactly "
-                    f"{len(sorted_maps)} aligned to the sorted "
-                    "remaining-maps order"
-                )
             true_map = config.normalize_map_name(row.map_name)
-            true_index = sorted_maps.index(true_map)
-            cross_entropy = scoring.log_loss(probs, true_index)
-            # Rank: probability descending, ties broken ascending by
-            # map name (one consistent secondary key — decision 8).
-            order = sorted(
-                range(len(sorted_maps)),
-                key=lambda i: (-probs[i], sorted_maps[i]),
-            )
-            rank = order.index(true_index) + 1
-            rows.append(
-                {
-                    "match_id": match_id,
-                    "step_index": row.step_index,
-                    "action": action,
-                    "n_remaining": len(sorted_maps),
-                    "cross_entropy": cross_entropy,
-                    "top1_correct": rank == 1,
-                    "top3_correct": rank <= min(3, len(sorted_maps)),
-                }
-            )
+            acting_team_id = row.team_id
+            # Opponent resolution: the other id of the match's
+            # {team1_id, team2_id} pair. The held-out builder's rows
+            # carry those columns (HELD_OUT_VETO_COLUMNS); hand-built
+            # minimal frames may not, in which case the opponent is
+            # left None (scoring never needs it; only the ban-example
+            # builder consumes it, and that path always feeds full
+            # held-out rows).
+            opponent_team_id: str | None = None
+            if acting_team_id is not None:
+                try:
+                    team1_id = str(row.team1_id)
+                    team2_id = str(row.team2_id)
+                except AttributeError:
+                    team1_id = None
+                    team2_id = None
+                if team1_id is not None:
+                    acting_str = str(acting_team_id)
+                    if acting_str == team1_id:
+                        opponent_team_id = team2_id
+                    elif acting_str == team2_id:
+                        opponent_team_id = team1_id
+                    else:
+                        raise ValueError(
+                            f"veto match {match_id!r} step "
+                            f"{row.step_index}: acting team "
+                            f"{acting_team_id!r} is neither of the "
+                            f"match's {{team1_id, team2_id}} pair "
+                            f"{sorted({team1_id, team2_id})}; the "
+                            "opponent cannot be resolved"
+                        )
+            yield {
+                "match_id": match_id,
+                "step_index": row.step_index,
+                "action": action,
+                "acting_team_id": acting_team_id,
+                "opponent_team_id": opponent_team_id,
+                "sorted_remaining_maps": sorted(remaining),
+                "date": row.date,
+                "true_map": true_map,
+            }
             remaining.remove(true_map)
+
+
+def score_veto_steps(
+    predictor_fn: VetoStepPredictorFn,
+    held_out_df: pd.DataFrame,
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+    map_pool=None,
+    actions_to_score: set[str] | None = None,
+) -> pd.DataFrame:
+    """Teacher-forced per-step scoring of a predictor over held-out vetoes.
+
+    A thin consumer of the shared teacher-forced walk
+    :func:`_iter_teacher_forced_steps` (decision 11): for every yielded
+    non-decider step (and, when ``actions_to_score`` is given, every
+    yielded step whose ``action`` is in that set) it calls
+    ``predictor_fn(acting_team_id, action, sorted_remaining_maps,
+    date, matches_df, maps_df)`` (``sorted`` = alphabetical by
+    normalized name, decision 3), validates the returned vector's
+    length equals ``len(remaining)``, finds the true map's index
+    within the sorted list, computes the cross-entropy via
+    ``utils.scoring.log_loss``, and computes the map's rank
+    (probability descending, ties ascending by name — decision 8).
+    Decider steps are skipped entirely (decision 5), and steps whose
+    action is not in ``actions_to_score`` are skipped from scoring too
+    (but still consumed for ``remaining`` bookkeeping by the
+    generator), which is what lets M27 score ban-only on the same full
+    replay.
+
+    Args:
+        predictor_fn: Any callable satisfying
+            :data:`VetoStepPredictorFn` (returns a probability
+            distribution over the passed sorted ``remaining_maps``).
+        held_out_df: The held-out veto-step table from
+            :func:`build_held_out_veto_matches` (needs
+            :data:`HELD_OUT_VETO_COLUMNS` — at minimum ``match_id``,
+            ``step_index``, ``team_id``, ``action``, ``map_name``,
+            ``date``).
+        matches_df: The full materialised ``matches`` table, passed
+            through to ``predictor_fn`` unchanged.
+        maps_df: The full materialised ``maps`` table, passed through
+            to ``predictor_fn`` unchanged.
+        map_pool: The pool to veto over, as an iterable of map names;
+            ``None`` (the default) resolves it per match from
+            ``config.json`` via :meth:`utils.config.Config.era_as_of`
+            on the match date's calendar date, exactly like
+            ``simulate_veto``.
+        actions_to_score: An optional set of actions to score (e.g.
+            ``{"ban"}``); ``None`` (the default) scores every
+            non-decider step, exactly M26's behavior — fully
+            backward-compatible for the existing call sites. Steps
+            whose action is not in the set are skipped from scoring
+            like deciders, but are still consumed for ``remaining``
+            bookkeeping by the shared walk.
+
+    Returns:
+        A ``pandas.DataFrame`` with exactly :data:`SCORED_STEP_COLUMNS`
+        (``match_id, step_index, action, n_remaining, cross_entropy,
+        top1_correct, top3_correct``), one row per scored step in
+        ``(match_id, step_index)`` order. ``cross_entropy`` is the
+        per-step ``log_loss``, ``top1_correct``/``top3_correct`` are
+        the per-step ranking booleans (decision 8), and
+        ``n_remaining`` is the candidate-set size at that step.
+
+    Raises:
+        ValueError: If ``predictor_fn`` returns a vector whose length
+            differs from ``len(remaining)`` (with the offending
+            match/step named); if ``scored_df`` would be empty (no
+            scoreable steps at all); if a match's real normalized
+            map-name set does not exactly equal the resolved pool; if
+            a non-decider acting team is neither of the match's two
+            team ids; if the true map's probability is 0 or the
+            returned vector fails the simplex validation (propagated
+            from :func:`utils.scoring.log_loss`); if ``map_pool=None``
+            and no era covers the match's date or the config is
+            invalid (propagated from
+            :meth:`utils.config.Config.era_as_of` /
+            :func:`utils.config.load_config`); or if ``date`` is
+            null/unparseable/timezone-aware (propagated from
+            :func:`utils.asof.parse_query_date`).
+        KeyError: If ``held_out_df`` lacks a required column or a
+            required table column is missing (propagated from pandas
+            and the predictor's own lookups).
+        TypeError: If a match date is list-like (propagated from
+            :func:`utils.asof.parse_query_date`).
+    """
+    rows: list[dict] = []
+    for step in _iter_teacher_forced_steps(
+        held_out_df, matches_df, maps_df, map_pool
+    ):
+        action = step["action"]
+        if action == "decider":
+            # Decision 5: forced, not chosen — nothing to score.
+            continue
+        if actions_to_score is not None and action not in actions_to_score:
+            # Decision 11: score only the requested actions (e.g. bans
+            # only); the generator still consumed this step's real map
+            # for remaining bookkeeping.
+            continue
+        sorted_maps = step["sorted_remaining_maps"]
+        probs = list(
+            predictor_fn(
+                step["acting_team_id"],
+                action,
+                sorted_maps,
+                step["date"],
+                matches_df,
+                maps_df,
+            )
+        )
+        if len(probs) != len(sorted_maps):
+            raise ValueError(
+                f"predictor_fn returned {len(probs)} probabilities "
+                f"for match {step['match_id']!r} step "
+                f"{step['step_index']} (action {action!r}, "
+                f"{len(sorted_maps)} maps remaining); expected exactly "
+                f"{len(sorted_maps)} aligned to the sorted "
+                "remaining-maps order"
+            )
+        true_index = sorted_maps.index(step["true_map"])
+        cross_entropy = scoring.log_loss(probs, true_index)
+        # Rank: probability descending, ties broken ascending by
+        # map name (one consistent secondary key — decision 8).
+        order = sorted(
+            range(len(sorted_maps)),
+            key=lambda i: (-probs[i], sorted_maps[i]),
+        )
+        rank = order.index(true_index) + 1
+        rows.append(
+            {
+                "match_id": step["match_id"],
+                "step_index": step["step_index"],
+                "action": action,
+                "n_remaining": len(sorted_maps),
+                "cross_entropy": cross_entropy,
+                "top1_correct": rank == 1,
+                "top3_correct": rank <= min(3, len(sorted_maps)),
+            }
+        )
 
     if not rows:
         raise ValueError(
@@ -901,6 +1065,126 @@ def score_veto_steps(
             "table contains no non-decider veto actions"
         )
     return pd.DataFrame(rows, columns=SCORED_STEP_COLUMNS)
+
+
+@dataclass(frozen=True)
+class BanTrainingExample:
+    """One teacher-forced training example for a per-step ban model (M27).
+
+    The raw (unfeaturized) record of one real ban step, produced by
+    :func:`build_ban_training_examples` from the shared teacher-forced
+    replay: the acting team, its opponent, the candidate set the ban
+    was made over, the as-of date, and the position of the real banned
+    map within that set. ``remaining_maps`` is the alphabetically
+    sorted (by normalized name) list of maps still in play at the step
+    (decision 3's ordering convention), so ``true_map_index`` is the
+    label a per-step softmax over ``remaining_maps`` is scored against
+    (the index whose probability the cross-entropy objective raises).
+    No featurization happens at this layer — that is the consuming
+    model's job, per the module-boundary standard (decision 12).
+
+    Attributes:
+        acting_team_id: The banning team's stable id (a string from
+            the resolved veto table's ``team_id`` column).
+        opponent_team_id: The other team's stable id (the other of the
+            match's ``{team1_id, team2_id}`` pair).
+        remaining_maps: The sorted tuple of candidate map names still
+            in play at this step (normalized, alphabetically ordered).
+        date: The step's as-of date string (the match's own date).
+        true_map_index: The index of the real banned map within
+            ``remaining_maps``.
+    """
+
+    acting_team_id: str
+    opponent_team_id: str
+    remaining_maps: tuple[str, ...]
+    date: str
+    true_map_index: int
+
+
+def build_ban_training_examples(
+    held_out_df: pd.DataFrame,
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+    map_pool=None,
+) -> list[BanTrainingExample]:
+    """Build the per-step ban training examples from a held-out veto table.
+
+    Walks the shared teacher-forced replay
+    (:func:`_iter_teacher_forced_steps`) and keeps only the rows whose
+    ``action == "ban"``, returning one frozen
+    :class:`BanTrainingExample` per ban step: the acting team, the
+    opponent (the other of the match's ``{team1_id, team2_id}`` pair),
+    the sorted remaining candidate list, the date, and
+    ``true_map_index = remaining_maps.index(true_map)`` — the position
+    of the real banned map within its own sorted candidate list, the
+    label a per-step softmax is scored against (decision 12). The
+    function returns raw ids/dates/candidate-lists only; featurization
+    of each candidate map is the consuming model's job (decision 12's
+    module-boundary note).
+
+    Args:
+        held_out_df: The held-out veto-step table from
+            :func:`build_held_out_veto_matches` (needs
+            :data:`HELD_OUT_VETO_COLUMNS` — at minimum ``match_id``,
+            ``step_index``, ``team_id``, ``action``, ``map_name``,
+            ``date``, plus ``team1_id``/``team2_id`` for opponent
+            resolution).
+        matches_df: The full materialised ``matches`` table, passed
+            through to the shared walk (used only by the optional
+            ``map_pool=None`` config-era resolution path).
+        maps_df: The full materialised ``maps`` table, passed through
+            to the shared walk unused.
+        map_pool: The pool to veto over, as an iterable of map names;
+            ``None`` (the default) resolves it per match from
+            ``config.json`` via :meth:`utils.config.Config.era_as_of`
+            on the match date's calendar date, exactly like
+            ``simulate_veto``.
+
+    Returns:
+        A list of :class:`BanTrainingExample` objects in
+        ``(match_id, step_index)`` replay order, one per ban step of
+        the held-out table. Never empty: a held-out table with no ban
+        rows raises instead.
+
+    Raises:
+        ValueError: If the held-out table contains no ban rows at all;
+            if a match's real normalized map-name set does not exactly
+            equal the resolved pool; if a ban row's acting ``team_id``
+            is neither of the match's ``team1_id``/``team2_id`` (an
+            unresolvable opponent); if ``map_pool=None`` and no era
+            covers the match's date or the config is invalid
+            (propagated from :meth:`utils.config.Config.era_as_of` /
+            :func:`utils.config.load_config`); or if ``date`` is
+            null/unparseable/timezone-aware (propagated from
+            :func:`utils.asof.parse_query_date`).
+        KeyError: If ``held_out_df`` lacks a required column
+            (propagated from pandas column indexing).
+        TypeError: If a match date is list-like (propagated from
+            :func:`utils.asof.parse_query_date`).
+    """
+    examples: list[BanTrainingExample] = []
+    for step in _iter_teacher_forced_steps(
+        held_out_df, matches_df, maps_df, map_pool
+    ):
+        if step["action"] != "ban":
+            continue
+        remaining_maps = step["sorted_remaining_maps"]
+        examples.append(
+            BanTrainingExample(
+                acting_team_id=step["acting_team_id"],
+                opponent_team_id=step["opponent_team_id"],
+                remaining_maps=tuple(remaining_maps),
+                date=step["date"],
+                true_map_index=remaining_maps.index(step["true_map"]),
+            )
+        )
+    if not examples:
+        raise ValueError(
+            "build_ban_training_examples produced zero examples; the "
+            "held-out table contains no ban veto actions"
+        )
+    return examples
 
 
 def build_veto_evaluation_report(scored_df: pd.DataFrame) -> dict:
@@ -1068,3 +1352,123 @@ def build_veto_comparison_report(
             ),
         },
     }
+
+
+def build_veto_multi_arm_report(
+    scored_by_arm: dict[str, pd.DataFrame],
+    baseline_arm: str,
+) -> dict:
+    """Build the N-arm comparison report over identically-scored tables.
+
+    Decision 13's generalisation of :func:`build_veto_comparison_report`
+    to any number of arms (M27 compares three: the conditional-logit
+    model, the M25 greedy arm, and the frequency baseline): takes one
+    scored table per arm from :func:`score_veto_steps` (all produced on
+    the *identical* held-out rows, in the identical order), validates
+    they are all row-aligned (same ``(match_id, step_index)`` pairs at
+    the same positions across every arm — a misaligned comparison
+    would silently pair two different steps' scores and corrupt every
+    delta), and returns ``{arm_name: <report>, "deltas_vs_<baseline>":
+    {arm_name: {...}}}`` where each arm's block is the
+    :func:`build_veto_evaluation_report` dict for that arm and the
+    delta block holds one ``{mean_cross_entropy, top1_accuracy,
+    top3_accuracy}`` dict per *non-baseline* arm, each arm-minus-
+    baseline (a negative cross-entropy delta means the arm is
+    better-calibrated; a positive accuracy delta means the arm ranks
+    better). The report asserts no direction for the deltas — the
+    actually-measured values are an empirical finding, not an assumed
+    one.
+
+    Args:
+        scored_by_arm: A dict mapping each arm's name to its
+            :func:`score_veto_steps` table (needs
+            :data:`SCORED_STEP_COLUMNS`). At least two arms are
+            required (a one-arm "comparison" is meaningless).
+        baseline_arm: The arm every delta is measured against; must be
+            a key of ``scored_by_arm``. The baseline arm's own report
+            block appears like any other arm's, but it has no delta
+            entry in the delta block.
+
+    Returns:
+        A dict with one key per arm name (each the
+        :func:`build_veto_evaluation_report` dict for that arm) plus
+        the key ``"deltas_vs_<baseline_arm>"`` mapping each non-
+        baseline arm name to its ``{"mean_cross_entropy": float,
+        "top1_accuracy": float, "top3_accuracy": float}`` dict of
+        arm-minus-baseline deltas. Every value is a plain
+        str/int/float/list/dict, so the whole dict is directly
+        ``json.dumps``-serializable.
+
+    Raises:
+        ValueError: If ``scored_by_arm`` has fewer than two arms; if
+            ``baseline_arm`` is not a key of ``scored_by_arm``; if any
+            two arms' scored tables have different row counts or
+            differ in any ``(match_id, step_index)`` pair at the same
+            position (the row-alignment contract, mirroring
+            :func:`build_veto_comparison_report`'s guard); or if any
+            arm's table is empty (propagated from
+            :func:`build_veto_evaluation_report`).
+        KeyError: If any arm's table lacks a
+            :data:`SCORED_STEP_COLUMNS` column (propagated from pandas
+            column indexing).
+    """
+    if len(scored_by_arm) < 2:
+        raise ValueError(
+            f"build_veto_multi_arm_report needs at least two arms to "
+            f"compare, got {len(scored_by_arm)}"
+        )
+    if baseline_arm not in scored_by_arm:
+        raise ValueError(
+            f"baseline_arm {baseline_arm!r} is not a scored arm; got "
+            f"arms {sorted(scored_by_arm)}"
+        )
+
+    arm_names = list(scored_by_arm)
+    reference_ids = scored_by_arm[arm_names[0]][list(_STEP_ID_COLUMNS)].to_numpy()
+    for name in arm_names[1:]:
+        scored = scored_by_arm[name]
+        if len(scored) != len(reference_ids):
+            raise ValueError(
+                f"scored tables have different row counts: "
+                f"{arm_names[0]} {len(reference_ids)} vs {name} "
+                f"{len(scored)}; they must describe the same held-out "
+                "veto steps"
+            )
+        arm_ids = scored[list(_STEP_ID_COLUMNS)].to_numpy()
+        mismatch_mask = arm_ids != reference_ids
+        if mismatch_mask.any():
+            idx = int(np.argmax(mismatch_mask.any(axis=1)))
+            raise ValueError(
+                "scored tables are not row-aligned: the held-out veto "
+                f"steps differ at position {idx} ("
+                f"{arm_names[0]} {tuple(reference_ids[idx])!r} vs "
+                f"{name} {tuple(arm_ids[idx])!r}); score all arms on "
+                "the identical build_held_out_veto_matches table"
+            )
+
+    arm_reports = {
+        name: build_veto_evaluation_report(scored)
+        for name, scored in scored_by_arm.items()
+    }
+    report = dict(arm_reports)
+    baseline_report = arm_reports[baseline_arm]
+    deltas_key = f"deltas_vs_{baseline_arm}"
+    report[deltas_key] = {}
+    for name, arm_report in arm_reports.items():
+        if name == baseline_arm:
+            continue
+        report[deltas_key][name] = {
+            "mean_cross_entropy": (
+                arm_report["mean_cross_entropy"]
+                - baseline_report["mean_cross_entropy"]
+            ),
+            "top1_accuracy": (
+                arm_report["top1_accuracy"]
+                - baseline_report["top1_accuracy"]
+            ),
+            "top3_accuracy": (
+                arm_report["top3_accuracy"]
+                - baseline_report["top3_accuracy"]
+            ),
+        }
+    return report

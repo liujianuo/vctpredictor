@@ -781,6 +781,225 @@ def test_comparison_report_rejects_misaligned_rows():
 
 
 # --------------------------------------------------------------------------
+# plan#12-13 (M27): actions_to_score filter, ban training examples,
+# multi-arm report
+# --------------------------------------------------------------------------
+
+
+def _full_held_out_frame(rows):
+    """Build a held-out frame with team1_id/team2_id for opponent resolution.
+
+    Extends :func:`_held_out_frame` with the ``team1_id``/``team2_id``
+    columns of :data:`ve.HELD_OUT_VETO_COLUMNS`, which the shared
+    teacher-forced walk needs to resolve each step's opponent.
+
+    Args:
+        rows: A list of ``(match_id, step_index, team_id, action,
+            map_name, date, team1_id, team2_id)`` tuples.
+
+    Returns:
+        A ``pandas.DataFrame`` with exactly those eight columns, in
+        that order.
+
+    Raises:
+        Nothing.
+    """
+    columns = [
+        "match_id",
+        "step_index",
+        "team_id",
+        "action",
+        "map_name",
+        "date",
+        "team1_id",
+        "team2_id",
+    ]
+    return pd.DataFrame(rows, columns=columns)
+
+
+# The synthetic Bo3 (same as _SYN_BO3_ROWS) with team1_id/team2_id
+# appended so opponent resolution is exercised. Expected ban examples:
+#   step 0: A bans Abyss over the 7-map pool      -> idx 0, opponent B
+#   step 1: B bans Split over 6 maps              -> idx 3, opponent A
+#   step 2/3: picks (skipped)
+#   step 4: A bans Haven over [Haven, Summit, Sunset] -> idx 0, opp B
+#   step 5: B bans Summit over [Summit, Sunset]   -> idx 0, opponent A
+_SYN_BO3_FULL_ROWS = [
+    ("syn1", 0, "A", "ban", "Abyss", "2026-08-23T12:15:00", "A", "B"),
+    ("syn1", 1, "B", "ban", "Split", "2026-08-23T12:15:00", "A", "B"),
+    ("syn1", 2, "A", "pick", "Ascent", "2026-08-23T12:15:00", "A", "B"),
+    ("syn1", 3, "B", "pick", "Lotus", "2026-08-23T12:15:00", "A", "B"),
+    ("syn1", 4, "A", "ban", "Haven", "2026-08-23T12:15:00", "A", "B"),
+    ("syn1", 5, "B", "ban", "Summit", "2026-08-23T12:15:00", "A", "B"),
+    ("syn1", 6, None, "decider", "Sunset", "2026-08-23T12:15:00", "A", "B"),
+]
+
+
+def test_score_veto_steps_actions_to_score_filters_but_keeps_bookkeeping():
+    # The decision-11 filter: with actions_to_score={"ban"} only the
+    # four ban steps are scored (in the same remaining order as the
+    # full replay — the picks in between are skipped from scoring but
+    # still consumed for remaining bookkeeping), so the step-4 ban sees
+    # 3 maps and the step-5 ban sees 2, exactly as the full run does.
+    held = _held_out_frame(
+        [dict(zip(("match_id", "step_index", "team_id", "action", "map_name", "date"), row)) for row in _SYN_BO3_ROWS]
+    )
+    scored = ve.score_veto_steps(
+        _uniform_stub,
+        held,
+        _matches_df([]),
+        _maps_df([]),
+        map_pool=POOL,
+        actions_to_score={"ban"},
+    )
+    assert list(scored["action"]) == ["ban", "ban", "ban", "ban"]
+    assert list(scored["n_remaining"]) == [7, 6, 3, 2]
+    assert list(scored["cross_entropy"]) == pytest.approx(
+        [math.log(7), math.log(6), math.log(3), math.log(2)]
+    )
+    assert list(scored["top1_correct"]) == [True, False, True, True]
+
+
+def test_build_ban_training_examples_hand_checked_labels_and_opponents():
+    # The decision-12 builder on the hand-checked synthetic Bo3: four
+    # examples (one per ban step), each with the sorted remaining
+    # candidate list, the true banned map's index within it, and the
+    # opponent = the other id of {team1_id, team2_id}.
+    held = _full_held_out_frame(_SYN_BO3_FULL_ROWS)
+    examples = ve.build_ban_training_examples(
+        held, _matches_df([]), _maps_df([]), map_pool=POOL
+    )
+    assert len(examples) == 4
+    expected = [
+        ("A", "B", ["Abyss", "Ascent", "Haven", "Lotus", "Split", "Summit", "Sunset"], 0),
+        ("B", "A", ["Ascent", "Haven", "Lotus", "Split", "Summit", "Sunset"], 3),
+        ("A", "B", ["Haven", "Summit", "Sunset"], 0),
+        ("B", "A", ["Summit", "Sunset"], 0),
+    ]
+    for example, (acting, opponent, remaining, true_index) in zip(examples, expected):
+        assert example.acting_team_id == acting
+        assert example.opponent_team_id == opponent
+        assert list(example.remaining_maps) == remaining
+        assert example.true_map_index == true_index
+        assert example.date == "2026-08-23T12:15:00"
+
+
+def test_build_ban_training_examples_rejects_no_ban_rows():
+    # A held-out table with zero ban actions has nothing to train on;
+    # fail loudly rather than returning an empty example list.
+    rows = [
+        ("syn1", 0, "A", "pick", "Abyss", "2026-08-23T12:15:00", "A", "B"),
+        ("syn1", 1, "B", "pick", "Split", "2026-08-23T12:15:00", "A", "B"),
+        ("syn1", 2, "A", "pick", "Ascent", "2026-08-23T12:15:00", "A", "B"),
+        ("syn1", 3, "B", "pick", "Lotus", "2026-08-23T12:15:00", "A", "B"),
+        ("syn1", 4, "A", "pick", "Haven", "2026-08-23T12:15:00", "A", "B"),
+        ("syn1", 5, "B", "pick", "Summit", "2026-08-23T12:15:00", "A", "B"),
+        ("syn1", 6, None, "decider", "Sunset", "2026-08-23T12:15:00", "A", "B"),
+    ]
+    held = _full_held_out_frame(rows)
+    with pytest.raises(ValueError, match="no ban veto actions"):
+        ve.build_ban_training_examples(
+            held, _matches_df([]), _maps_df([]), map_pool=POOL
+        )
+
+
+def test_iter_teacher_forced_steps_rejects_unknown_acting_team():
+    # A non-decider row whose acting team is neither of the match's
+    # {team1_id, team2_id} pair cannot have its opponent resolved; the
+    # shared walk must fail loudly instead of emitting a wrong label.
+    rows = [
+        ("syn1", 0, "GHOST", "ban", "Abyss", "2026-08-23T12:15:00", "A", "B"),
+        ("syn1", 1, "B", "ban", "Split", "2026-08-23T12:15:00", "A", "B"),
+        ("syn1", 2, "A", "pick", "Ascent", "2026-08-23T12:15:00", "A", "B"),
+        ("syn1", 3, "B", "pick", "Lotus", "2026-08-23T12:15:00", "A", "B"),
+        ("syn1", 4, "A", "ban", "Haven", "2026-08-23T12:15:00", "A", "B"),
+        ("syn1", 5, "B", "ban", "Summit", "2026-08-23T12:15:00", "A", "B"),
+        ("syn1", 6, None, "decider", "Sunset", "2026-08-23T12:15:00", "A", "B"),
+    ]
+    held = _full_held_out_frame(rows)
+    with pytest.raises(ValueError, match="neither of"):
+        ve.build_ban_training_examples(
+            held, _matches_df([]), _maps_df([]), map_pool=POOL
+        )
+
+
+# A third scored arm for the multi-arm report tests: every step has
+# cross-entropy 0.5, top-1 True and top-3 True, so its aggregates are
+# mean_ce 0.5, top1 1.0, top3 1.0.
+_CL_ROWS = [
+    ("m1", 0, "ban", 7, 0.5, True, True),
+    ("m1", 1, "pick", 6, 0.5, True, True),
+    ("m1", 2, "ban", 5, 0.5, True, True),
+    ("m2", 0, "ban", 7, 0.5, True, True),
+    ("m2", 1, "pick", 6, 0.5, True, True),
+    ("m2", 2, "ban", 5, 0.5, True, True),
+]
+
+
+def test_multi_arm_report_shape_deltas_and_json():
+    # The N-arm report holds one block per arm plus a per-non-baseline-
+    # arm delta block (arm minus baseline), and the whole dict
+    # round-trips through json. Hand-computed: conditional_logit
+    # mean_ce 0.5 vs baseline 2.0 -> -1.5; greedy deltas match the
+    # 2-arm report's (0.0 / +4/6 / -2/6).
+    greedy = _scored_frame(_GREEDY_ROWS)
+    baseline = _scored_frame(_BASELINE_ROWS)
+    cl = _scored_frame(_CL_ROWS)
+    report = ve.build_veto_multi_arm_report(
+        {"conditional_logit": cl, "greedy": greedy, "baseline": baseline},
+        baseline_arm="baseline",
+    )
+    assert set(report) == {"conditional_logit", "greedy", "baseline", "deltas_vs_baseline"}
+    assert report["conditional_logit"]["n_steps"] == 6
+    assert report["conditional_logit"]["mean_cross_entropy"] == pytest.approx(0.5)
+    assert report["conditional_logit"]["top1_accuracy"] == pytest.approx(1.0)
+    deltas = report["deltas_vs_baseline"]
+    assert set(deltas) == {"conditional_logit", "greedy"}
+    assert deltas["conditional_logit"]["mean_cross_entropy"] == pytest.approx(-1.5)
+    assert deltas["conditional_logit"]["top1_accuracy"] == pytest.approx(1.0)
+    assert deltas["conditional_logit"]["top3_accuracy"] == pytest.approx(0.0)
+    assert deltas["greedy"]["mean_cross_entropy"] == pytest.approx(0.0)
+    assert deltas["greedy"]["top1_accuracy"] == pytest.approx(4 / 6)
+    assert deltas["greedy"]["top3_accuracy"] == pytest.approx(-2 / 6)
+    serialized = json.dumps(report, sort_keys=True)
+    assert json.loads(serialized) == report
+
+
+def test_multi_arm_report_rejects_misaligned_rows():
+    # Different row counts, or the same rows with a different id at the
+    # same position, are misalignments across every arm pair; a
+    # baseline arm that is not scored, or a single-arm dict, is also
+    # rejected.
+    greedy = _scored_frame(_GREEDY_ROWS)
+    baseline = _scored_frame(_BASELINE_ROWS)
+    cl = _scored_frame(_CL_ROWS)
+    with pytest.raises(ValueError, match="row counts"):
+        ve.build_veto_multi_arm_report(
+            {"conditional_logit": cl, "greedy": greedy, "baseline": baseline[:-1]},
+            baseline_arm="baseline",
+        )
+    swapped = [
+        ("m9", 0, action, n, ce, t1, t3) if mid == "m1" else (mid, i, action, n, ce, t1, t3)
+        for (mid, i, action, n, ce, t1, t3) in _BASELINE_ROWS
+    ]
+    with pytest.raises(ValueError, match="not row-aligned"):
+        ve.build_veto_multi_arm_report(
+            {"conditional_logit": cl, "greedy": greedy, "baseline": _scored_frame(swapped)},
+            baseline_arm="baseline",
+        )
+    with pytest.raises(ValueError, match="baseline_arm"):
+        ve.build_veto_multi_arm_report(
+            {"conditional_logit": cl, "greedy": greedy},
+            baseline_arm="not_an_arm",
+        )
+    with pytest.raises(ValueError, match="at least two arms"):
+        ve.build_veto_multi_arm_report(
+            {"greedy": greedy},
+            baseline_arm="greedy",
+        )
+
+
+# --------------------------------------------------------------------------
 # plan#15g: real v1 end-to-end via the CLI
 # --------------------------------------------------------------------------
 
@@ -858,3 +1077,32 @@ def test_real_v1_veto_evaluation_end_to_end():
         f"top1={artifact['delta']['top1_accuracy']!r} "
         f"top3={artifact['delta']['top3_accuracy']!r}"
     )
+
+
+@pytest.mark.skipif(
+    not _real_v1_available(),
+    reason="materialised v1 dataset not present (run materialize.py and "
+    "splits.py first)",
+)
+def test_real_v1_ban_training_examples_on_train_split():
+    # The decision-12 builder on real v1 train split: 81 matches have
+    # veto rows, of which 79 are Bo3 (4 ban steps each = 316) and 2 are
+    # Bo5 (2 ban steps each = 4), so exactly 320 ban training examples,
+    # each with a resolved opponent (never None), a sorted remaining
+    # list whose true-map index is in range, and a date equal to its
+    # match's date.
+    import pandas as pd
+
+    veto_df = pd.read_parquet("data/v1/veto_actions.parquet")
+    matches_df = pd.read_parquet("data/v1/matches.parquet")
+    splits_df = pd.read_parquet("data/v1/splits.parquet")
+    maps_df = pd.read_parquet("data/v1/maps.parquet")
+    held = ve.build_held_out_veto_matches(veto_df, matches_df, splits_df, split="train")
+    examples = ve.build_ban_training_examples(held, matches_df, maps_df)
+    assert len(examples) == 320
+    assert len({e.acting_team_id for e in examples}) > 1
+    for example in examples:
+        assert example.opponent_team_id is not None
+        assert example.opponent_team_id != example.acting_team_id
+        assert 0 <= example.true_map_index < len(example.remaining_maps)
+        assert sorted(example.remaining_maps) == list(example.remaining_maps)
