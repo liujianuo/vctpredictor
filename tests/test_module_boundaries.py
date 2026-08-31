@@ -83,6 +83,7 @@ ALLOWED_UTILS_CROSS_IMPORT = "from utils.table_io import DEFAULT_OUTPUT_DIR"
 MODELS_MODULES = (
     "binary_logit.py",
     "four_way_baseline.py",
+    "greedy_veto_simulator.py",
     "multinomial_logit.py",
     "ordinal_logit.py",
     "temperature_scaling.py",
