@@ -97,6 +97,7 @@ EVALUATION_MODULES = (
     "granularity_ablation.py",
     "harness.py",
     "proportional_odds.py",
+    "temperature_calibration.py",
 )
 
 
