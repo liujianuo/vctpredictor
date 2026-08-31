@@ -459,3 +459,159 @@ def test_real_v1_train_temperature_scaling_end_to_end():
         f"calibration_nll_at_t1={model.calibration_nll_at_t1!r} "
         f"calibration_nll_at_t_star={model.calibration_nll_at_t_star!r}"
     )
+
+
+# --------------------------------------------------------------------------
+# plan#9: ordinal_logit_temperature registry entry in drivers/evaluate.py
+# --------------------------------------------------------------------------
+
+
+def test_evaluate_registry_has_temperature_key():
+    # The new factory must be registered so --model choices pick it up
+    # automatically (alongside the three existing keys).
+    from drivers import evaluate
+
+    assert "ordinal_logit_temperature" in evaluate.MODEL_REGISTRY
+    assert "ordinal_logit" in evaluate.MODEL_REGISTRY
+    assert "multinomial_logit" in evaluate.MODEL_REGISTRY
+    assert "four_way_baseline" in evaluate.MODEL_REGISTRY
+
+
+@pytest.mark.skipif(
+    not _real_v1_available(),
+    reason="materialised v1 dataset + ordinal artifact not present (run "
+    "materialize.py and train_ordinal_logit.py first)",
+)
+def test_temperature_factory_raises_on_missing_temperature_artifact(tmp_path):
+    # With the base ordinal artifact and player_map_stats present but
+    # temperature_scaling_model.json absent, the factory must surface a
+    # clear FileNotFoundError (train_temperature_scaling.py has not been
+    # run for this version).
+    from drivers import evaluate
+
+    v1_dir = tmp_path / "v1"
+    v1_dir.mkdir()
+    shutil.copy2(
+        Path("data/v1/ordinal_logit_model.json"),
+        v1_dir / "ordinal_logit_model.json",
+    )
+    shutil.copy2(
+        Path("data/v1/player_map_stats.parquet"),
+        v1_dir / "player_map_stats.parquet",
+    )
+    assert not (v1_dir / "temperature_scaling_model.json").exists()
+    with pytest.raises(FileNotFoundError):
+        evaluate.MODEL_REGISTRY["ordinal_logit_temperature"](tmp_path, "v1")
+
+
+@pytest.mark.skipif(
+    not _real_v1_available(),
+    reason="materialised v1 dataset + ordinal artifact not present (run "
+    "materialize.py and train_ordinal_logit.py first)",
+)
+def test_temperature_factory_staleness_guard_rejects_mismatched_thresholds(tmp_path):
+    # Decision E's staleness guard: a hand-built calibration artifact
+    # whose stored thresholds do not match the loaded base model's must
+    # raise the documented ValueError rather than silently applying a
+    # stale T (the "re-run train_temperature_scaling.py" signal).
+    from drivers import evaluate
+
+    v1_dir = tmp_path / "v1"
+    v1_dir.mkdir()
+    shutil.copy2(
+        Path("data/v1/ordinal_logit_model.json"),
+        v1_dir / "ordinal_logit_model.json",
+    )
+    shutil.copy2(
+        Path("data/v1/player_map_stats.parquet"),
+        v1_dir / "player_map_stats.parquet",
+    )
+    mismatched = temperature_scaling.to_dict(_sample_temperature_model())
+    # _sample_temperature_model carries the real thresholds; perturb
+    # them so the guard trips.
+    mismatched["thresholds"] = [0.0, 1.0, 2.0]
+    (v1_dir / "temperature_scaling_model.json").write_text(
+        json.dumps(mismatched, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        ValueError, match="calibrated against a different"
+    ):
+        evaluate.MODEL_REGISTRY["ordinal_logit_temperature"](tmp_path, "v1")
+
+
+@pytest.mark.skipif(
+    not _real_v1_available(),
+    reason="materialised v1 dataset + ordinal artifact not present (run "
+    "materialize.py and train_ordinal_logit.py first)",
+)
+def test_real_v1_temperature_factory_t1_matches_ordinal_exactly(tmp_path):
+    # Locks in decision A's "T = 1 recovers the M20 model exactly"
+    # claim end-to-end, not just at the pure-math level: a throwaway
+    # TemperatureScaledModel with temperature = 1.0 and the same
+    # thresholds, loaded through the real factory closure, must
+    # reproduce the uncalibrated ordinal_logit model's predict_proba
+    # output exactly on a handful of real held-out rows (bit-for-bit,
+    # since the pipeline up to eta is shared and T=1 is the identity).
+    import pandas as pd
+
+    from drivers import evaluate
+    from evaluation import harness
+
+    v1_dir = tmp_path / "v1"
+    v1_dir.mkdir()
+    shutil.copy2(
+        Path("data/v1/ordinal_logit_model.json"),
+        v1_dir / "ordinal_logit_model.json",
+    )
+    shutil.copy2(
+        Path("data/v1/player_map_stats.parquet"),
+        v1_dir / "player_map_stats.parquet",
+    )
+    base_model = ordinal_logit.from_dict(
+        json.loads(
+            Path("data/v1/ordinal_logit_model.json").read_text(encoding="utf-8")
+        )
+    )
+    t1_model = temperature_scaling.TemperatureScaledModel(
+        temperature=1.0,
+        thresholds=base_model.thresholds,
+        n_calibration=1,
+        oof_coverage={},
+        t_grid_min=0.05,
+        t_grid_max=20.0,
+        calibration_nll_at_t1=1.0,
+        calibration_nll_at_t_star=1.0,
+    )
+    (v1_dir / "temperature_scaling_model.json").write_text(
+        json.dumps(temperature_scaling.to_dict(t1_model), indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    matches_df = pd.read_parquet("data/v1/matches.parquet")
+    maps_df = pd.read_parquet("data/v1/maps.parquet")
+    labels_df = pd.read_parquet("data/v1/labels.parquet")
+    splits_df = pd.read_parquet("data/v1/splits.parquet")
+    player_map_stats_df = pd.read_parquet("data/v1/player_map_stats.parquet")
+
+    calibrated_fn = evaluate.MODEL_REGISTRY["ordinal_logit_temperature"](
+        tmp_path, "v1"
+    )
+    uncalibrated_fn = ordinal_logit.make_model_fn(base_model, player_map_stats_df)
+
+    held_out = harness.build_held_out_maps(
+        matches_df, maps_df, labels_df, splits_df, split="test"
+    )
+    for row in list(held_out.itertuples(index=False))[:5]:
+        calibrated = calibrated_fn(
+            row.team1_id, row.team2_id, row.map_name, row.date, matches_df, maps_df
+        )
+        uncalibrated = uncalibrated_fn(
+            row.team1_id, row.team2_id, row.map_name, row.date, matches_df, maps_df
+        )
+        assert calibrated == tuple(float(p) for p in uncalibrated), (
+            f"T=1 calibrated output differs from uncalibrated on map "
+            f"(match {row.match_id!r}, map_index {row.map_index!r}): "
+            f"{calibrated} vs {uncalibrated}"
+        )

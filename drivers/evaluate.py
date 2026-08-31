@@ -44,10 +44,11 @@ import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from evaluation import harness
-from models import multinomial_logit, ordinal_logit
+from models import _shared, multinomial_logit, ordinal_logit, temperature_scaling
 from utils.table_io import DEFAULT_OUTPUT_DIR, write_parquet
 
 logger = logging.getLogger(__name__)
@@ -169,6 +170,149 @@ def _multinomial_logit_factory(output_dir: Path, version: str) -> harness.ModelF
     return multinomial_logit.make_model_fn(model, player_map_stats_df)
 
 
+def _ordinal_logit_temperature_factory(output_dir: Path, version: str) -> harness.ModelFn:
+    """Load the calibrated (temperature-scaled) M20 artifact pair and wrap them.
+
+    The stateful factory for M24's temperature-scaled ordinal logit: it
+    loads the base M20 artifact
+    (``<output_dir>/<version>/ordinal_logit_model.json``, exactly like
+    :func:`_ordinal_logit_factory`) and the calibration artifact
+    (``<output_dir>/<version>/temperature_scaling_model.json``, produced
+    by ``drivers/train_temperature_scaling.py``), enforces the
+    decision-E staleness guard, loads the ``player_map_stats`` table,
+    and returns a closure that computes the raw 11-feature vector
+    (:func:`models._shared.build_feature_vector`), standardizes it with
+    the *base* model's stored training means/stds
+    (:func:`models.ordinal_logit.apply_standardizer`), computes
+    ``eta = dot(xs, base_model.coefficients)``, and returns
+    :func:`models.temperature_scaling.predict_proba_with_temperature`
+    applied to ``(eta, base_model.thresholds, temp_model.temperature)``
+    — i.e. the fixed final model's own ``(eta, thresholds)`` with the
+    single fitted ``T`` (decision E: ``eta``/``thresholds`` always come
+    from the one fixed, fully-trained M20 artifact, never from any fold
+    model).
+
+    **Staleness guard (decision E, enforced here — do not weaken).**
+    The calibration artifact's ``thresholds`` field is a *provenance
+    copy* of the base model's thresholds at calibration-fit time. If the
+    loaded base model's thresholds do not ``np.allclose``-match that
+    stored copy, the factory raises ``ValueError`` rather than silently
+    applying a stale ``T`` (e.g. after ``train_ordinal_logit.py`` was
+    re-run without re-running ``train_temperature_scaling.py``).
+
+    Args:
+        output_dir: The parent directory the version subdirectory
+            lives under (e.g. ``Path("data")``).
+        version: The dataset version subdirectory name (e.g. ``"v1"``).
+
+    Returns:
+        A model function (the 6-argument generic shape) that predicts
+        the four temperature-scaled category probabilities, closing
+        over the base model, the calibration model and the loaded
+        ``player_map_stats`` table.
+
+    Raises:
+        FileNotFoundError: If ``ordinal_logit_model.json``,
+            ``temperature_scaling_model.json`` or
+            ``player_map_stats.parquet`` does not exist for this
+            version (i.e. the two training drivers or
+            ``materialize.py`` have not been run) — propagated as-is
+            from ``json.load``/``pandas.read_parquet``.
+        ValueError: If the calibration artifact's stored thresholds do
+            not match the loaded base model's thresholds (the staleness
+            guard), or if either artifact dict is malformed/
+            shape-inconsistent (propagated from the two ``from_dict``
+            functions).
+        KeyError: If either artifact dict lacks a required key
+            (propagated from the two ``from_dict`` functions).
+    """
+    base_artifact_path = Path(output_dir) / version / "ordinal_logit_model.json"
+    with open(base_artifact_path, encoding="utf-8") as handle:
+        base_model = ordinal_logit.from_dict(json.load(handle))
+    temp_artifact_path = (
+        Path(output_dir) / version / "temperature_scaling_model.json"
+    )
+    with open(temp_artifact_path, encoding="utf-8") as handle:
+        temp_model = temperature_scaling.from_dict(json.load(handle))
+    if not np.allclose(temp_model.thresholds, base_model.thresholds):
+        raise ValueError(
+            "temperature_scaling_model.json was calibrated against a "
+            "different ordinal_logit_model.json; re-run "
+            "train_temperature_scaling.py"
+        )
+    player_map_stats_df = load_player_map_stats_table(output_dir, version)
+
+    def model_fn(
+        team1_id: str,
+        team2_id: str,
+        map_name: str,
+        date: str,
+        matches_df: pd.DataFrame,
+        maps_df: pd.DataFrame,
+    ) -> tuple[float, float, float, float]:
+        """Predict the four temperature-scaled category probabilities.
+
+        Computes the raw 11-feature vector via
+        :func:`models._shared.build_feature_vector` (using the
+        closed-over ``player_map_stats_df`` — the table the generic
+        interface does not pass), standardizes it with the base model's
+        stored training-population statistics, computes
+        ``eta = dot(xs, base_model.coefficients)``, and returns
+        :func:`models.temperature_scaling.predict_proba_with_temperature`
+        applied to ``(eta, base_model.thresholds,
+        temp_model.temperature)``. See
+        :func:`_ordinal_logit_temperature_factory`'s docstring for the
+        decision-E contract (fixed final model's ``(eta, thresholds)``,
+        single fitted ``T``).
+
+        Args:
+            team1_id: The queried team1's stable id ("A").
+            team2_id: The queried team2's stable id ("B").
+            map_name: The map to predict for.
+            date: The as-of cutoff (the map's own match date).
+            matches_df: The full materialised ``matches`` table from the
+                same dataset version the closed-over
+                ``player_map_stats_df`` was loaded from.
+            maps_df: The full materialised ``maps`` table from the same
+                version.
+
+        Returns:
+            The 4-tuple of probabilities in
+            :data:`models._shared.OUTCOME_LABELS` order, summing to
+            approximately 1 (each clipped into ``[eps, 1-eps]``).
+
+        Raises:
+            ValueError: If the feature vector length mismatches the
+                base model, if ``temp_model.temperature`` is not
+                positive, or if any feature computation fails
+                (propagated from :func:`models._shared.build_feature_vector`
+                / :func:`models.ordinal_logit.predict_proba`'s shape
+                checks / :func:`models.temperature_scaling.predict_proba_with_temperature`).
+            KeyError: If any table lacks a required column (propagated
+                from :func:`models._shared.build_feature_vector`).
+        """
+        x = _shared.build_feature_vector(
+            team1_id,
+            team2_id,
+            map_name,
+            date,
+            matches_df,
+            maps_df,
+            player_map_stats_df,
+        )
+        xs = ordinal_logit.apply_standardizer(
+            x.reshape(1, -1),
+            base_model.standardizer_means,
+            base_model.standardizer_stds,
+        )[0]
+        eta = float(np.dot(xs, base_model.coefficients))
+        return temperature_scaling.predict_proba_with_temperature(
+            eta, base_model.thresholds, temp_model.temperature
+        )
+
+    return model_fn
+
+
 # The registry of runnable model names -> factories. Each value is a
 # :data:`ModelFactory` callable ``(output_dir, version) -> ModelFn``;
 # :func:`main` invokes the selected factory with the dataset location
@@ -177,6 +321,7 @@ def _multinomial_logit_factory(output_dir: Path, version: str) -> harness.ModelF
 MODEL_REGISTRY: dict[str, ModelFactory] = {
     "four_way_baseline": _four_way_baseline_factory,
     "ordinal_logit": _ordinal_logit_factory,
+    "ordinal_logit_temperature": _ordinal_logit_temperature_factory,
     "multinomial_logit": _multinomial_logit_factory,
 }
 
