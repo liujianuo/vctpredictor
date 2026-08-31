@@ -15,11 +15,38 @@ validation errors.
 
 import json
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from evaluation import granularity_ablation as ga
+
+_REAL_V1_TABLES = ("matches", "maps", "labels", "splits", "player_map_stats")
+
+
+def _real_v1_available():
+    """Report whether the real v1 tables and both model artifacts exist.
+
+    The skip guard for the end-to-end ablation test: all five Parquet
+    tables plus both fitted model artifacts (``ordinal_logit_model.json``
+    and ``binary_logit_model.json``) must exist, i.e. ``materialize.py``,
+    ``labels.py``, ``splits.py`` and both training drivers have been
+    run.
+
+    Returns:
+        A bool: ``True`` iff all five ``data/v1/*.parquet`` files and
+        both ``data/v1/*_logit_model.json`` artifacts exist.
+
+    Raises:
+        Nothing.
+    """
+    return all(
+        Path(f"data/v1/{name}.parquet").exists() for name in _REAL_V1_TABLES
+    ) and all(
+        Path(f"data/v1/{name}_logit_model.json").exists()
+        for name in ("ordinal", "binary")
+    )
 
 
 def test_marginalize_ordinal_probs_sums_hand_built_fixture():
@@ -253,3 +280,109 @@ def test_build_ablation_report_rejects_invalid_labels():
             binary_probs, binary_probs, truth, n_train_binary_model=1,
             n_train_ordinal_model=1,
         )
+
+
+# --------------------------------------------------------------------------
+# plan#8: real v1 end-to-end via the ablation CLI
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not _real_v1_available(),
+    reason="materialised v1 dataset + trained model artifacts not present "
+    "(run materialize.py and both training drivers first)",
+)
+def test_real_v1_ablation_end_to_end():
+    # The M22 finding on real data/v1: run the ablation CLI (which
+    # assembles the shared 35-map test matrix once, scores both models
+    # directly, marginalizes the ordinal four-way output, and writes
+    # data/v1/granularity_ablation_report.json), reload the artifact,
+    # assert n_eval is the known 35-map v1 test-split size, and
+    # independently recompute the report in-process (not just read the
+    # CLI's artifact) so the numbers are double-checked. Prints and
+    # records the actual accuracy_gap / log_loss_gap /
+    # granularity_verdict — the roadmap's M22 viability-gate finding.
+    import pandas as pd
+
+    from drivers import ablate_granularity, training_data
+    from models import binary_logit, ordinal_logit
+
+    rc = ablate_granularity.main(["--version", "v1"])
+    assert rc == 0
+
+    artifact = json.loads(
+        Path("data/v1/granularity_ablation_report.json").read_text(encoding="utf-8")
+    )
+    assert artifact["n_eval"] == 35
+    assert artifact["granularity_verdict"] in ("costs_accuracy", "viable")
+    assert artifact["verdict_rule"] == ga._VERDICT_RULE
+    for model_key in ("binary_logit", "ordinal_marginalized"):
+        assert math.isfinite(artifact[model_key]["mean_log_loss"])
+        assert 0.0 <= artifact[model_key]["accuracy"] <= 1.0
+
+    matches_df = pd.read_parquet("data/v1/matches.parquet")
+    maps_df = pd.read_parquet("data/v1/maps.parquet")
+    labels_df = pd.read_parquet("data/v1/labels.parquet")
+    splits_df = pd.read_parquet("data/v1/splits.parquet")
+    player_map_stats_df = pd.read_parquet("data/v1/player_map_stats.parquet")
+    X_test, y_test_ordinal = training_data.assemble_design_matrix(
+        matches_df,
+        maps_df,
+        labels_df,
+        splits_df,
+        player_map_stats_df,
+        split="test",
+    )
+    ordinal_model = ordinal_logit.from_dict(
+        json.loads(
+            Path("data/v1/ordinal_logit_model.json").read_text(encoding="utf-8")
+        )
+    )
+    binary_model = binary_logit.from_dict(
+        json.loads(
+            Path("data/v1/binary_logit_model.json").read_text(encoding="utf-8")
+        )
+    )
+    ordinal_probs_4way = np.asarray(
+        [
+            ordinal_logit.predict_proba(X_test[i], ordinal_model)
+            for i in range(X_test.shape[0])
+        ],
+        dtype=float,
+    )
+    ordinal_marginal = ga.marginalize_ordinal_probs(ordinal_probs_4way)
+    binary_probs = np.asarray(
+        [
+            binary_logit.predict_proba(X_test[i], binary_model)
+            for i in range(X_test.shape[0])
+        ],
+        dtype=float,
+    )
+    truth = (y_test_ordinal >= 2).astype(int)
+    report = ga.build_ablation_report(
+        binary_probs,
+        ordinal_marginal,
+        truth,
+        n_train_binary_model=binary_model.n_train,
+        n_train_ordinal_model=ordinal_model.n_train,
+    )
+    for key in (
+        "granularity_verdict",
+        "accuracy_gap",
+        "log_loss_gap",
+        "n_eval",
+    ):
+        assert report[key] == artifact[key]
+    assert report["binary_logit"] == artifact["binary_logit"]
+    assert report["ordinal_marginalized"] == artifact["ordinal_marginalized"]
+
+    print(
+        "M22 granularity ablation on real v1 test split (n_eval=35): "
+        f"binary_logit acc={report['binary_logit']['accuracy']!r} "
+        f"ll={report['binary_logit']['mean_log_loss']!r} "
+        f"ordinal_marginalized acc={report['ordinal_marginalized']['accuracy']!r} "
+        f"ll={report['ordinal_marginalized']['mean_log_loss']!r} "
+        f"accuracy_gap={report['accuracy_gap']!r} "
+        f"log_loss_gap={report['log_loss_gap']!r} "
+        f"granularity_verdict={report['granularity_verdict']!r}"
+    )
