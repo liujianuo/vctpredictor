@@ -405,6 +405,133 @@ def test_map_variance_normalizes_map_name():
 
 
 # --------------------------------------------------------------------------
+# map_ot_rate (M27)
+# --------------------------------------------------------------------------
+
+
+def test_map_ot_rate_shrinkage_arithmetic():
+    # Haven: 4 as-of maps, 3 OT events (15-13, 14-12, 15-13) and one
+    # regulation (13-8); Bind: 2 as-of maps, both regulation. The
+    # league-wide prior pools all 6 maps -> 3/6 = 0.5. With k = 2:
+    # mean = (3 + 2*0.5) / (4 + 2) = 4/6, alpha = 4, beta = 2,
+    # variance = alpha*beta / ((alpha+beta)^2 * (alpha+beta+1)) =
+    # 4*2 / (6^2 * 7). The Bind estimate must be different (0 OT / 2
+    # games), proving the per-map filter isolates the named map.
+    matches_df, maps_df = _build(
+        [
+            {"match_id": "h1", "date": D1, "team1_id": "A", "team2_id": "B",
+             "map_name": "Haven", "team1_score": 15, "team2_score": 13},
+            {"match_id": "h2", "date": D1, "team1_id": "C", "team2_id": "D",
+             "map_name": "Haven", "team1_score": 14, "team2_score": 12},
+            {"match_id": "h3", "date": D2, "team1_id": "A", "team2_id": "C",
+             "map_name": "Haven", "team1_score": 15, "team2_score": 13},
+            {"match_id": "h4", "date": D2, "team1_id": "B", "team2_id": "D",
+             "map_name": "Haven", "team1_score": 13, "team2_score": 8},
+            {"match_id": "b1", "date": D1, "team1_id": "A", "team2_id": "D",
+             "map_name": "Bind", "team1_score": 13, "team2_score": 11},
+            {"match_id": "b2", "date": D2, "team1_id": "B", "team2_id": "C",
+             "map_name": "Bind", "team1_score": 13, "team2_score": 7},
+        ]
+    )
+    result = closeness.map_ot_rate("Haven", QUERY, matches_df, maps_df, k=2.0)
+    prior = closeness.global_ot_rate(QUERY, matches_df, maps_df).rate
+    assert prior == pytest.approx(0.5)
+    assert result.events == 3
+    assert result.games == 4
+    assert result.raw_rate == pytest.approx(0.75)
+    assert result.mean == pytest.approx((3 + 2.0 * 0.5) / (4 + 2.0))
+    assert result.alpha == pytest.approx(4.0)
+    assert result.beta == pytest.approx(2.0)
+    assert result.variance == pytest.approx(4.0 * 2.0 / (6.0**2 * 7.0))
+
+    bind = closeness.map_ot_rate("Bind", QUERY, matches_df, maps_df, k=2.0)
+    assert bind.events == 0
+    assert bind.games == 2
+    assert bind.mean == pytest.approx((0 + 2.0 * 0.5) / (2 + 2.0))
+
+
+def test_map_ot_rate_zero_games_full_shrinkage():
+    # No as-of map on the name: mean == prior exactly (full shrinkage)
+    # and raw_rate is reported as the prior too.
+    matches_df, maps_df = _build(_base_events())
+    result = closeness.map_ot_rate("Fracture", QUERY, matches_df, maps_df)
+    assert result.events == 0
+    assert result.games == 0
+    assert result.raw_rate == pytest.approx(result.prior)
+    assert result.mean == pytest.approx(result.prior)
+
+
+def test_map_ot_rate_normalizes_map_name():
+    # " haven " must match the stored "Haven" via normalize_map_name.
+    matches_df, maps_df = _build(
+        [
+            {"match_id": "m1", "date": D1, "team1_id": "A", "team2_id": "B",
+             "map_name": "Haven", "team1_score": 15, "team2_score": 13},
+            {"match_id": "m2", "date": D1, "team1_id": "C", "team2_id": "D",
+             "map_name": "Haven", "team1_score": 13, "team2_score": 8},
+        ]
+    )
+    result = closeness.map_ot_rate(" haven ", QUERY, matches_df, maps_df, k=2.0)
+    assert result.events == 1
+    assert result.games == 2
+
+
+@pytest.mark.parametrize("bad_k", [0, -1, 0.0, float("nan"), float("inf")])
+def test_map_ot_rate_invalid_k_raises(bad_k):
+    # k must be a positive finite real number.
+    matches_df, maps_df = _build(_base_events())
+    with pytest.raises(ValueError, match="k must be"):
+        closeness.map_ot_rate("Haven", QUERY, matches_df, maps_df, k=bad_k)
+
+
+def test_map_ot_rate_leakage_strict_boundary():
+    # The exactly-at and after poison maps (both "Haven") must never
+    # change the per-map OT estimate, which stays over the two
+    # strictly-before Haven maps (0 OT events / 2 games, prior 0.25).
+    base_m, base_p = _build(_base_events())
+    poison_m, poison_p = _build(_poison_events())
+    grown_m = pd.concat([base_m, poison_m], ignore_index=True)
+    grown_p = pd.concat([base_p, poison_p], ignore_index=True)
+
+    base = closeness.map_ot_rate("Haven", QUERY, base_m, base_p, k=2.0)
+    grown = closeness.map_ot_rate("Haven", QUERY, grown_m, grown_p, k=2.0)
+    assert base.events == 0
+    assert base.games == 2
+    assert (base.events, base.games, base.mean) == (
+        grown.events,
+        grown.games,
+        grown.mean,
+    )
+
+
+@pytest.mark.skipif(
+    not (
+        Path("data/v1/matches.parquet").exists()
+        and Path("data/v1/maps.parquet").exists()
+    ),
+    reason="materialised v1 dataset not present (run materialize.py first)",
+)
+def test_real_data_map_ot_rate_sane_numbers():
+    # Real v1 scale: a real map's per-map OT estimate is non-degenerate
+    # (mean strictly inside (0, 1), not all-zero and not all-one), the
+    # counts are consistent, and the prior is the global pooled OT rate
+    # at the same cutoff.
+    matches_df, maps_df = asof.load_asof_tables("v1")
+    latest = pd.to_datetime(matches_df["date"]).max()
+    query = (latest + pd.Timedelta(hours=1)).isoformat()
+    a_map = maps_df["map_name"].iloc[0]
+
+    result = closeness.map_ot_rate(a_map, query, matches_df, maps_df)
+    assert result.games > 0
+    assert result.events <= result.games
+    assert 0.0 <= result.raw_rate <= 1.0
+    assert 0.0 < result.mean < 1.0
+    assert result.prior == pytest.approx(
+        closeness.global_ot_rate(query, matches_df, maps_df).rate
+    )
+
+
+# --------------------------------------------------------------------------
 # null-score guard (deliverable B's fail-loud convention, M15 side)
 # --------------------------------------------------------------------------
 
@@ -428,6 +555,8 @@ def test_null_score_raises_from_all_public_functions():
         closeness.team_ot_rate("A", QUERY, matches_df, maps_df)
     with pytest.raises(ValueError, match="null/NaN"):
         closeness.map_round_margin_variance("Haven", QUERY, matches_df, maps_df)
+    with pytest.raises(ValueError, match="null/NaN"):
+        closeness.map_ot_rate("Haven", QUERY, matches_df, maps_df)
 
 
 def test_null_score_team2_raises():

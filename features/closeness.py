@@ -1,6 +1,6 @@
 """Closeness and overtime features (roadmap M15).
 
-A pure in-memory library producing three features from the materialised
+A pure in-memory library producing four features from the materialised
 matches/maps tables, each queried as-of a cutoff date:
 
 - ``team_close_map_frequency`` — a team's unshrunk frequency of "close"
@@ -9,7 +9,10 @@ matches/maps tables, each queried as-of a cutoff date:
   toward a global pooled OT base rate (:func:`global_ot_rate`);
 - ``map_round_margin_variance`` — the per-map-name historical *sample*
   variance (``ddof=1``) of absolute round margins, computed over all
-  teams' as-of maps on that map.
+  teams' as-of maps on that map;
+- ``map_ot_rate`` — the per-map-name *heavily-shrunk* overtime rate,
+  pulled toward the same global pooled OT base rate
+  (:func:`global_ot_rate`), over all teams' as-of maps on that map.
 
 Like the rest of ``features/``, this module has no CLI, no ``argparse``
 entry point, and no file I/O of its own — it operates on the
@@ -83,6 +86,18 @@ enters any estimate, for any team.
   events can barely move the estimate. This is a judgment call isolated
   as :data:`DEFAULT_OT_K`, not a magic number, and every caller can
   override ``k``.
+- **Per-map OT rate (M27) reuses the same heavy-shrinkage math, with the
+  same constant.** :func:`map_ot_rate` counts ``events``/``games`` over
+  the league-wide as-of pool restricted to one ``map_name`` (the same
+  :func:`_league_maps_as_of` + ``normalize_map_name`` filter pattern as
+  ``map_round_margin_variance``) and shrinks toward the same global
+  pooled prior (:func:`global_ot_rate`). A single map's historical
+  sample is even narrower than one team's (a map appears only ~30-40
+  times in v1), so the same ``k = 1000.0`` heavy constant is at least as
+  appropriate there — the prior's weight relative to a per-map sample is
+  even larger. The map-level default is exposed as a separate named
+  constant :data:`DEFAULT_MAP_OT_K` (equal to :data:`DEFAULT_OT_K`) so
+  the choice is documented and overridable per caller.
 - **Per-map margin variance uses sample variance (``ddof=1``),** matching
   ``ShrunkWinRate``'s Beta variance being a "true" (not biased
   population) variance. Degenerate cases are explicit, not left to
@@ -148,6 +163,13 @@ OT_MIN_SCORE = 12
 # and ~4x the total pooled v1 map count (244). See the module docstring's
 # "DEFAULT_OT_K" bullet for the full justification.
 DEFAULT_OT_K = 1000.0
+
+# Default shrinkage strength for the per-map OT rate (M27). Identical
+# value to DEFAULT_OT_K: a single map's historical sample is even
+# narrower than one team's (a map appears ~30-40 times in v1), so the
+# same "heavy" prior weight is at least as appropriate there; kept as
+# its own named constant so the choice is explicit and overridable.
+DEFAULT_MAP_OT_K = DEFAULT_OT_K
 
 # Column names this module reads from the M8 maps table. ``match_id``,
 # ``date`` and ``status`` come from the matches table via ``utils.asof``'s
@@ -650,3 +672,92 @@ def map_round_margin_variance(
     n = len(map_rows)
     variance = float(np.var(abs_margin, ddof=1)) if n > 1 else float("nan")
     return MapMarginVariance(n=n, variance=variance)
+
+
+def map_ot_rate(
+    map_name: str,
+    date: str,
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+    k=DEFAULT_MAP_OT_K,
+) -> ShrunkOTRate:
+    """Return the heavily-shrunk overtime rate on one map as of a cutoff.
+
+    The per-map analogue of :func:`team_ot_rate`, added for M27's
+    conditional-logit ban model: it counts ``events``/``games`` over the
+    *league-wide* as-of pool (:func:`_league_maps_as_of`) restricted to
+    the named ``map_name`` (normalized via
+    :func:`utils.config.normalize_map_name`, matching
+    :func:`map_round_margin_variance`'s filter pattern) and shrinks
+    toward the *same* global pooled OT prior (:func:`global_ot_rate` at
+    the same date) with the same Beta-posterior formula
+    ``mean = (events + k*prior) / (games + k)``. With ``games == 0`` on
+    the map the formula degrades to ``mean = prior`` exactly (full
+    shrinkage). ``k`` defaults to the heavy :data:`DEFAULT_MAP_OT_K`
+    (equal to :data:`DEFAULT_OT_K`; a single map's sample is even
+    narrower than one team's, so the prior's weight is if anything
+    larger).
+
+    Args:
+        map_name: The map to estimate for; normalized via
+            :func:`utils.config.normalize_map_name` before matching, so
+            ``"breeze"``/``" Breeze "`` both match ``"Breeze"``.
+        date: The as-of cutoff; maps dated ``>=`` this are excluded
+            (strict ``<``).
+        matches_df: The materialised ``matches`` table.
+        maps_df: The materialised ``maps`` table (needs ``map_name``,
+            ``team1_score``, ``team2_score`` in addition to the columns
+            the league-wide filter already requires).
+        k: The shrinkage strength (effective prior sample size); must be
+            a positive finite real number (see :func:`_validate_k`).
+
+    Returns:
+        A :class:`ShrunkOTRate` with the map's ``events``/``games``
+        (counted over all teams' as-of maps on that map), the global
+        ``prior``, the unshrunk ``raw_rate`` (equal to ``prior`` when
+        ``games == 0``), and the posterior ``alpha``, ``beta``, ``mean``
+        and ``variance``.
+
+    Raises:
+        KeyError: If either table lacks a required column (propagated
+            from :func:`_league_maps_as_of`).
+        ValueError: If ``k`` is not a positive finite real number (see
+            :func:`_validate_k`); if an as-of map has a null/NaN score
+            (see :func:`_margin_and_ot`); or if the query date or a row
+            date is null/unparseable/timezone-aware (propagated from
+            :func:`_league_maps_as_of` / :func:`global_ot_rate`).
+        TypeError: If the query date is list-like (propagated from
+            :func:`_league_maps_as_of`).
+        ConfigError: If ``map_name`` or any as-of map's ``map_name``
+            value is not a string (propagated from
+            :func:`utils.config.normalize_map_name`).
+    """
+    k_value = _validate_k(k)
+    maps = _league_maps_as_of(date, matches_df, maps_df)
+
+    normalized = config.normalize_map_name(map_name)
+    map_rows = maps[maps[MAP_NAME_COL].map(config.normalize_map_name) == normalized]
+
+    _, _, is_ot = _margin_and_ot(
+        map_rows[TEAM1_SCORE_COL], map_rows[TEAM2_SCORE_COL]
+    )
+    events = int(is_ot.sum())
+    games = len(map_rows)
+    prior = global_ot_rate(date, matches_df, maps_df).rate
+    raw_rate = events / games if games else prior
+
+    alpha = events + k_value * prior
+    beta = (games - events) + k_value * (1.0 - prior)
+    mean = alpha / (alpha + beta)
+    variance = (alpha * beta) / ((alpha + beta) ** 2 * (alpha + beta + 1.0))
+
+    return ShrunkOTRate(
+        events=events,
+        games=games,
+        prior=prior,
+        raw_rate=raw_rate,
+        alpha=alpha,
+        beta=beta,
+        mean=mean,
+        variance=variance,
+    )
