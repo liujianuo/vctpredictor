@@ -81,6 +81,7 @@ ALLOWED_UTILS_CROSS_IMPORT = "from utils.table_io import DEFAULT_OUTPUT_DIR"
 # filesystem. Note this is the top-level models/ package (roadmap M18),
 # unrelated to scraper.models (the scraper's pure cache dataclasses).
 MODELS_MODULES = (
+    "ancestral_veto_sampler.py",
     "binary_logit.py",
     "conditional_logit_ban.py",
     "conditional_logit_pick.py",
