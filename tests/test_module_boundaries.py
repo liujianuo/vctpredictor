@@ -105,6 +105,7 @@ EVALUATION_MODULES = (
     "proportional_odds.py",
     "series_evaluation.py",
     "temperature_calibration.py",
+    "veto_marginalized_series.py",
     "veto_evaluation.py",
 )
 
