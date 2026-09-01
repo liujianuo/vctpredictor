@@ -50,6 +50,7 @@ UTILS_MODULES = (
     "asof.py",
     "config.py",
     "scoring.py",
+    "series_paths.py",
     "splits.py",
     "table_io.py",
 )
