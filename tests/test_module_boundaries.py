@@ -86,6 +86,7 @@ MODELS_MODULES = (
     "binary_logit.py",
     "conditional_logit_ban.py",
     "conditional_logit_pick.py",
+    "flat_series_baseline.py",
     "four_way_baseline.py",
     "greedy_veto_simulator.py",
     "multinomial_logit.py",
