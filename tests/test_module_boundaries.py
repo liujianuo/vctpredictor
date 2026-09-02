@@ -76,6 +76,7 @@ FEATURE_MODULES = (
     "map_win_rate.py",
     "player_form.py",
     "side_win_rate.py",
+    "signed_margin.py",
 )
 
 # The one allowed cross-utils-module import: a Path *constant*, not a
