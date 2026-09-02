@@ -108,6 +108,7 @@ EVALUATION_MODULES = (
     "series_evaluation.py",
     "stage_isolation.py",
     "temperature_calibration.py",
+    "veto_conditional_variance.py",
     "veto_marginalized_series.py",
     "veto_evaluation.py",
 )
