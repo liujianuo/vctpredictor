@@ -18,7 +18,23 @@ loop), ``drivers/train_multinomial_logit.py`` (new),
 ``drivers/diagnose_proportional_odds.py`` (new) and
 ``drivers/train_temperature_scaling.py`` (new, via
 :func:`assemble_out_of_fold_eta_rows`) — enough repetition to justify
-lifting the loop out of the first driver. ``drivers/`` sits at the top
+lifting the loop out of the first driver.
+
+Since M36 (bootstrap prediction intervals), this module also hosts
+:func:`assemble_bootstrap_design_matrix`, the match-level block-
+bootstrap resampler consumed by
+``drivers/evaluate_bootstrap_intervals.py``: it calls
+:func:`evaluation.harness.build_held_out_maps` with ``split="train"``
+once to get the base train-row table, resamples whole ``match_id``s
+with replacement via a caller-supplied
+``numpy.random.Generator``, and rebuilds the ``(X, y)`` pair exactly
+like :func:`assemble_design_matrix` does (same
+:func:`models._shared.build_feature_vector` call per row). It is
+deliberately placed here rather than in a fifth duplicate join loop
+inside ``evaluation/``: this module already is the one place that
+turns the materialised tables into the raw training design matrix,
+and it sits at the top of the dependency DAG (no module-boundary
+restriction), free to depend on ``evaluation.harness``. ``drivers/`` sits at the top
 of the dependency DAG (no module-boundary restriction), so this module
 may freely depend on ``evaluation.harness``, ``models._shared``,
 ``models.ordinal_logit`` and ``utils.splits``; the same assembly cannot
@@ -94,6 +110,109 @@ def assemble_design_matrix(
     X_rows: list[np.ndarray] = []
     y_rows: list[int] = []
     for row in rows.itertuples(index=False):
+        X_rows.append(
+            _shared.build_feature_vector(
+                row.team1_id,
+                row.team2_id,
+                row.map_name,
+                row.date,
+                matches_df,
+                maps_df,
+                player_map_stats_df,
+            )
+        )
+        y_rows.append(int(row.outcome_ordinal))
+    return np.asarray(X_rows, dtype=float), np.asarray(y_rows, dtype=int)
+
+
+def assemble_bootstrap_design_matrix(
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+    labels_df: pd.DataFrame,
+    splits_df: pd.DataFrame,
+    player_map_stats_df: pd.DataFrame,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Assemble one match-level block-bootstrap resampled design matrix.
+
+    The M36 resample step: draws one full resampled training design
+    matrix from the ``"train"`` split by resampling *whole matches*
+    with replacement (a block bootstrap, per the M36 plan assumption 2
+    and ``utils.splits``'s own module doctrine that the split unit is
+    the match, not the map — a match's maps are sequential games in one
+    series, not independent chronological draws, so plain per-map-row
+    iid resampling would be wrong). The base train-row table comes from
+    a single :func:`evaluation.harness.build_held_out_maps` call with
+    ``split="train"`` (the existing, reused way to build a training
+    set — no new join logic is written); the returned rows carry
+    ``match_id``, so they can be grouped per match. ``len(unique
+    match_ids)`` match ids are drawn with replacement via the
+    caller-supplied ``rng``, and the resampled row table is the
+    concatenation of every drawn match's *entire* row block in draw
+    order (a match drawn twice contributes its full row block twice,
+    contiguously — never a match split across resample slots). The
+    ``(X, y)`` pair is then built exactly as
+    :func:`assemble_design_matrix` does: one
+    :func:`models._shared.build_feature_vector` call per resulting row,
+    and ``row.outcome_ordinal`` into ``y``.
+
+    **Why a raw ``(X, y)`` pair rather than a ``splits.parquet``-shaped
+    table.** ``splits.parquet`` has one row per ``match_id`` and cannot
+    represent "this match's rows appear twice" via a join; the
+    resampled row set is therefore materialized directly (repeat a
+    resampled match's rows verbatim, feature-vector and all) rather
+    than forced through ``utils.splits``/``evaluation.harness``'s join
+    machinery (M36 plan assumption 3).
+
+    Args:
+        matches_df: The materialised ``matches`` table.
+        maps_df: The materialised ``maps`` table.
+        labels_df: The materialised ``labels`` table (needs
+            ``outcome_ordinal``).
+        splits_df: The materialised ``splits`` table.
+        player_map_stats_df: The materialised ``player_map_stats`` table
+            (required by the M16/M17 features inside
+            :func:`models._shared.build_feature_vector`).
+        rng: The ``numpy.random.Generator`` whose draws this function
+            consumes sequentially (one ``rng.choice`` call per
+            invocation). A fixed seed therefore reproduces the
+            resample, and therefore the refit model, byte-identically;
+            the caller must keep this rng separate from any veto-
+            sampling rng (the M36 driver uses a dedicated
+            ``--bootstrap-seed`` rng for exactly this).
+
+    Returns:
+        A ``(X, y)`` tuple: ``X`` an ``(n, 11)`` numpy array of
+        ``float`` in :data:`models._shared.FEATURE_NAMES` order, ``y``
+        an ``(n,)`` numpy array of ``int`` outcome ordinals — the
+        resampled training matrix/label vector, sized exactly like the
+        ``"train"`` split it was drawn from (``n`` equals the base
+        train row count: each draw has ``len(unique match_ids)`` slots
+        and each slot contributes that match's full row block).
+
+    Raises:
+        ValueError: If the train split is empty (propagated from
+            :func:`evaluation.harness.build_held_out_maps`), or if any
+            feature computation fails (propagated from
+            :func:`models._shared.build_feature_vector`).
+        KeyError: If any input table lacks a required column
+            (propagated from the harness / the feature modules).
+    """
+    rows = harness.build_held_out_maps(
+        matches_df, maps_df, labels_df, splits_df, split="train"
+    )
+    groups_by_match = {
+        match_id: group
+        for match_id, group in rows.groupby("match_id", sort=False)
+    }
+    match_ids = list(groups_by_match)
+    drawn = rng.choice(np.asarray(match_ids), size=len(match_ids), replace=True)
+    resampled = pd.concat(
+        [groups_by_match[mid] for mid in drawn], ignore_index=True
+    )
+    X_rows: list[np.ndarray] = []
+    y_rows: list[int] = []
+    for row in resampled.itertuples(index=False):
         X_rows.append(
             _shared.build_feature_vector(
                 row.team1_id,
