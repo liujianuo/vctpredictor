@@ -100,6 +100,7 @@ MODELS_MODULES = (
 # coverage stays legible and does not silently grow or shrink with the
 # filesystem.
 EVALUATION_MODULES = (
+    "compounding_diagnostics.py",
     "granularity_ablation.py",
     "harness.py",
     "proportional_odds.py",
