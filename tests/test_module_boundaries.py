@@ -17,8 +17,16 @@ The rules enforced here:
   ``utils/ -> features/`` edges; the dependency graph is rooted at
   ``utils/``).
 - No ``features/`` module may import a sibling ``features/`` module
-  other than the explicitly shared ``_shared.py`` (no lateral
-  feature-to-feature private-helper imports).
+  other than the explicitly shared ``_shared.py`` and ``round_detail.py``
+  (no lateral feature-to-feature private-helper imports).
+  ``round_detail.py`` is a second explicitly-shared feature-support
+  module (roadmap M38.1 — the shared substrate M38.2 and M38.3 both
+  train against): it is excluded from ``FEATURE_MODULES`` below exactly
+  like ``_shared.py``, and its one import from ``_shared.py`` (the
+  ``TEAM1_SCORE_COL``/``TEAM2_SCORE_COL`` score-column constants) is a
+  shared-to-shared dependency — ``_shared.py`` has no downstream
+  dependents of its own to protect, so it is not a lateral
+  feature-to-feature import in the problematic sense.
 - The dependency graph is a DAG with ``models/`` on top: no ``utils/``
   or ``features/`` module may import from ``models/`` (no upward
   edges), and a ``models/`` module may only depend downward on
@@ -55,10 +63,12 @@ UTILS_MODULES = (
     "table_io.py",
 )
 
-# The modules that live under features/ (excluding _shared.py, which is
-# the explicitly-shared feature-support module every other feature may
-# import from). Update this constant list whenever a module is added to
-# or removed from features/.
+# The modules that live under features/ (excluding _shared.py and
+# round_detail.py, the two explicitly-shared feature-support modules
+# every other feature may import from — _shared.py the score-
+# orientation/roster helpers, round_detail.py the per-map round-detail
+# substrate of roadmap M38.1). Update this constant list whenever a
+# module is added to or removed from features/.
 FEATURE_MODULES = (
     "closeness.py",
     "elo.py",
@@ -146,9 +156,12 @@ def test_no_utils_module_imports_features():
 
 
 def test_no_feature_module_imports_sibling_feature_module():
-    # features/ modules may only depend on _shared.py among themselves;
-    # a private helper must never be reached into from a sibling feature
-    # module.
+    # features/ modules may only depend on the two explicitly-shared
+    # modules (_shared.py and round_detail.py) among themselves; a
+    # private helper must never be reached into from a sibling feature
+    # module. Both names are in the allowed set because round_detail.py
+    # is a second explicitly-shared feature-support module (roadmap
+    # M38.1), mirroring _shared.py's exclusion from FEATURE_MODULES.
     for module in FEATURE_MODULES:
         source = Path("features", module).read_text(encoding="utf-8")
         for line in source.splitlines():
@@ -156,10 +169,10 @@ def test_no_feature_module_imports_sibling_feature_module():
             if not stripped.startswith("from features."):
                 continue
             imported = stripped[len("from features.") :].split()[0]
-            assert imported == "_shared", (
+            assert imported in {"_shared", "round_detail"}, (
                 f"features/{module} imports {imported!r} from a sibling "
-                "feature module; only features._shared may be imported "
-                "laterally"
+                "feature module; only features._shared and "
+                "features.round_detail may be imported laterally"
             )
 
 
