@@ -75,6 +75,7 @@ FEATURE_MODULES = (
     "h2h_context.py",
     "map_win_rate.py",
     "player_form.py",
+    "side_win_rate.py",
 )
 
 # The one allowed cross-utils-module import: a Path *constant*, not a
