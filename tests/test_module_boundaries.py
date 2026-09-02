@@ -105,6 +105,7 @@ EVALUATION_MODULES = (
     "granularity_ablation.py",
     "harness.py",
     "proportional_odds.py",
+    "reliability_diagrams.py",
     "series_evaluation.py",
     "stage_isolation.py",
     "temperature_calibration.py",
