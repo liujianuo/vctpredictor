@@ -72,6 +72,7 @@ UTILS_MODULES = (
 FEATURE_MODULES = (
     "closeness.py",
     "elo.py",
+    "first_blood.py",
     "h2h_context.py",
     "map_win_rate.py",
     "player_form.py",
