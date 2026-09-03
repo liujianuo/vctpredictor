@@ -167,6 +167,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from features._shared import (
@@ -895,3 +896,522 @@ def load_h2h_context_tables(
     maps_df = pd.read_parquet(version_dir / "maps.parquet")
     player_map_stats_df = pd.read_parquet(version_dir / "player_map_stats.parquet")
     return matches_df, maps_df, player_map_stats_df
+
+
+def batched_h2h_win_rate_centered(
+    rows_df: pd.DataFrame,
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+    k=DEFAULT_H2H_K,
+) -> np.ndarray:
+    """Return per-row shrunk H2H win rate minus the flat 0.5 prior.
+
+    The batched sibling of the :func:`team_pair_h2h` call
+    :func:`models._shared.build_feature_vector` makes per row (task
+    052). A per-directed-pair ledger is built once from every eligible
+    map (finished map of a completed match, contributing two directed
+    events — ``(team1, team2, team1_won)`` and
+    ``(team2, team1, team2_won)``), running ``wins``/``games`` are
+    recorded per ordered pair over the chronologically-sorted events,
+    and each row's ``(team1_id, team2_id)`` pair is resolved against
+    that ledger with ``utils.asof.merge_asof_lookup`` (strict ``<`` per
+    query — the pair's games/wins as of the row's own date). The flat
+    ``:data:`H2H_PRIOR``` (``0.5``) Beta formula is then applied
+    vectorized with the same arithmetic and operand order as the
+    single-row estimator, so a never-played pair degrades to
+    ``mean == 0.5`` and the centered value to exactly ``0.0``,
+    bit-for-bit identical to looping the single-row calls.
+
+    Args:
+        rows_df: The row table; needs ``team1_id``, ``team2_id`` and
+            ``date`` columns. Row order is preserved in the output.
+        matches_df: The materialised ``matches`` table.
+        maps_df: The materialised ``maps`` table (needs ``map_name``
+            for score reads — not used here beyond the finish/completion
+            filters, but the row table carries no per-pair map).
+        k: The shrinkage strength (see :func:`features._shared._validate_k`).
+
+    Returns:
+        A ``(n,)`` numpy array of ``float``:
+        ``team_pair_h2h(team1, team2, date, ...).mean - H2H_PRIOR`` per
+        row.
+
+    Raises:
+        KeyError: If a table lacks a required column (propagated from
+            the event builder / as-of helpers).
+        ValueError: If ``k`` is invalid (see
+            :func:`features._shared._validate_k`), if any eligible map
+            has a null/NaN score or tied scores, or if a row date is
+            null/unparseable (propagated from
+            ``utils.asof.parse_date_column``).
+    """
+    k_value = _validate_k(k)
+    asof.require_columns(
+        matches_df,
+        (
+            asof.MATCH_ID_COL,
+            asof.TEAM1_ID_COL,
+            asof.TEAM2_ID_COL,
+            asof.DATE_COL,
+            asof.STATUS_COL,
+        ),
+        "matches_df",
+    )
+    asof.require_columns(
+        maps_df,
+        (asof.MATCH_ID_COL, asof.WINNER_COL, "team1_score", "team2_score"),
+        "maps_df",
+    )
+    completed = matches_df[matches_df[asof.STATUS_COL] == asof.COMPLETED_STATUS]
+    if not completed[asof.MATCH_ID_COL].is_unique:
+        raise ValueError(
+            "matches_df contains duplicate match_id values among the "
+            "completed rows; the pair-event join would fan out and "
+            "duplicate map rows"
+        )
+    finished = maps_df[maps_df[asof.WINNER_COL].notna()]
+    merged = finished.merge(
+        completed[
+            [
+                asof.MATCH_ID_COL,
+                asof.TEAM1_ID_COL,
+                asof.TEAM2_ID_COL,
+                asof.DATE_COL,
+            ]
+        ],
+        on=asof.MATCH_ID_COL,
+        how="inner",
+    )
+    team1_scores = merged["team1_score"].to_numpy()
+    team2_scores = merged["team2_score"].to_numpy()
+    null_mask = pd.isna(team1_scores) | pd.isna(team2_scores)
+    if null_mask.any():
+        raise ValueError(
+            "h2h batched path: league map(s) have a null/NaN score, "
+            "which is impossible for a finished map"
+        )
+    tie_mask = team1_scores == team2_scores
+    if tie_mask.any():
+        raise ValueError(
+            "h2h batched path: league map(s) have tied scores, which is "
+            "impossible for a finished map"
+        )
+    date_ns = pd.to_datetime(merged[asof.DATE_COL]).astype(np.int64).to_numpy()
+    order = np.lexsort(
+        (np.arange(len(merged)), merged[asof.MATCH_ID_COL].to_numpy(), date_ns)
+    )
+    merged = merged.iloc[order].reset_index(drop=True)
+    t1 = merged[asof.TEAM1_ID_COL].to_numpy()
+    t2 = merged[asof.TEAM2_ID_COL].to_numpy()
+    t1_won = (merged["team1_score"].to_numpy() > merged["team2_score"].to_numpy()).astype(int)
+
+    side_a = pd.DataFrame(
+        {
+            "team_a_id": np.concatenate([t1, t2]),
+            "team_b_id": np.concatenate([t2, t1]),
+            "date": np.concatenate(
+                [merged[asof.DATE_COL].to_numpy(), merged[asof.DATE_COL].to_numpy()]
+            ),
+            "won": np.concatenate([t1_won, 1 - t1_won]),
+        }
+    )
+    side_a = side_a.sort_values("date", kind="stable").reset_index(drop=True)
+    side_a["games_after"] = (
+        side_a.groupby(["team_a_id", "team_b_id"]).cumcount() + 1
+    )
+    side_a["wins_after"] = side_a.groupby(["team_a_id", "team_b_id"])["won"].cumsum()
+
+    def _pair_result() -> tuple[np.ndarray, np.ndarray]:
+        """Resolve every row's ordered pair totals.
+
+        Returns:
+            A ``(games, wins)`` float array pair aligned to ``rows_df``
+            (NaN where the pair has no strictly-prior map).
+
+        Raises:
+            Nothing (validation propagated from the lookup).
+        """
+        queries = rows_df[
+            [asof.TEAM1_ID_COL, asof.TEAM2_ID_COL, asof.DATE_COL]
+        ].reset_index(drop=True)
+        looked = asof.merge_asof_lookup(
+            side_a,
+            ("team_a_id", "team_b_id"),
+            asof.DATE_COL,
+            ("games_after", "wins_after"),
+            queries,
+            (asof.TEAM1_ID_COL, asof.TEAM2_ID_COL),
+            asof.DATE_COL,
+        )
+        return (
+            looked["games_after"].to_numpy(dtype=float),
+            looked["wins_after"].to_numpy(dtype=float),
+        )
+
+    games, wins = _pair_result()
+    games = np.where(np.isnan(games), 0.0, games)
+    wins = np.where(np.isnan(wins), 0.0, wins)
+    alpha = wins + k_value * H2H_PRIOR
+    beta = (games - wins) + k_value * (1.0 - H2H_PRIOR)
+    mean = alpha / (alpha + beta)
+    return mean - H2H_PRIOR
+
+
+def batched_event_stage(
+    rows_df: pd.DataFrame,
+    matches_df: pd.DataFrame,
+) -> np.ndarray:
+    """Return per-row integer event stage numbers as floats.
+
+    The batched sibling of the :func:`match_event_stage` call
+    :func:`models._shared.build_feature_vector` makes per row (task
+    052). The row table carries each row's ``match_id`` (a required
+    column of the batched contract — no ``(team1, team2, date)``
+    re-resolution is needed), so the stage is a pure vectorized
+    ``match_id -> event_name -> event_stage`` map built once from
+    ``matches_df``; every row's stage parses through the same strict
+    :func:`event_stage` parser (``Stage\\s+(\\d+)``, fail loud on
+    drift).
+
+    Args:
+        rows_df: The row table; needs a ``match_id`` column. Row order
+            is preserved in the output.
+        matches_df: The materialised ``matches`` table (needs
+            ``match_id`` and ``event_name``).
+
+    Returns:
+        A ``(n,)`` numpy array of ``float``: each row's stage number
+        (e.g. ``1.0``/``2.0``).
+
+    Raises:
+        KeyError: If a table lacks a required column (propagated from
+            ``utils.asof.require_columns``).
+        ValueError: If a row's ``match_id`` is absent from
+            ``matches_df``, or if any match's ``event_name`` does not
+            contain a parseable ``Stage N`` token (propagated from
+            :func:`event_stage`).
+        TypeError: If a match's ``event_name`` cell is not a string
+            (propagated from :func:`event_stage`).
+    """
+    asof.require_columns(
+        matches_df, (asof.MATCH_ID_COL, EVENT_NAME_COL), "matches_df"
+    )
+    if asof.MATCH_ID_COL not in rows_df.columns:
+        raise KeyError(
+            "rows_df is missing required column(s): ['match_id'] (the "
+            "batched event-stage path resolves stages by match_id, so "
+            "the row table must carry it)"
+        )
+    stage_by_match: dict = {}
+    for row in matches_df.itertuples(index=False):
+        stage_by_match[getattr(row, asof.MATCH_ID_COL)] = event_stage(
+            getattr(row, EVENT_NAME_COL)
+        )
+    ids = rows_df[asof.MATCH_ID_COL].to_numpy()
+    missing = [mid for mid in ids if mid not in stage_by_match]
+    if missing:
+        raise ValueError(
+            f"match_id {missing[0]!r} is not present in matches_df"
+        )
+    return np.asarray([float(stage_by_match[mid]) for mid in ids], dtype=float)
+
+
+def batched_days_since_diff(
+    rows_df: pd.DataFrame,
+    matches_df: pd.DataFrame,
+) -> np.ndarray:
+    """Return per-row rest-gap differentials (A minus B, days).
+
+    The batched sibling of the two :func:`days_since_last_match` calls
+    :func:`models._shared.build_feature_vector` makes per row (task
+    052). A per-team ledger of every completed match (one event per
+    participating side, dated by the match) is built once, and each
+    row's two sides are resolved against it with
+    ``utils.asof.merge_asof_lookup`` returning the *date string* of
+    the side's last completed match strictly before the row's date
+    (strict-``<`` per query). The whole-day gap
+    ``int((query - last_match_date).days)`` is then computed vectorized
+    (non-negative; ``0`` for a same-calendar-day gap, exactly as the
+    single-row ``Timedelta.days`` floors sub-day gaps), with a side
+    that has no prior completed match treated as ``0`` before
+    differencing — the module's documented ``None``-then-``0``
+    fallback, bit-for-bit identical to looping the single-row calls.
+
+    Args:
+        rows_df: The row table; needs ``team1_id``, ``team2_id`` and
+            ``date`` columns. Row order is preserved in the output.
+        matches_df: The materialised ``matches`` table (needs
+            ``match_id``, ``team1_id``, ``team2_id``, ``date``,
+            ``status``).
+
+    Returns:
+        A ``(n,)`` numpy array of ``float``: the team1-side rest gap
+        minus the team2-side rest gap per row (an unseen/no-prior-match
+        side contributes ``0``).
+
+    Raises:
+        KeyError: If a table lacks a required column (propagated from
+            ``utils.asof.require_columns``).
+        ValueError: If ``matches_df`` contains duplicate ``match_id``
+            values among the completed rows, or if a row date is
+            null/unparseable (propagated from
+            ``utils.asof.parse_date_column``).
+    """
+    asof.require_columns(
+        matches_df,
+        (
+            asof.MATCH_ID_COL,
+            asof.TEAM1_ID_COL,
+            asof.TEAM2_ID_COL,
+            asof.DATE_COL,
+            asof.STATUS_COL,
+        ),
+        "matches_df",
+    )
+    completed = matches_df[matches_df[asof.STATUS_COL] == asof.COMPLETED_STATUS]
+    if not completed[asof.MATCH_ID_COL].is_unique:
+        raise ValueError(
+            "matches_df contains duplicate match_id values among the "
+            "completed rows; the days-since ledger would double count a "
+            "match"
+        )
+    date_col = asof.DATE_COL
+    side1 = pd.DataFrame(
+        {
+            "team_id": completed[asof.TEAM1_ID_COL].to_numpy(),
+            "date": completed[date_col].to_numpy(),
+            "last_match_date": completed[date_col].to_numpy(),
+        }
+    )
+    side2 = pd.DataFrame(
+        {
+            "team_id": completed[asof.TEAM2_ID_COL].to_numpy(),
+            "date": completed[date_col].to_numpy(),
+            "last_match_date": completed[date_col].to_numpy(),
+        }
+    )
+    events = pd.concat([side1, side2], ignore_index=True)
+
+    def _side_gap(team_col: str) -> np.ndarray:
+        """Resolve one side's rest gap per row (0 = no prior match).
+
+        Args:
+            team_col: The row-table team id column.
+
+        Returns:
+            A ``(n_rows,)`` float array of whole-day gaps.
+
+        Raises:
+            Nothing (validation propagated from the lookup).
+        """
+        queries = rows_df[[team_col, date_col]].reset_index(drop=True)
+        looked = asof.merge_asof_lookup(
+            events,
+            ("team_id",),
+            date_col,
+            ("last_match_date",),
+            queries,
+            (team_col,),
+            date_col,
+        )
+        # The value column is the event's *date string*: the side's last
+        # completed match's date, as recorded on the matched event.
+        last_dates = looked["last_match_date"]
+        has_prior = ~pd.isna(last_dates)
+        query_ns = asof.parse_date_column(queries[date_col])
+        days = np.zeros(len(rows_df), dtype=float)
+        if has_prior.any():
+            last_ns = pd.to_datetime(last_dates[has_prior]).astype("int64").to_numpy()
+            q_ns = query_ns[has_prior].astype("int64").to_numpy()
+            days[has_prior] = ((q_ns - last_ns) // 86_400_000_000_000).astype(float)
+        return days
+
+    days_a = _side_gap(asof.TEAM1_ID_COL)
+    days_b = _side_gap(asof.TEAM2_ID_COL)
+    return days_a - days_b
+
+
+def batched_roster_decay_diff(
+    rows_df: pd.DataFrame,
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+    player_map_stats_df: pd.DataFrame,
+    jaccard_threshold: float = DEFAULT_JACCARD_THRESHOLD,
+    half_life_days: float = DEFAULT_HALF_LIFE_DAYS,
+) -> np.ndarray:
+    """Return per-row roster-change decay differentials (A minus B).
+
+    The batched sibling of the two :func:`team_roster_change` calls
+    :func:`models._shared.build_feature_vector` makes per row (task
+    052). Per team, the chronological list of evaluable rosters (the
+    distinct player-name set of each map that actually has rows for
+    that team) is precomputed once over the whole league — the exact
+    :func:`_roster_sets_chronological` machinery run forward over all
+    maps instead of per query. Each row's sides are then resolved with
+    the rank-then-slice pattern: the count of evaluable rosters
+    strictly before the row's date (the strict-``<`` boundary) is found
+    by binary search, and the two most recent rosters before that rank
+    feed the unchanged Jaccard similarity / threshold comparison /
+    ``0.5 ** (days / half_life)`` decay arithmetic (``days`` is the
+    whole-day gap between the row's date and the newer roster's map,
+    floored exactly as the single-row path floors it). Fewer than two
+    evaluable rosters, or no declared change, yields the ``None``-then-
+    ``1.0`` fallback per side (no penalty), so the output is
+    bit-for-bit identical to looping the single-row calls.
+
+    Args:
+        rows_df: The row table; needs ``team1_id``, ``team2_id`` and
+            ``date`` columns. Row order is preserved in the output.
+        matches_df: The materialised ``matches`` table.
+        maps_df: The materialised ``maps`` table.
+        player_map_stats_df: The materialised ``player_map_stats``
+            table.
+        jaccard_threshold: The similarity below which a change is
+            declared (see :func:`_validate_jaccard_threshold`).
+        half_life_days: The post-change decay half-life in days (see
+            :func:`_validate_half_life_days`).
+
+    Returns:
+        A ``(n,)`` numpy array of ``float``: the team1-side decay
+        multiplier (``1.0`` when absent) minus the team2-side's per
+        row.
+
+    Raises:
+        KeyError: If a table lacks a required column (propagated from
+            the event builder / as-of helpers).
+        ValueError: If ``jaccard_threshold`` or ``half_life_days`` is
+            invalid (see the validate helpers); if a match's two side
+            names are identical or a ``player_map_stats`` ``team_name``
+            matches neither side (propagated from the roster walk); or
+            if a row date is null/unparseable (propagated from
+            ``utils.asof.parse_date_column``).
+    """
+    threshold = _validate_jaccard_threshold(jaccard_threshold)
+    half_life = _validate_half_life_days(half_life_days)
+
+    # Per team: parsed-date array + parallel roster-set list, in the
+    # same chronological (date, match_id, map_index) order the
+    # single-row path sorts a team's evaluable maps by.
+    asof.require_columns(
+        matches_df,
+        (
+            asof.MATCH_ID_COL,
+            asof.TEAM1_ID_COL,
+            asof.TEAM2_ID_COL,
+            TEAM1_NAME_COL,
+            TEAM2_NAME_COL,
+            asof.DATE_COL,
+            asof.STATUS_COL,
+        ),
+        "matches_df",
+    )
+    asof.require_columns(
+        maps_df, (asof.MATCH_ID_COL, asof.MAP_INDEX_COL, asof.WINNER_COL), "maps_df"
+    )
+    asof.require_columns(player_map_stats_df, _PMS_REQUIRED, "player_map_stats_df")
+
+    completed = matches_df[matches_df[asof.STATUS_COL] == asof.COMPLETED_STATUS]
+    if not completed[asof.MATCH_ID_COL].is_unique:
+        raise ValueError(
+            "matches_df contains duplicate match_id values among the "
+            "completed rows; the roster walk would double count a map"
+        )
+    match_names = _build_match_name_lookup(matches_df)
+    match_meta = completed[
+        [
+            asof.MATCH_ID_COL,
+            asof.TEAM1_ID_COL,
+            asof.TEAM2_ID_COL,
+            asof.DATE_COL,
+        ]
+    ]
+    finished = maps_df[maps_df[asof.WINNER_COL].notna()][
+        [asof.MATCH_ID_COL, asof.MAP_INDEX_COL]
+    ]
+    eligible = finished.merge(match_meta, on=asof.MATCH_ID_COL, how="inner")
+    eligible = (
+        eligible.assign(_parsed=pd.to_datetime(eligible[asof.DATE_COL]))
+        .sort_values(
+            ["_parsed", asof.MATCH_ID_COL, asof.MAP_INDEX_COL], kind="stable"
+        )
+        .reset_index(drop=True)
+    )
+    pms_groups = {
+        (key[0], int(key[1])): group
+        for key, group in player_map_stats_df.groupby(
+            [asof.MATCH_ID_COL, asof.MAP_INDEX_COL], sort=False
+        )
+    }
+    per_team: dict[str, tuple[np.ndarray, list]] = {}
+    ids_t1 = eligible[asof.TEAM1_ID_COL].to_numpy()
+    ids_t2 = eligible[asof.TEAM2_ID_COL].to_numpy()
+    ids_mid = eligible[asof.MATCH_ID_COL].to_numpy()
+    ids_map = eligible[asof.MAP_INDEX_COL].to_numpy()
+    dates_ns = eligible["_parsed"].astype(np.int64).to_numpy()
+    for position in range(len(eligible)):
+        match_id = ids_mid[position]
+        map_index = int(ids_map[position])
+        date_value = int(dates_ns[position])
+        group = pms_groups.get((match_id, map_index))
+        if group is None:
+            continue
+        team1_name, team2_name = match_names[match_id]
+        for team_id, resolved_name in (
+            (ids_t1[position], team1_name),
+            (ids_t2[position], team2_name),
+        ):
+            roster = _validated_roster(
+                group, resolved_name, {team1_name, team2_name}, match_id, map_index
+            )
+            players = set(roster[PLAYER_NAME_COL].dropna())
+            if not players:
+                continue
+            dates_arr, rosters = per_team.setdefault(
+                team_id, (np.asarray([], dtype=np.int64), [])
+            )
+            per_team[team_id] = (
+                np.append(dates_arr, date_value),
+                rosters + [players],
+            )
+
+    query_ns = asof.parse_date_column(rows_df[asof.DATE_COL]).to_numpy().astype(np.int64)
+
+    def _side_decay(team_col: str) -> np.ndarray:
+        """Resolve one side's per-row decay multiplier (1.0 = none).
+
+        Args:
+            team_col: The row-table team id column.
+
+        Returns:
+            A ``(n_rows,)`` float array of decay multipliers, ``1.0``
+            when the side has no declared roster change as of that row.
+
+        Raises:
+            Nothing.
+        """
+        team_ids = rows_df[team_col].to_numpy()
+        out = np.ones(len(rows_df), dtype=float)
+        for i in range(len(rows_df)):
+            pair = per_team.get(team_ids[i])
+            if pair is None:
+                continue
+            dates_arr, rosters = pair
+            rank = int(np.searchsorted(dates_arr, query_ns[i], side="left"))
+            if rank < 2:
+                continue
+            current_date_ns = int(dates_arr[rank - 1])
+            current = rosters[rank - 1]
+            prior = rosters[rank - 2]
+            union = current | prior
+            intersection = current & prior
+            similarity = len(intersection) / len(union) if union else 0.0
+            changed = similarity < threshold
+            if not changed:
+                continue
+            days = (query_ns[i] - current_date_ns) // 86_400_000_000_000
+            out[i] = _decay_multiplier(int(days), half_life)
+        return out
+
+    decay_a = _side_decay(asof.TEAM1_ID_COL)
+    decay_b = _side_decay(asof.TEAM2_ID_COL)
+    return decay_a - decay_b

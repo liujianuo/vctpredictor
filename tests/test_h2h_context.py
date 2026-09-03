@@ -14,6 +14,7 @@ pass.
 import math
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -623,3 +624,188 @@ def test_real_data_sanity_sane_numbers():
     assert rc.changed in (True, False, None)
     if rc.changed is not None:
         assert rc.similarity is not None and 0.0 <= rc.similarity <= 1.0
+
+
+# --------------------------------------------------------------------------
+# batched h2h_context parity (task 052)
+# --------------------------------------------------------------------------
+
+
+def _h2h_parity_fixture():
+    """Build a multi-feature A-vs-B fixture plus a row table.
+
+    Teams ``A`` ("Alpha") and ``B`` ("Beta") play three single-map
+    completed matches (m1 01-01, m2 01-03, m3 01-05), with a roster
+    change for A between m1 and m2 (players ``p1``/``p2`` swapped for
+    ``p6``/``p7`` — Jaccard ``3/7 ~ 0.43 < 0.6``, a declared change)
+    and a stable B roster throughout. Each match row carries
+    ``event_name`` "VCT 2026: EMEA Stage 2" (stage 2).
+
+    Returns:
+        A ``(matches_df, maps_df, pms_df, rows_df)`` tuple; ``rows_df``
+        has ``team1_id, team2_id, map_name, date, match_id`` columns.
+
+    Raises:
+        Nothing.
+    """
+    matches_rows = [
+        {"match_id": "m1", "date": "2026-01-01T10:00:00", "team1_id": "A",
+         "team2_id": "B", "team1_name": "Alpha", "team2_name": "Beta",
+         "event_name": "VCT 2026: EMEA Stage 2", "status": "completed"},
+        {"match_id": "m2", "date": "2026-01-03T10:00:00", "team1_id": "B",
+         "team2_id": "A", "team1_name": "Beta", "team2_name": "Alpha",
+         "event_name": "VCT 2026: EMEA Stage 2", "status": "completed"},
+        {"match_id": "m3", "date": "2026-01-05T10:00:00", "team1_id": "A",
+         "team2_id": "B", "team1_name": "Alpha", "team2_name": "Beta",
+         "event_name": "VCT 2026: EMEA Stage 2", "status": "completed"},
+    ]
+    maps_rows = [
+        {"match_id": "m1", "map_index": 0, "map_name": "Haven",
+         "team1_score": 13, "team2_score": 8, "winner": "A"},
+        {"match_id": "m2", "map_index": 0, "map_name": "Bind",
+         "team1_score": 13, "team2_score": 10, "winner": "B"},
+        {"match_id": "m3", "map_index": 0, "map_name": "Haven",
+         "team1_score": 11, "team2_score": 13, "winner": "B"},
+    ]
+    matches_df = _matches_df(matches_rows)
+    maps_df = _maps_df(maps_rows)
+
+    pms_rows = []
+    roster_a1 = _ROSTER_A
+    roster_a2 = ["p6", "p7", "p3", "p4", "p5"]
+    roster_b = ["q1", "q2", "q3", "q4", "q5"]
+
+    def add_roster(match, team_name, players, acs_start):
+        """Append one side's 5 pms rows for a match.
+
+        Args:
+            match: The match id.
+            team_name: The side's display name.
+            players: The 5 player names.
+            acs_start: Base acs value (varied per row).
+
+        Returns:
+            None (appends to ``pms_rows``).
+
+        Raises:
+            Nothing.
+        """
+        for idx, name in enumerate(players):
+            pms_rows.append(
+                {
+                    "match_id": match,
+                    "map_index": 0,
+                    "player_name": name,
+                    "team_name": team_name,
+                    "rating": 1.0 + 0.1 * idx,
+                    "acs": acs_start + idx,
+                }
+            )
+
+    add_roster("m1", "Alpha", roster_a1, 200)
+    add_roster("m1", "Beta", roster_b, 190)
+    add_roster("m2", "Alpha", roster_a2, 210)
+    add_roster("m2", "Beta", roster_b, 195)
+    add_roster("m3", "Alpha", roster_a2, 205)
+    add_roster("m3", "Beta", roster_b, 185)
+    pms_df = _pms_df(pms_rows)
+
+    rows_df = pd.DataFrame(
+        [
+            {"team1_id": "A", "team2_id": "B", "map_name": "Haven",
+             "date": "2026-01-01T10:00:00", "match_id": "m1"},
+            {"team1_id": "A", "team2_id": "B", "map_name": "Bind",
+             "date": "2026-01-03T10:00:00", "match_id": "m2"},
+            {"team1_id": "A", "team2_id": "B", "map_name": "Haven",
+             "date": "2026-01-04T10:00:00", "match_id": "m2"},
+            {"team1_id": "A", "team2_id": "B", "map_name": "Haven",
+             "date": "2026-01-05T10:00:00", "match_id": "m3"},
+            {"team1_id": "A", "team2_id": "B", "map_name": "Haven",
+             "date": "2026-01-06T10:00:00", "match_id": "m3"},
+            {"team1_id": "Z", "team2_id": "Y", "map_name": "Haven",
+             "date": "2026-01-06T10:00:00", "match_id": "m3"},
+        ]
+    )
+    return matches_df, maps_df, pms_df, rows_df
+
+
+def test_batched_h2h_win_rate_centered_bit_exact_parity():
+    # batched_h2h_win_rate_centered reproduces the looped single-row
+    # team_pair_h2h centered means element-for-element, including the
+    # never-played-pair row (full shrinkage -> exactly 0.0).
+    matches_df, maps_df, _pms_df, rows_df = _h2h_parity_fixture()
+    expected = np.zeros(len(rows_df))
+    for i, row in enumerate(rows_df.itertuples(index=False)):
+        mean = h2h_context.team_pair_h2h(
+            row.team1_id, row.team2_id, row.date, matches_df, maps_df,
+            k=h2h_context.DEFAULT_H2H_K,
+        ).mean
+        expected[i] = mean - h2h_context.H2H_PRIOR
+    got = h2h_context.batched_h2h_win_rate_centered(
+        rows_df, matches_df, maps_df
+    )
+    assert np.array_equal(got, expected)
+    assert got[-1] == 0.0
+
+
+def test_batched_event_stage_matches_single_row():
+    # The batched stage map reproduces match_event_stage per row, and a
+    # row whose match_id is absent raises the same ValueError class as
+    # the single-row lookup.
+    matches_df, _maps_df, _pms_df, rows_df = _h2h_parity_fixture()
+    expected = np.asarray(
+        [
+            float(h2h_context.match_event_stage(r.match_id, matches_df))
+            for r in rows_df.itertuples(index=False)
+        ]
+    )
+    got = h2h_context.batched_event_stage(rows_df, matches_df)
+    assert np.array_equal(got, expected)
+    assert set(got) == {2.0}
+    bad = pd.DataFrame(
+        {"team1_id": ["A"], "team2_id": ["B"], "map_name": ["Haven"],
+         "date": ["2026-01-06T10:00:00"], "match_id": ["nope"]}
+    )
+    with pytest.raises(ValueError, match="not present"):
+        h2h_context.batched_event_stage(bad, matches_df)
+
+
+def test_batched_days_since_diff_bit_exact_parity():
+    # batched_days_since_diff reproduces the looped single-row
+    # days_since_last_match per row (None -> 0 fallback included).
+    matches_df, _maps_df, _pms_df, rows_df = _h2h_parity_fixture()
+    expected = np.zeros(len(rows_df))
+    for i, row in enumerate(rows_df.itertuples(index=False)):
+        da = h2h_context.days_since_last_match(
+            row.team1_id, row.date, matches_df
+        )
+        db = h2h_context.days_since_last_match(
+            row.team2_id, row.date, matches_df
+        )
+        expected[i] = (da if da is not None else 0) - (
+            db if db is not None else 0
+        )
+    got = h2h_context.batched_days_since_diff(rows_df, matches_df)
+    assert np.array_equal(got, expected)
+
+
+def test_batched_roster_decay_diff_bit_exact_parity():
+    # batched_roster_decay_diff reproduces the looped single-row
+    # team_roster_change decay multipliers per row (None -> 1.0
+    # fallback included): rows before A's change declare no decay, the
+    # row just after it carries the half-life decay, and the unseen
+    # team row is 0.0.
+    matches_df, maps_df, pms_df, rows_df = _h2h_parity_fixture()
+    expected = np.zeros(len(rows_df))
+    for i, row in enumerate(rows_df.itertuples(index=False)):
+        ra = h2h_context.team_roster_change(
+            row.team1_id, row.date, matches_df, maps_df, pms_df
+        )
+        rb = h2h_context.team_roster_change(
+            row.team2_id, row.date, matches_df, maps_df, pms_df
+        )
+        dec_a = ra.decay_multiplier if ra.decay_multiplier is not None else 1.0
+        dec_b = rb.decay_multiplier if rb.decay_multiplier is not None else 1.0
+        expected[i] = dec_a - dec_b
+    got = h2h_context.batched_roster_decay_diff(rows_df, matches_df, maps_df, pms_df)
+    assert np.array_equal(got, expected)
