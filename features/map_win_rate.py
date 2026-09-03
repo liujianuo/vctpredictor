@@ -64,6 +64,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 
 from features._shared import (
@@ -496,3 +497,289 @@ def select_k(
 
     best_k = min(grid, key=lambda candidate: scores_by_k[candidate])
     return best_k, scores_by_k
+
+
+def _two_sided_map_events(
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Build the league-wide per-team map event frame used by the batched path.
+
+    Every finished map (``winner`` non-null) of every completed match
+    contributes **two** event rows — one per participating team side —
+    carrying that side's id, the match date (as-of key), the normalized
+    ``map_name`` and a ``won`` flag derived from the raw scores
+    (``team1_score > team2_score`` for the team1 side, the reverse for
+    the team2 side — never the ``winner`` display string). Score
+    validation (null/NaN and tie guards, the same fail-loud class as
+    :func:`features._shared._wins_from_oriented_maps`) runs once over
+    the whole league here rather than once per query's as-of subset —
+    the documented whole-league difference of the batched path; real
+    ``data/v1`` has zero such rows, so it never fires on valid data.
+
+    Args:
+        matches_df: The materialised ``matches`` table (needs
+            ``match_id``, ``team1_id``, ``team2_id``, ``date``,
+            ``status``).
+        maps_df: The materialised ``maps`` table (needs ``match_id``,
+            ``winner``, ``map_name``, ``team1_score``, ``team2_score``).
+
+    Returns:
+        A ``pandas.DataFrame`` with columns ``team_id``, ``date``,
+        ``match_id``, ``map_index``, ``map_name`` (normalized through
+        :func:`utils.config.normalize_map_name`) and ``won`` (``0``/``1``
+        ints), two rows per eligible map. Row order is ``maps_df``'s
+        original order (each map's team1 row directly above its team2
+        row); chronological sorting is the caller's job.
+
+    Raises:
+        KeyError: If a table lacks a required column (propagated from
+            ``utils.asof.require_columns``).
+        ValueError: If ``matches_df`` contains duplicate ``match_id``
+            values among the completed rows (the join would fan out and
+            duplicate map rows), or if any eligible map has a null/NaN
+            score or tied scores (impossible for a finished map).
+    """
+    asof.require_columns(
+        matches_df,
+        (
+            asof.MATCH_ID_COL,
+            asof.TEAM1_ID_COL,
+            asof.TEAM2_ID_COL,
+            asof.DATE_COL,
+            asof.STATUS_COL,
+        ),
+        "matches_df",
+    )
+    asof.require_columns(
+        maps_df,
+        (
+            asof.MATCH_ID_COL,
+            asof.WINNER_COL,
+            MAP_NAME_COL,
+            TEAM1_SCORE_COL,
+            TEAM2_SCORE_COL,
+        ),
+        "maps_df",
+    )
+
+    completed = matches_df[matches_df[asof.STATUS_COL] == asof.COMPLETED_STATUS]
+    if not completed[asof.MATCH_ID_COL].is_unique:
+        raise ValueError(
+            "matches_df contains duplicate match_id values among the "
+            "completed rows; the map-event join would fan out and "
+            "duplicate map rows"
+        )
+    finished = maps_df[maps_df[asof.WINNER_COL].notna()]
+    merged = finished.merge(
+        completed[
+            [
+                asof.MATCH_ID_COL,
+                asof.TEAM1_ID_COL,
+                asof.TEAM2_ID_COL,
+                asof.DATE_COL,
+            ]
+        ],
+        on=asof.MATCH_ID_COL,
+        how="inner",
+    )
+
+    team1_scores = merged[TEAM1_SCORE_COL].to_numpy()
+    team2_scores = merged[TEAM2_SCORE_COL].to_numpy()
+    null_mask = pd.isna(team1_scores) | pd.isna(team2_scores)
+    if null_mask.any():
+        offending = merged.loc[null_mask, asof.MATCH_ID_COL].tolist()
+        raise ValueError(
+            f"{len(offending)} league map(s) have a null/NaN score "
+            "(team1_score or team2_score is missing), which is impossible "
+            f"for a finished map; offending match_id(s): {offending[:5]}"
+        )
+    tie_mask = team1_scores == team2_scores
+    if tie_mask.any():
+        offending = merged.loc[tie_mask, asof.MATCH_ID_COL].tolist()
+        raise ValueError(
+            f"{len(offending)} league map(s) have tied scores "
+            "(team1_score == team2_score), which is impossible for a "
+            f"finished map; offending match_id(s): {offending[:5]}"
+        )
+
+    normalized_names = merged[MAP_NAME_COL].map(config.normalize_map_name)
+    side1 = pd.DataFrame(
+        {
+            "team_id": merged[asof.TEAM1_ID_COL].to_numpy(),
+            "date": merged[asof.DATE_COL].to_numpy(),
+            "match_id": merged[asof.MATCH_ID_COL].to_numpy(),
+            "map_index": merged["map_index"].to_numpy(),
+            "map_name": normalized_names.to_numpy(),
+            "won": (team1_scores > team2_scores).astype(int),
+        }
+    )
+    side2 = pd.DataFrame(
+        {
+            "team_id": merged[asof.TEAM2_ID_COL].to_numpy(),
+            "date": merged[asof.DATE_COL].to_numpy(),
+            "match_id": merged[asof.MATCH_ID_COL].to_numpy(),
+            "map_index": merged["map_index"].to_numpy(),
+            "map_name": normalized_names.to_numpy(),
+            "won": (team2_scores > team1_scores).astype(int),
+        }
+    )
+    return pd.concat([side1, side2], ignore_index=True)
+
+
+def batched_map_win_rate_diff(
+    rows_df: pd.DataFrame,
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+    k=DEFAULT_K,
+) -> np.ndarray:
+    """Return per-row shrunk per-map win-rate differentials (A minus B).
+
+    The batched sibling of the two :func:`team_map_win_rate` calls
+    :func:`models._shared.build_feature_vector` makes per row (task
+    052): builds the league-wide per-team map event frame once via
+    :func:`_two_sided_map_events`, records per-key running totals over
+    the chronologically-sorted events (per-team overall wins/games for
+    the prior, and per-``(team, map_name)`` wins/games for the
+    numerator — both via ``groupby(...).cumcount()``/``cumsum()``), and
+    resolves each row's two sides against those static ledgers with
+    ``utils.asof.merge_asof_lookup`` — one team1 lookup and one team2
+    lookup per ledger, so every row's count is the count of that side's
+    events dated strictly before the row's own date (the strict-``<``
+    boundary enforced per query by the as-of primitive, never by
+    trusting a pre-filtered view). The Beta formula is then applied
+    vectorized with the exact same arithmetic and operand order as the
+    single-row estimator (``prior = wins/games`` when ``games > 0``
+    else ``0.5``; ``alpha = map_wins + k*prior``; ``beta =
+    (map_games - map_wins) + k*(1 - prior)``; ``mean =
+    alpha/(alpha+beta)``), so a zero-history side degrades to the full
+    shrinkage value exactly as the single-row path does, and the output
+    is bit-for-bit identical to looping the single-row calls.
+
+    Args:
+        rows_df: The row table; needs ``team1_id``, ``team2_id``,
+            ``map_name`` and ``date`` columns. Row order is preserved
+            in the output.
+        matches_df: The materialised ``matches`` table.
+        maps_df: The materialised ``maps`` table.
+        k: The shrinkage strength (effective prior sample size); must be
+            a positive finite real number (see :func:`_validate_k`).
+
+    Returns:
+        A ``(n,)`` numpy array of ``float``:
+        ``team_map_win_rate(team1, map, date, ...).mean`` minus
+        ``team_map_win_rate(team2, map, date, ...).mean`` per row, where
+        a side with zero prior maps on the queried map degrades to its
+        own overall-rate prior exactly as the single-row estimator does.
+
+    Raises:
+        KeyError: If a table lacks a required column (propagated from
+            the event builder / as-of helpers).
+        ValueError: If ``k`` is invalid (see :func:`_validate_k`), if
+            any league map has a null/NaN score or tied scores (see
+            :func:`_two_sided_map_events`), or if a row date is
+            null/unparseable (propagated from
+            ``utils.asof.parse_date_column``).
+        ConfigError: If a map name is not a string (propagated from
+            :func:`utils.config.normalize_map_name`).
+    """
+    k_value = _validate_k(k)
+    events = _two_sided_map_events(matches_df, maps_df)
+
+    parsed = asof.parse_date_column(events[asof.DATE_COL])
+    events = (
+        events.assign(_parsed_date=parsed)
+        .sort_values(
+            ["_parsed_date", asof.MATCH_ID_COL, "map_index", "team_id"],
+            kind="stable",
+        )
+        .drop(columns=["_parsed_date"])
+    )
+    events = events.reset_index(drop=True)
+
+    events["games_after"] = events.groupby("team_id").cumcount() + 1
+    events["wins_after"] = events.groupby("team_id")["won"].cumsum()
+    events["map_games_after"] = (
+        events.groupby(["team_id", "map_name"]).cumcount() + 1
+    )
+    events["map_wins_after"] = (
+        events.groupby(["team_id", "map_name"])["won"].cumsum()
+    )
+
+    def _side_result(team_col: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Resolve one side's overall + per-map running totals for every row.
+
+        Args:
+            team_col: The row-table team id column to resolve
+                (``"team1_id"`` or ``"team2_id"``).
+
+        Returns:
+            A ``(games_overall, wins_overall, map_games, map_wins)``
+            tuple of float numpy arrays aligned to ``rows_df`` (``NaN``
+            where the side has no strictly-prior event for that ledger).
+
+        Raises:
+            Nothing (validation propagated from the lookups).
+        """
+        queries_overall = rows_df[[team_col, asof.DATE_COL]].reset_index(drop=True)
+        overall = asof.merge_asof_lookup(
+            events,
+            ("team_id",),
+            asof.DATE_COL,
+            ("games_after", "wins_after"),
+            queries_overall,
+            (team_col,),
+            asof.DATE_COL,
+        )
+        query_map = rows_df[[team_col, MAP_NAME_COL, asof.DATE_COL]].copy()
+        query_map[MAP_NAME_COL] = query_map[MAP_NAME_COL].map(
+            config.normalize_map_name
+        )
+        query_map = query_map.reset_index(drop=True)
+        per_map = asof.merge_asof_lookup(
+            events,
+            ("team_id", "map_name"),
+            asof.DATE_COL,
+            ("map_games_after", "map_wins_after"),
+            query_map,
+            (team_col, MAP_NAME_COL),
+            asof.DATE_COL,
+        )
+        return (
+            overall["games_after"].to_numpy(dtype=float),
+            overall["wins_after"].to_numpy(dtype=float),
+            per_map["map_games_after"].to_numpy(dtype=float),
+            per_map["map_wins_after"].to_numpy(dtype=float),
+        )
+
+    games_a, wins_a, map_games_a, map_wins_a = _side_result(asof.TEAM1_ID_COL)
+    games_b, wins_b, map_games_b, map_wins_b = _side_result(asof.TEAM2_ID_COL)
+
+    def _shrunk_mean(games_o, wins_o, map_games, map_wins):
+        """Apply the Beta formula vectorized for one side.
+
+        Args:
+            games_o: Overall as-of games (float array, NaN = none).
+            wins_o: Overall as-of wins (float array, NaN = none).
+            map_games: Per-map as-of games (float array, NaN = none).
+            map_wins: Per-map as-of wins (float array, NaN = none).
+
+        Returns:
+            The per-row posterior mean array.
+
+        Raises:
+            Nothing.
+        """
+        games_o = np.where(np.isnan(games_o), 0.0, games_o)
+        wins_o = np.where(np.isnan(wins_o), 0.0, wins_o)
+        map_games = np.where(np.isnan(map_games), 0.0, map_games)
+        map_wins = np.where(np.isnan(map_wins), 0.0, map_wins)
+        prior = np.full(len(games_o), 0.5)
+        has_games = games_o > 0.0
+        prior[has_games] = wins_o[has_games] / games_o[has_games]
+        alpha = map_wins + k_value * prior
+        beta = (map_games - map_wins) + k_value * (1.0 - prior)
+        return alpha / (alpha + beta)
+
+    return (_shrunk_mean(games_a, wins_a, map_games_a, map_wins_a) -
+            _shrunk_mean(games_b, wins_b, map_games_b, map_wins_b))

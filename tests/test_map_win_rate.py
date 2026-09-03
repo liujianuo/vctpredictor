@@ -12,6 +12,7 @@ smoke test repeats the no-leakage assertion at real ``data/v1`` scale.
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -697,3 +698,110 @@ def test_select_k_zero_validation_instances_raises():
     empty_maps = _maps_df([])
     with pytest.raises(ValueError, match="zero scoreable validation instances"):
         mwr.select_k(matches_df, empty_maps, K_GRID)
+
+
+# --------------------------------------------------------------------------
+# batched map_win_rate_diff parity (task 052)
+# --------------------------------------------------------------------------
+
+
+def _mwr_parity_fixture():
+    """Build a small multi-team, multi-map fixture plus a row table.
+
+    Three teams over three dates, with team ``A`` playing Haven twice
+    (win then loss) and Bind once, team ``B`` playing only Haven, and
+    team ``Z`` appearing only in the row table (an unseen side, so the
+    full-shrinkage zero-history path runs inside the same batched
+    call). Map names are deliberately mixed-case in the maps table and
+    lowercase in the row table so the case-normalization edge (the
+    normalized name must be the ledger key and the query key) is
+    exercised end to end.
+
+    Returns:
+        A ``(matches_df, maps_df, rows_df)`` tuple; ``rows_df`` has
+        ``team1_id, team2_id, map_name, date`` columns.
+
+    Raises:
+        Nothing.
+    """
+    matches_rows = [
+        {"match_id": "m1", "date": "2026-01-01T10:00:00", "team1_id": "A",
+         "team2_id": "B", "status": "completed"},
+        {"match_id": "m2", "date": "2026-01-03T10:00:00", "team1_id": "B",
+         "team2_id": "A", "status": "completed"},
+        {"match_id": "m3", "date": "2026-01-05T10:00:00", "team1_id": "A",
+         "team2_id": "B", "status": "completed"},
+    ]
+    maps_rows = [
+        {"match_id": "m1", "map_index": 0, "map_name": "haven",
+         "team1_score": 13, "team2_score": 8, "winner": "A"},
+        {"match_id": "m2", "map_index": 0, "map_name": "Haven",
+         "team1_score": 13, "team2_score": 10, "winner": "B"},
+        {"match_id": "m2", "map_index": 1, "map_name": "Bind",
+         "team1_score": 11, "team2_score": 13, "winner": "A"},
+        {"match_id": "m3", "map_index": 0, "map_name": "Haven",
+         "team1_score": 13, "team2_score": 6, "winner": "A"},
+    ]
+    matches_df = _matches_df(matches_rows)
+    maps_df = _maps_df(maps_rows)
+    rows_df = pd.DataFrame(
+        [
+            {"team1_id": "A", "team2_id": "B", "map_name": "haven",
+             "date": "2026-01-01T10:00:00"},
+            {"team1_id": "A", "team2_id": "B", "map_name": "HAVEN",
+             "date": "2026-01-03T10:00:00"},
+            {"team1_id": "A", "team2_id": "B", "map_name": "bind",
+             "date": "2026-01-03T10:00:00"},
+            {"team1_id": "A", "team2_id": "B", "map_name": "Haven",
+             "date": "2026-01-05T10:00:00"},
+            {"team1_id": "Z", "team2_id": "A", "map_name": "haven",
+             "date": "2026-01-06T10:00:00"},
+            {"team1_id": "B", "team2_id": "A", "map_name": "Haven",
+             "date": "2026-01-06T10:00:00"},
+        ]
+    )
+    return matches_df, maps_df, rows_df
+
+
+def test_batched_map_win_rate_diff_bit_exact_parity():
+    # The batched path reproduces, element-for-element, the looped
+    # single-row team_map_win_rate means per row (no tolerance),
+    # including the unseen-team full-shrinkage row and the map-name
+    # case-normalization edge on both the ledger and the query side.
+    matches_df, maps_df, rows_df = _mwr_parity_fixture()
+    expected = np.zeros(len(rows_df))
+    for i, row in enumerate(rows_df.itertuples(index=False)):
+        mean_a = mwr.team_map_win_rate(
+            row.team1_id, row.map_name, row.date, matches_df, maps_df,
+            mwr.DEFAULT_K,
+        ).mean
+        mean_b = mwr.team_map_win_rate(
+            row.team2_id, row.map_name, row.date, matches_df, maps_df,
+            mwr.DEFAULT_K,
+        ).mean
+        expected[i] = mean_a - mean_b
+    got = mwr.batched_map_win_rate_diff(rows_df, matches_df, maps_df)
+    assert got.shape == (len(rows_df),)
+    assert np.array_equal(got, expected)
+
+
+def test_batched_map_win_rate_diff_unseen_row_is_zero():
+    # Two wholly unseen sides both degrade to the 0.5 full-shrinkage
+    # prior, so their differential is exactly 0.0.
+    matches_df, maps_df, _rows = _mwr_parity_fixture()
+    rows_df = pd.DataFrame(
+        [
+            {"team1_id": "Z", "team2_id": "Y", "map_name": "Haven",
+             "date": "2026-01-06T10:00:00"},
+            {"team1_id": "Z", "team2_id": "A", "map_name": "haven",
+             "date": "2026-01-06T10:00:00"},
+        ]
+    )
+    got = mwr.batched_map_win_rate_diff(rows_df, matches_df, maps_df)
+    assert got[0] == 0.0
+    # Z unseen degrades to 0.5; A's Haven history is real, so the diff
+    # is exactly 0.5 minus A's single-row mean.
+    expected_a = mwr.team_map_win_rate(
+        "A", "haven", "2026-01-06T10:00:00", matches_df, maps_df, mwr.DEFAULT_K
+    ).mean
+    assert got[1] == 0.5 - expected_a
