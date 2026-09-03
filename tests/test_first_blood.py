@@ -35,6 +35,7 @@ silently mid-test.
 import math
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -1130,3 +1131,60 @@ def test_real_data_smoke_select_k():
     best_k, scores = fb.select_k(matches_df, maps_df, pms_df)
     assert best_k in fb.DEFAULT_K_GRID
     assert all(math.isfinite(value) and value > 0.0 for value in scores.values())
+
+
+# --------------------------------------------------------------------------
+# batched first-blood diff parity (task 052)
+# --------------------------------------------------------------------------
+
+
+def test_batched_first_blood_diff_bit_exact_parity():
+    # The batched path reproduces, element-for-element, the looped
+    # single-row team_map_first_blood_rate means per row (no
+    # tolerance), across several as-of cutoffs, both seat orientations
+    # for T1, and a wholly unseen side (Z) whose whole hierarchy
+    # degrades exactly as the single-row path degrades it.
+    matches_df, maps_df, pms_df, query = _core_tables()
+    d0, d1, d2, d3 = _stamp(0), _stamp(1), _stamp(2), _stamp(3)
+    rows_df = pd.DataFrame(
+        [
+            {"team1_id": "T1", "team2_id": "T2", "map_name": "Haven", "date": d0},
+            {"team1_id": "T1", "team2_id": "T2", "map_name": "Haven", "date": d1},
+            {"team1_id": "T1", "team2_id": "T3", "map_name": "Haven", "date": d2},
+            {"team1_id": "T1", "team2_id": "T4", "map_name": "Bind", "date": d3},
+            {"team1_id": "T1", "team2_id": "T4", "map_name": "Bind", "date": query},
+            {"team1_id": "Z", "team2_id": "T1", "map_name": "Haven", "date": query},
+        ]
+    )
+    expected = np.zeros(len(rows_df))
+    for i, row in enumerate(rows_df.itertuples(index=False)):
+        mean_a = fb.team_map_first_blood_rate(
+            row.team1_id, row.map_name, row.date, matches_df, maps_df, pms_df,
+            fb.BEST_K,
+        ).mean
+        mean_b = fb.team_map_first_blood_rate(
+            row.team2_id, row.map_name, row.date, matches_df, maps_df, pms_df,
+            fb.BEST_K,
+        ).mean
+        expected[i] = mean_a - mean_b
+    got = fb.batched_first_blood_diff(rows_df, matches_df, maps_df, pms_df)
+    assert got.shape == (len(rows_df),)
+    assert np.array_equal(got, expected)
+
+
+def test_batched_first_blood_conservation_violation_still_raises():
+    # The batched path's one-time group validation must still raise the
+    # conservation ValueError when a corrupt fixture group violates the
+    # per-map invariant, exactly as the single-row path does.
+    matches_df, maps_df, pms_df, _query = _core_tables()
+    pms_bad = pms_df.copy()
+    # Break conservation on m1's team1 side (Alpha: fk 11 -> 20; the
+    # mirrored fd on the other side no longer balances the group).
+    mask = (pms_bad["match_id"] == "m1") & (pms_bad["team_name"] == "Alpha")
+    pms_bad.loc[mask, "first_kills"] = 20
+    rows_df = pd.DataFrame(
+        [{"team1_id": "T1", "team2_id": "T2", "map_name": "Haven",
+          "date": _stamp(4)}]
+    )
+    with pytest.raises(ValueError, match="conservation"):
+        fb.batched_first_blood_diff(rows_df, matches_df, maps_df, pms_bad)

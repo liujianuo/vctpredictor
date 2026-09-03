@@ -203,6 +203,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 
 from features._shared import (
@@ -1191,3 +1192,277 @@ def select_k(
 
     best_k = min(grid, key=lambda candidate: scores_by_k[candidate])
     return best_k, scores_by_k
+
+
+def _league_first_blood_events(
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+    player_map_stats_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Derive every eligible map's two sides' roster-summed (FK, FD) pairs.
+
+    The league event source for the batched first-blood path (task
+    052): groups ``player_map_stats`` once by ``(match_id, map_index)``
+    and, for every eligible map (finished map of a completed match)
+    whose group exists, runs the module's per-group validation exactly
+    once — the no-nulls hard invariant, the per-map conservation check
+    (``sum(first_kills) == sum(first_deaths)`` over the full group) and
+    the fail-loud team-name reconciliation — via the same
+    :func:`_side_counts_from_group` resolver the single-row path uses.
+    Each side's ``(first_kills, first_deaths)`` roster sum becomes one
+    event carrying the side's ``team_id`` (resolved via the match row),
+    the match date (as-of key) and the normalized ``map_name``. A map
+    with no group, or a side whose roster is empty, contributes nothing
+    for that side (the skip-and-count rule). Validation therefore runs
+    once over the whole league rather than once per query's as-of
+    subset — the documented whole-league difference of the batched
+    path (real ``data/v1`` has no violating rows).
+
+    Args:
+        matches_df: The materialised ``matches`` table (needs
+            ``match_id``, ``team1_id``, ``team2_id``, ``team1_name``,
+            ``team2_name``, ``date``, ``status``).
+        maps_df: The materialised ``maps`` table (needs ``match_id``,
+            ``map_index``, ``winner``).
+        player_map_stats_df: The materialised ``player_map_stats``
+            table (needs ``match_id``, ``map_index``, ``team_name``,
+            ``first_kills``, ``first_deaths``).
+
+    Returns:
+        A ``pandas.DataFrame`` with columns ``team_id``, ``match_id``,
+        ``map_index``, ``date``, ``map_name`` (normalized),
+        ``first_kills`` and ``first_deaths`` — one row per (map, side)
+        pair whose group validated and yielded a roster.
+
+    Raises:
+        KeyError: If a table lacks a required column (propagated from
+            ``utils.asof.require_columns``).
+        ValueError: If a group violates the conservation/no-nulls hard
+            invariants or the team-name reconciliation (see
+            :func:`_side_counts_from_group`); if a match's two side
+            names are identical (see
+            :func:`features._shared._build_match_name_lookup`); or if
+            ``matches_df`` contains duplicate ``match_id`` values among
+            the completed rows.
+    """
+    asof.require_columns(
+        matches_df,
+        (
+            asof.MATCH_ID_COL,
+            asof.TEAM1_ID_COL,
+            asof.TEAM2_ID_COL,
+            TEAM1_NAME_COL,
+            TEAM2_NAME_COL,
+            asof.DATE_COL,
+            asof.STATUS_COL,
+        ),
+        "matches_df",
+    )
+    asof.require_columns(
+        maps_df, (asof.MATCH_ID_COL, asof.MAP_INDEX_COL, asof.WINNER_COL), "maps_df"
+    )
+    asof.require_columns(player_map_stats_df, _PMS_REQUIRED, "player_map_stats_df")
+
+    completed = matches_df[matches_df[asof.STATUS_COL] == asof.COMPLETED_STATUS]
+    if not completed[asof.MATCH_ID_COL].is_unique:
+        raise ValueError(
+            "matches_df contains duplicate match_id values among the "
+            "completed rows; the first-blood event join would fan out "
+            "and duplicate map rows"
+        )
+    match_names = _build_match_name_lookup(matches_df)
+    meta = completed[
+        [
+            asof.MATCH_ID_COL,
+            asof.TEAM1_ID_COL,
+            asof.TEAM2_ID_COL,
+            asof.DATE_COL,
+        ]
+    ]
+    finished = maps_df[maps_df[asof.WINNER_COL].notna()][
+        [asof.MATCH_ID_COL, asof.MAP_INDEX_COL, MAP_NAME_COL]
+    ]
+    eligible = finished.merge(meta, on=asof.MATCH_ID_COL, how="inner")
+    groups = _pms_groups(player_map_stats_df)
+
+    rows_out: list[dict] = []
+    for row in eligible.itertuples(index=False):
+        match_id = getattr(row, asof.MATCH_ID_COL)
+        map_index = int(getattr(row, asof.MAP_INDEX_COL))
+        group = groups.get((match_id, map_index))
+        if group is None:
+            continue
+        team1_name, team2_name = match_names[match_id]
+        for team_id, resolved_name in (
+            (getattr(row, asof.TEAM1_ID_COL), team1_name),
+            (getattr(row, asof.TEAM2_ID_COL), team2_name),
+        ):
+            pair = _side_counts_from_group(
+                group, resolved_name, {team1_name, team2_name}, match_id, map_index
+            )
+            if pair is None:
+                continue
+            rows_out.append(
+                {
+                    "team_id": team_id,
+                    asof.MATCH_ID_COL: match_id,
+                    asof.MAP_INDEX_COL: map_index,
+                    asof.DATE_COL: getattr(row, asof.DATE_COL),
+                    MAP_NAME_COL: config.normalize_map_name(
+                        getattr(row, MAP_NAME_COL)
+                    ),
+                    FIRST_KILLS_COL: pair[0],
+                    FIRST_DEATHS_COL: pair[1],
+                }
+            )
+    return pd.DataFrame(rows_out)
+
+
+def batched_first_blood_diff(
+    rows_df: pd.DataFrame,
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+    player_map_stats_df: pd.DataFrame,
+    k=BEST_K,
+    overall_k=DEFAULT_OVERALL_K,
+) -> np.ndarray:
+    """Return per-row shrunk first-blood rate differentials (A minus B).
+
+    The batched sibling of the two :func:`team_map_first_blood_rate`
+    calls :func:`models._shared.build_feature_vector` makes per row
+    (task 052). The league's per-side roster-summed ``(first_kills,
+    first_deaths)`` pairs are derived once via
+    :func:`_league_first_blood_events` (one group-validation pass over
+    ``player_map_stats`` instead of one per query), and two families of
+    running totals are recorded over the chronologically-sorted events:
+    per-team ``FK``/``FD`` (the inner level's inputs) and per-
+    ``(team, map_name)`` ``FK``/``FD`` (the outer level's). Each row's
+    two sides are resolved against those ledgers with
+    ``utils.asof.merge_asof_lookup`` (strict ``<`` per query), and the
+    two-level Beta-binomial hierarchy is applied vectorized with the
+    exact same arithmetic and operand order as the single-row
+    estimators: the inner level shrinks the team's overall rate toward
+    the exact structural constant :data:`LEAGUE_FIRST_BLOOD_RATE`
+    (``0.5`` — no ledger needed) with ``overall_k``, and the outer
+    level shrinks the map rate toward the inner mean with ``k``. A
+    zero-history side degrades through the hierarchy exactly as the
+    single-row path does, bit-for-bit identical to looping the
+    single-row calls.
+
+    Args:
+        rows_df: The row table; needs ``team1_id``, ``team2_id``,
+            ``map_name`` and ``date`` columns. Row order is preserved
+            in the output.
+        matches_df: The materialised ``matches`` table.
+        maps_df: The materialised ``maps`` table.
+        player_map_stats_df: The materialised ``player_map_stats``
+            table.
+        k: The outer-level shrinkage strength (see
+            :func:`features._shared._validate_k`); defaults to the
+            CV-chosen :data:`BEST_K`.
+        overall_k: The inner-level shrinkage strength (see
+            :func:`features._shared._validate_k`); defaults to the fixed
+            :data:`DEFAULT_OVERALL_K`.
+
+    Returns:
+        A ``(n,)`` numpy array of ``float``:
+        ``team_map_first_blood_rate(team1, map, date, ...).mean`` minus
+        ``team_map_first_blood_rate(team2, map, date, ...).mean`` per
+        row.
+
+    Raises:
+        KeyError: If a table lacks a required column (propagated from
+            the event builder / as-of helpers).
+        ValueError: If ``k``/``overall_k`` is invalid (see
+            :func:`features._shared._validate_k`), if a group violates
+            the conservation/no-nulls invariants or the team-name
+            reconciliation (see :func:`_league_first_blood_events`), or
+            if a row date is null/unparseable (propagated from
+            ``utils.asof.parse_date_column``).
+        ConfigError: If a map name is not a string (propagated from
+            :func:`utils.config.normalize_map_name`).
+    """
+    k_value = _validate_k(k)
+    overall_k_value = _validate_k(overall_k)
+
+    events = _league_first_blood_events(
+        matches_df, maps_df, player_map_stats_df
+    )
+    if events.empty:
+        return np.zeros(len(rows_df), dtype=float)
+    parsed = asof.parse_date_column(events[asof.DATE_COL])
+    events = (
+        events.assign(_parsed=parsed)
+        .sort_values(
+            ["_parsed", asof.MATCH_ID_COL, asof.MAP_INDEX_COL], kind="stable"
+        )
+        .drop(columns=["_parsed"])
+        .reset_index(drop=True)
+    )
+    events["team_fk_after"] = events.groupby("team_id")[FIRST_KILLS_COL].cumsum()
+    events["team_fd_after"] = events.groupby("team_id")[FIRST_DEATHS_COL].cumsum()
+    events["map_fk_after"] = events.groupby(["team_id", MAP_NAME_COL])[
+        FIRST_KILLS_COL
+    ].cumsum()
+    events["map_fd_after"] = events.groupby(["team_id", MAP_NAME_COL])[
+        FIRST_DEATHS_COL
+    ].cumsum()
+
+    def _side_outer(team_col: str) -> np.ndarray:
+        """Resolve one side's outer posterior mean for every row.
+
+        Args:
+            team_col: The row-table team id column.
+
+        Returns:
+            A ``(n_rows,)`` float array of the outer-level posterior
+            means.
+
+        Raises:
+            Nothing (validation propagated from the lookups).
+        """
+        queries_overall = rows_df[[team_col, asof.DATE_COL]].reset_index(drop=True)
+        overall = asof.merge_asof_lookup(
+            events,
+            ("team_id",),
+            asof.DATE_COL,
+            ("team_fk_after", "team_fd_after"),
+            queries_overall,
+            (team_col,),
+            asof.DATE_COL,
+        )
+        query_map = rows_df[[team_col, MAP_NAME_COL, asof.DATE_COL]].copy()
+        query_map[MAP_NAME_COL] = query_map[MAP_NAME_COL].map(
+            config.normalize_map_name
+        )
+        query_map = query_map.reset_index(drop=True)
+        per_map = asof.merge_asof_lookup(
+            events,
+            ("team_id", MAP_NAME_COL),
+            asof.DATE_COL,
+            ("map_fk_after", "map_fd_after"),
+            query_map,
+            (team_col, MAP_NAME_COL),
+            asof.DATE_COL,
+        )
+        fk_o = overall["team_fk_after"].to_numpy(dtype=float)
+        fd_o = overall["team_fd_after"].to_numpy(dtype=float)
+        fk_m = per_map["map_fk_after"].to_numpy(dtype=float)
+        fd_m = per_map["map_fd_after"].to_numpy(dtype=float)
+        fk_o = np.where(np.isnan(fk_o), 0.0, fk_o)
+        fd_o = np.where(np.isnan(fd_o), 0.0, fd_o)
+        fk_m = np.where(np.isnan(fk_m), 0.0, fk_m)
+        fd_m = np.where(np.isnan(fd_m), 0.0, fd_m)
+        # Inner level: the team's overall rate toward the exact 0.5
+        # structural prior.
+        inner_alpha = fk_o + overall_k_value * LEAGUE_FIRST_BLOOD_RATE
+        inner_beta = fd_o + overall_k_value * (1.0 - LEAGUE_FIRST_BLOOD_RATE)
+        inner_mean = inner_alpha / (inner_alpha + inner_beta)
+        # Outer level: the map rate shrunk toward the inner mean.
+        alpha = fk_m + k_value * inner_mean
+        beta = fd_m + k_value * (1.0 - inner_mean)
+        return alpha / (alpha + beta)
+
+    outer_a = _side_outer(asof.TEAM1_ID_COL)
+    outer_b = _side_outer(asof.TEAM2_ID_COL)
+    return outer_a - outer_b
