@@ -7,10 +7,15 @@ that assembles the leakage-safe walk-forward out-of-fold calibration
 rows the temperature-scaling fit consumes. The M10 train split is
 assembled via :func:`evaluation.harness.build_held_out_maps` with
 ``split="train"`` (the existing, reused way to build a training set —
-no new join logic is written), and each training row's 13-feature
-vector is built with :func:`models._shared.build_feature_vector` (the
-identical feature vector both M20's ordinal logit and M21's
-multinomial logit must consume for the "identical splits" comparison).
+no new join logic is written). Since task 052, each row table's
+13-feature matrix is built in one batched
+:func:`models._shared.build_feature_matrix` call (the batched path:
+each feature's full-history ledger is built once and every row is
+resolved against it — bit-for-bit identical to the per-row
+:func:`models._shared.build_feature_vector` loop it replaced, proven
+by the real-v1 parity test; the identical feature vector both M20's
+ordinal logit and M21's multinomial logit must consume for the
+"identical splits" comparison).
 
 This helper is called from four drivers in this task:
 ``drivers/train_ordinal_logit.py`` (refactored from its previous inline
@@ -28,8 +33,9 @@ bootstrap resampler consumed by
 once to get the base train-row table, resamples whole ``match_id``s
 with replacement via a caller-supplied
 ``numpy.random.Generator``, and rebuilds the ``(X, y)`` pair exactly
-like :func:`assemble_design_matrix` does (same
-:func:`models._shared.build_feature_vector` call per row). It is
+like :func:`assemble_design_matrix` does (one batched
+:func:`models._shared.build_feature_matrix` call over the resampled
+rows). It is
 deliberately placed here rather than in a fifth duplicate join loop
 inside ``evaluation/``: this module already is the one place that
 turns the materialised tables into the raw training design matrix,
@@ -68,11 +74,13 @@ def assemble_design_matrix(
 
     Wraps :func:`evaluation.harness.build_held_out_maps` with the
     requested ``split`` (default ``"train"`` — the M10 train slice, 209
-    maps at v1 scale), then iterates the returned rows in order and, for
-    each, calls :func:`models._shared.build_feature_vector` with the
-    row's ``team1_id``/``team2_id``/``map_name``/``date`` plus the five
-    tables, collecting ``X`` (``n x 13`` floats in
-    :data:`models._shared.FEATURE_NAMES` order) and reading
+    maps at v1 scale), then builds the whole design matrix in one
+    batched :func:`models._shared.build_feature_matrix` call over the
+    returned rows (the task-052 batched path: each of the 13 features'
+    full-history ledgers is built once and every row is resolved
+    against it, instead of one
+    :func:`models._shared.build_feature_vector` call per row — bit-for-
+    bit identical output, proven by the real-v1 parity test) and reads
     ``row.outcome_ordinal`` into ``y`` (``n,`` ints in ``{0, 1, 2, 3}``).
 
     Args:
@@ -100,29 +108,16 @@ def assemble_design_matrix(
             empty (propagated from
             :func:`evaluation.harness.build_held_out_maps`), or if any
             feature computation fails (propagated from
-            :func:`models._shared.build_feature_vector`).
+            :func:`models._shared.build_feature_matrix`).
         KeyError: If any input table lacks a required column
             (propagated from the harness / the feature modules).
     """
     rows = harness.build_held_out_maps(
         matches_df, maps_df, labels_df, splits_df, split=split
     )
-    X_rows: list[np.ndarray] = []
-    y_rows: list[int] = []
-    for row in rows.itertuples(index=False):
-        X_rows.append(
-            _shared.build_feature_vector(
-                row.team1_id,
-                row.team2_id,
-                row.map_name,
-                row.date,
-                matches_df,
-                maps_df,
-                player_map_stats_df,
-            )
-        )
-        y_rows.append(int(row.outcome_ordinal))
-    return np.asarray(X_rows, dtype=float), np.asarray(y_rows, dtype=int)
+    X = _shared.build_feature_matrix(rows, matches_df, maps_df, player_map_stats_df)
+    y = np.asarray([int(row.outcome_ordinal) for row in rows.itertuples(index=False)], dtype=int)
+    return X, y
 
 
 def assemble_bootstrap_design_matrix(
@@ -152,9 +147,11 @@ def assemble_bootstrap_design_matrix(
     order (a match drawn twice contributes its full row block twice,
     contiguously — never a match split across resample slots). The
     ``(X, y)`` pair is then built exactly as
-    :func:`assemble_design_matrix` does: one
-    :func:`models._shared.build_feature_vector` call per resulting row,
-    and ``row.outcome_ordinal`` into ``y``.
+    :func:`assemble_design_matrix` does: one batched
+    :func:`models._shared.build_feature_matrix` call over the resampled
+    rows (task-052 path; bit-for-bit identical to the per-row
+    :func:`models._shared.build_feature_vector` calls it replaces), and
+    ``row.outcome_ordinal`` into ``y``.
 
     **Why a raw ``(X, y)`` pair rather than a ``splits.parquet``-shaped
     table.** ``splits.parquet`` has one row per ``match_id`` and cannot
@@ -194,7 +191,7 @@ def assemble_bootstrap_design_matrix(
         ValueError: If the train split is empty (propagated from
             :func:`evaluation.harness.build_held_out_maps`), or if any
             feature computation fails (propagated from
-            :func:`models._shared.build_feature_vector`).
+            :func:`models._shared.build_feature_matrix`).
         KeyError: If any input table lacks a required column
             (propagated from the harness / the feature modules).
     """
@@ -210,22 +207,14 @@ def assemble_bootstrap_design_matrix(
     resampled = pd.concat(
         [groups_by_match[mid] for mid in drawn], ignore_index=True
     )
-    X_rows: list[np.ndarray] = []
-    y_rows: list[int] = []
-    for row in resampled.itertuples(index=False):
-        X_rows.append(
-            _shared.build_feature_vector(
-                row.team1_id,
-                row.team2_id,
-                row.map_name,
-                row.date,
-                matches_df,
-                maps_df,
-                player_map_stats_df,
-            )
-        )
-        y_rows.append(int(row.outcome_ordinal))
-    return np.asarray(X_rows, dtype=float), np.asarray(y_rows, dtype=int)
+    X = _shared.build_feature_matrix(
+        resampled, matches_df, maps_df, player_map_stats_df
+    )
+    y = np.asarray(
+        [int(row.outcome_ordinal) for row in resampled.itertuples(index=False)],
+        dtype=int,
+    )
+    return X, y
 
 
 def assemble_out_of_fold_eta_rows(
@@ -271,9 +260,12 @@ def assemble_out_of_fold_eta_rows(
     -> ``utils.splits.join_split_to_maps`` raises if any map's match is
     absent from the splits table. The fold's training matrix reuses
     :func:`assemble_design_matrix` (``split="train"`` against the
-    synthetic table), the fold's validation rows reuse
-    ``evaluation.harness.build_held_out_maps`` (``split="val"``), and
-    each validation row's ``eta`` is computed via
+    synthetic table), and the fold's validation feature matrix is one
+    batched :func:`models._shared.build_feature_matrix` call over the
+    ``evaluation.harness.build_held_out_maps`` ``"val"`` rows (the
+    task-052 batched path — only the feature-vector construction
+    batches; the per-fold model application below stays row-wise). Each
+    validation row's ``eta`` is then computed via
     ``models.ordinal_logit.apply_standardizer`` (with the *fold model's
     own* training means/stds) dotted with the *fold model's own*
     coefficients — never the final model's. All folds are submitted to
@@ -326,7 +318,7 @@ def assemble_out_of_fold_eta_rows(
             leak guard); if a label is invalid or a feature computation
             fails (propagated from
             :func:`models.ordinal_logit.fit` /
-            :func:`models._shared.build_feature_vector`); or if a date
+            :func:`models._shared.build_feature_matrix`); or if a date
             is unparseable (propagated from
             :func:`utils.splits.walk_forward_folds`).
         KeyError: If any input table lacks a required column
@@ -394,17 +386,12 @@ def assemble_out_of_fold_eta_rows(
             fold_splits_df,
             split="val",
         )
+        val_X = _shared.build_feature_matrix(
+            val_rows, matches_df, maps_df, player_map_stats_df
+        )
         pred_rows: list[dict] = []
-        for row in val_rows.itertuples(index=False):
-            x = _shared.build_feature_vector(
-                row.team1_id,
-                row.team2_id,
-                row.map_name,
-                row.date,
-                matches_df,
-                maps_df,
-                player_map_stats_df,
-            )
+        for row_index, row in enumerate(val_rows.itertuples(index=False)):
+            x = val_X[row_index]
             # Standardize with the *fold model's own* training
             # statistics (decision C) and dot with the fold model's own
             # coefficients — never the final model's.
