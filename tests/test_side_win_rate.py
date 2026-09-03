@@ -22,6 +22,7 @@ construction, never silently mid-test.
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -1127,3 +1128,52 @@ def test_real_data_smoke_sane_numbers_and_select_k_curves():
     assert best_defense in swr.DEFAULT_K_GRID
     assert best_attack == 1000.0
     assert best_defense == 500.0
+
+
+# --------------------------------------------------------------------------
+# batched attack-side diff parity (task 052)
+# --------------------------------------------------------------------------
+
+
+def test_batched_attack_side_win_rate_diff_bit_exact_parity():
+    # The batched attack path reproduces, element-for-element, the
+    # looped single-row team_map_side_rate means per row (no
+    # tolerance), including a wholly unseen side (Z) whose whole
+    # hierarchy degrades through the league/inner priors exactly as the
+    # single-row path degrades it.
+    matches_df, maps_df, query = _core_tables()
+    d1, d2, d3 = _stamp(0), _stamp(1), _stamp(2)
+    rows_df = pd.DataFrame(
+        [
+            {"team1_id": "T1", "team2_id": "T2", "map_name": "Haven", "date": d1},
+            {"team1_id": "T1", "team2_id": "T2", "map_name": "Haven", "date": d2},
+            {"team1_id": "T1", "team2_id": "T3", "map_name": "Haven", "date": d3},
+            {"team1_id": "T1", "team2_id": "T4", "map_name": "Bind", "date": d3},
+            {"team1_id": "T1", "team2_id": "T4", "map_name": "Bind", "date": query},
+            {"team1_id": "Z", "team2_id": "T1", "map_name": "Haven", "date": query},
+        ]
+    )
+    expected = np.zeros(len(rows_df))
+    for i, row in enumerate(rows_df.itertuples(index=False)):
+        mean_a = swr.team_map_side_rate(
+            row.team1_id,
+            row.map_name,
+            swr.PHASE_ATTACK,
+            row.date,
+            matches_df,
+            maps_df,
+            swr.BEST_K_ATTACK,
+        ).mean
+        mean_b = swr.team_map_side_rate(
+            row.team2_id,
+            row.map_name,
+            swr.PHASE_ATTACK,
+            row.date,
+            matches_df,
+            maps_df,
+            swr.BEST_K_ATTACK,
+        ).mean
+        expected[i] = mean_a - mean_b
+    got = swr.batched_attack_side_win_rate_diff(rows_df, matches_df, maps_df)
+    assert got.shape == (len(rows_df),)
+    assert np.array_equal(got, expected)
