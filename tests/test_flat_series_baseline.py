@@ -14,7 +14,6 @@ against an independently recomputed feature call.
 """
 
 import math
-from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -25,6 +24,7 @@ from models.flat_series_baseline import (
     _parse_best_of,
     predict_series_outcome,
 )
+from tests._shared import _real_v1_available
 from utils import asof, series_paths
 
 # The as-of cutoff used by the synthetic fixtures: one hour after the
@@ -488,25 +488,6 @@ def test_future_match_does_not_change_prediction():
 # --------------------------------------------------------------------------
 
 
-def _real_v1_available():
-    """Report whether the materialised v1 tables exist on disk.
-
-    The skip guard for the real-data tests, matching the convention in
-    ``test_four_way_baseline.py`` / ``test_map_win_rate.py``: both
-    Parquet files must exist (i.e. ``materialize.py`` has been run).
-
-    Returns:
-        A bool: ``True`` iff ``data/v1/matches.parquet`` and
-        ``data/v1/maps.parquet`` both exist.
-
-    Raises:
-        Nothing.
-    """
-    return Path("data/v1/matches.parquet").exists() and Path(
-        "data/v1/maps.parquet"
-    ).exists()
-
-
 def _real_v1_series_target():
     """Pick a real finished v1 match whose teams both have prior history.
 
@@ -557,7 +538,7 @@ def _real_v1_series_target():
 
 
 @pytest.mark.skipif(
-    not _real_v1_available(),
+    not _real_v1_available(("matches", "maps")),
     reason="materialised v1 dataset not present (run materialize.py first)",
 )
 def test_real_v1_simplex_and_cross_checks_feature_calls():

@@ -22,9 +22,8 @@ import pandas as pd
 import pytest
 
 from evaluation import temperature_calibration as tc
+from tests._shared import _real_v1_available as _real_v1_tables_available
 from utils import scoring
-
-_REAL_V1_TABLES = ("matches", "maps", "labels", "splits", "player_map_stats")
 
 # The exact column order of a score_held_out_maps table (kept in sync
 # with evaluation.harness.SCORED_COLUMNS so the fixtures are honest
@@ -50,12 +49,14 @@ _SCORED_COLUMNS = (
 def _real_v1_available():
     """Report whether the real v1 tables and both model artifacts exist.
 
-    The skip guard for the end-to-end comparison test: all five Parquet
-    tables plus ``ordinal_logit_model.json`` and
-    ``temperature_scaling_model.json`` must exist, i.e.
-    ``materialize.py``, ``labels.py``, ``splits.py``,
-    ``train_ordinal_logit.py`` and ``train_temperature_scaling.py``
-    have all been run.
+    The skip guard for the end-to-end comparison test: the parquet
+    half is delegated to ``tests._shared._real_v1_available`` (the
+    single shared home of the bare-table-name convention — all five
+    ``data/v1/*.parquet`` files), and this module additionally requires
+    both fitted artifacts (``ordinal_logit_model.json`` and
+    ``temperature_scaling_model.json``, i.e. ``train_ordinal_logit.py``
+    and ``train_temperature_scaling.py`` have both been run) because
+    the end-to-end comparison loads them.
 
     Returns:
         A bool: ``True`` iff all five ``data/v1/*.parquet`` files and
@@ -64,9 +65,9 @@ def _real_v1_available():
     Raises:
         Nothing.
     """
-    return all(
-        Path(f"data/v1/{name}.parquet").exists() for name in _REAL_V1_TABLES
-    ) and Path("data/v1/ordinal_logit_model.json").exists() and Path(
+    return _real_v1_tables_available() and Path(
+        "data/v1/ordinal_logit_model.json"
+    ).exists() and Path(
         "data/v1/temperature_scaling_model.json"
     ).exists()
 

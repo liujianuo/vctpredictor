@@ -18,7 +18,6 @@ run of the whole pipeline against the real M32 flat baseline on
 
 import json
 import math
-from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -31,6 +30,7 @@ from evaluation.series_evaluation import (
     flat_series_baseline_model,
     score_held_out_series,
 )
+from tests._shared import _real_v1_available
 from utils import series_paths
 
 # --------------------------------------------------------------------------
@@ -835,31 +835,8 @@ def test_build_series_multi_arm_report_raises_on_unknown_baseline():
 # --------------------------------------------------------------------------
 
 
-def _real_v1_available():
-    """Report whether the materialised v1 tables exist on disk.
-
-    The skip guard for the real-data test, matching the convention in
-    ``test_flat_series_baseline.py`` / ``test_map_win_rate.py``: all
-    three Parquet files must exist (i.e. ``materialize.py`` /
-    ``splits.py`` have been run).
-
-    Returns:
-        A bool: ``True`` iff ``data/v1/matches.parquet``,
-        ``data/v1/maps.parquet`` and ``data/v1/splits.parquet`` all
-        exist.
-
-    Raises:
-        Nothing.
-    """
-    return (
-        Path("data/v1/matches.parquet").exists()
-        and Path("data/v1/maps.parquet").exists()
-        and Path("data/v1/splits.parquet").exists()
-    )
-
-
 @pytest.mark.skipif(
-    not _real_v1_available(),
+    not _real_v1_available(("matches", "maps", "splits")),
     reason="materialised v1 dataset not present (run materialize.py/splits.py first)",
 )
 def test_real_v1_flat_baseline_end_to_end():

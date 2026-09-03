@@ -36,8 +36,7 @@ from models.multinomial_logit import (
     to_dict,
     total_log_likelihood,
 )
-
-_REAL_V1_TABLES = ("matches", "maps", "labels", "splits", "player_map_stats")
+from tests._shared import _real_v1_available
 
 
 def _league_tables():
@@ -176,24 +175,6 @@ def _league_tables():
     maps_df = pd.DataFrame(map_rows)
     pms_df = pd.DataFrame(pms_rows)
     return matches_df, maps_df, pms_df
-
-
-def _real_v1_available():
-    """Report whether the materialised v1 tables exist on disk.
-
-    The skip guard for the real-data tests, matching the convention in
-    ``test_ordinal_logit.py``: all five Parquet files must exist (i.e.
-    ``materialize.py``, ``labels.py`` and ``splits.py`` have been run).
-
-    Returns:
-        A bool: ``True`` iff all five ``data/v1/*.parquet`` files exist.
-
-    Raises:
-        Nothing.
-    """
-    return all(
-        Path(f"data/v1/{name}.parquet").exists() for name in _REAL_V1_TABLES
-    )
 
 
 def _numeric_gradient(Xs, y, intercepts, coefficients, l2_lambda, eps):
@@ -512,41 +493,35 @@ def test_evaluate_registry_has_multinomial_logit(tmp_path):
 
 
 @pytest.fixture(scope="module")
-def real_v1_train_model():
+def real_v1_train_model(real_v1_train_design_matrix):
     """Fit the model on the real v1 train split once per module.
 
-    Assembles the ``(209, 15)`` training matrix exactly the way
-    ``drivers/train_multinomial_logit.py`` does (held-out maps
-    restricted to ``split="train"``, one feature vector per row, labels
-    from ``outcome_ordinal``) and fits with the documented defaults.
-    Shared by the real-data tests so the expensive feature assembly runs
-    once.
+    Fits the multinomial logit with the documented defaults on the
+    shared session-scoped design matrix. The expensive feature assembly
+    (the five table reads plus the per-row
+    :func:`models._shared.build_feature_vector` loop) runs once per
+    pytest session inside the ``real_v1_train_design_matrix`` fixture;
+    this fixture only performs the cheap fit, cached per module for the
+    real-data monotonic-loss test.
+
+    Args:
+        real_v1_train_design_matrix: The session-scoped fixture
+            providing ``(X, y_ordinal, train_rows, matches_df, maps_df,
+            player_map_stats_df)``; only ``X`` and ``y_ordinal`` are
+            consumed here, both read-only (never mutate them in place).
 
     Returns:
         The fitted :class:`MultinomialLogitModel`.
 
     Raises:
-        pytest.skip: If the real v1 tables are absent (decorated
-            behaviour; the fixture body itself raises nothing).
+        pytest.skip: If the real v1 tables are absent (propagated from
+            the session fixture's own skip guard; the fixture body
+            itself raises nothing).
     """
-    if not _real_v1_available():
-        pytest.skip("materialised v1 dataset not present (run materialize.py first)")
-    from drivers import training_data
-
-    matches_df = pd.read_parquet("data/v1/matches.parquet")
-    maps_df = pd.read_parquet("data/v1/maps.parquet")
-    labels_df = pd.read_parquet("data/v1/labels.parquet")
-    splits_df = pd.read_parquet("data/v1/splits.parquet")
-    player_map_stats_df = pd.read_parquet("data/v1/player_map_stats.parquet")
-    X, y = training_data.assemble_design_matrix(
-        matches_df,
-        maps_df,
-        labels_df,
-        splits_df,
-        player_map_stats_df,
-        split="train",
+    X, y_ordinal, _train_rows, _matches_df, _maps_df, _pms_df = (
+        real_v1_train_design_matrix
     )
-    return fit(X, y)
+    return fit(X, y_ordinal)
 
 
 def test_real_v1_loss_trace_non_increasing(real_v1_train_model):

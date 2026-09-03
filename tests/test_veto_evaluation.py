@@ -24,6 +24,7 @@ import pytest
 
 from evaluation import veto_evaluation as ve
 from models.greedy_veto_simulator import team_map_scores
+from tests._shared import _real_v1_available
 
 _QUERY_DATE = "2026-01-06T00:00:00"
 
@@ -42,25 +43,6 @@ _MAPS_COLS = [
 ]
 
 _REAL_V1_TABLES = ("matches", "maps", "splits", "veto_actions")
-
-
-def _real_v1_available():
-    """Report whether the real v1 tables needed by the veto harness exist.
-
-    The skip guard for the end-to-end tests: matches, maps, splits and
-    veto_actions must all be materialised under ``data/v1``, i.e.
-    ``materialize.py`` and ``splits.py`` have been run.
-
-    Returns:
-        A bool: ``True`` iff all four ``data/v1/*.parquet`` files
-            exist.
-
-    Raises:
-        Nothing.
-    """
-    return all(
-        Path(f"data/v1/{name}.parquet").exists() for name in _REAL_V1_TABLES
-    )
 
 
 def _matches_df(rows):
@@ -324,7 +306,7 @@ def _wrong_favorite_stub(recorded):
 
 
 @pytest.mark.skipif(
-    not _real_v1_available(),
+    not _real_v1_available(_REAL_V1_TABLES),
     reason="materialised v1 dataset not present (run materialize.py and "
     "splits.py first)",
 )
@@ -344,7 +326,7 @@ def test_real_v1_abbreviation_reconciliation_zero_mismatches():
 
 
 @pytest.mark.skipif(
-    not _real_v1_available(),
+    not _real_v1_available(_REAL_V1_TABLES),
     reason="materialised v1 dataset not present (run materialize.py and "
     "splits.py first)",
 )
@@ -444,7 +426,7 @@ def test_verify_raises_on_veto_match_absent_from_matches():
 
 
 @pytest.mark.skipif(
-    not _real_v1_available(),
+    not _real_v1_available(_REAL_V1_TABLES),
     reason="materialised v1 dataset not present (run materialize.py and "
     "splits.py first)",
 )
@@ -997,7 +979,7 @@ def test_build_pick_training_examples_excludes_deciders_by_action_filter():
 
 
 @pytest.mark.skipif(
-    not _real_v1_available(),
+    not _real_v1_available(_REAL_V1_TABLES),
     reason="materialised v1 dataset not present (run materialize.py and "
     "splits.py first)",
 )
@@ -1108,7 +1090,7 @@ def test_multi_arm_report_rejects_misaligned_rows():
 
 
 @pytest.mark.skipif(
-    not _real_v1_available(),
+    not _real_v1_available(_REAL_V1_TABLES),
     reason="materialised v1 dataset not present (run materialize.py and "
     "splits.py first)",
 )
@@ -1183,7 +1165,7 @@ def test_real_v1_veto_evaluation_end_to_end():
 
 
 @pytest.mark.skipif(
-    not _real_v1_available(),
+    not _real_v1_available(_REAL_V1_TABLES),
     reason="materialised v1 dataset not present (run materialize.py and "
     "splits.py first)",
 )

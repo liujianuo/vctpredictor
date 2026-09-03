@@ -13,7 +13,6 @@ the floor numbers later models must beat.
 
 import json
 import math
-from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -28,6 +27,7 @@ from evaluation.harness import (
     four_way_baseline_model,
     score_held_out_maps,
 )
+from tests._shared import _real_v1_available
 from utils import scoring, splits
 
 _MATCHES_COLS = ["match_id", "date", "team1_id", "team2_id", "status"]
@@ -308,27 +308,6 @@ def _calibration_stub(team1_id, team2_id, map_name, date, matches_df, maps_df):
     return (0.5, 0.1, 0.1, 0.3)
 
 
-def _real_v1_available():
-    """Report whether the materialised v1 tables exist on disk.
-
-    The skip guard for the real-data test, matching the convention in
-    ``test_four_way_baseline.py``: all four Parquet files must exist
-    (i.e. ``materialize.py``, ``labels.py`` and ``splits.py`` have
-    been run).
-
-    Returns:
-        A bool: ``True`` iff ``data/v1/{matches,maps,labels,splits}.parquet``
-        all exist.
-
-    Raises:
-        Nothing.
-    """
-    return all(
-        Path(f"data/v1/{name}.parquet").exists()
-        for name in ("matches", "maps", "labels", "splits")
-    )
-
-
 # --------------------------------------------------------------------------
 # plan#9a: build_held_out_maps join/filter correctness
 # --------------------------------------------------------------------------
@@ -516,7 +495,7 @@ def test_build_evaluation_report_calibration_arithmetic():
 
 
 @pytest.mark.skipif(
-    not _real_v1_available(),
+    not _real_v1_available(("matches", "maps", "labels", "splits")),
     reason="materialised v1 dataset not present (run materialize.py first)",
 )
 def test_real_v1_harness_end_to_end():

@@ -25,17 +25,19 @@ from models import multinomial_logit, ordinal_logit
 from models._shared import FEATURE_NAMES
 from models.multinomial_logit import MultinomialLogitModel
 from models.ordinal_logit import OrdinalLogitModel
-
-_REAL_V1_TABLES = ("matches", "maps", "labels", "splits", "player_map_stats")
+from tests._shared import _real_v1_available as _real_v1_tables_available
 
 
 def _real_v1_available():
-    """Report whether the materialised v1 tables exist on disk.
+    """Report whether the v1 tables and both fitted artifacts exist.
 
-    The skip guard for the real-data tests, matching the convention in
-    ``test_ordinal_logit.py``: all five Parquet files plus both fitted
-    model artifacts must exist (i.e. ``materialize.py``, ``labels.py``,
-    ``splits.py``, and both training drivers have been run).
+    The skip guard for the real-data diagnostic: the parquet half is
+    delegated to ``tests._shared._real_v1_available`` (the single
+    shared home of the bare-table-name convention — all five
+    ``data/v1/*.parquet`` files), and this module additionally requires
+    both fitted model artifacts (``ordinal_logit_model.json`` and
+    ``multinomial_logit_model.json``, i.e. both training drivers have
+    been run) because the end-to-end diagnostic loads them.
 
     Returns:
         A bool: ``True`` iff all five ``data/v1/*.parquet`` files and
@@ -44,9 +46,7 @@ def _real_v1_available():
     Raises:
         Nothing.
     """
-    return all(
-        Path(f"data/v1/{name}.parquet").exists() for name in _REAL_V1_TABLES
-    ) and all(
+    return _real_v1_tables_available() and all(
         Path(f"data/v1/{name}_logit_model.json").exists()
         for name in ("ordinal", "multinomial")
     )

@@ -34,19 +34,22 @@ import numpy as np
 import pytest
 
 from models import ordinal_logit, temperature_scaling
-
-# The five materialised v1 tables, used by the skip guards and the
-# end-to-end tests (matching test_ordinal_logit.py's convention).
-_REAL_V1_TABLES = ("matches", "maps", "labels", "splits", "player_map_stats")
+from tests._shared import _REAL_V1_TABLES
+from tests._shared import _real_v1_available as _real_v1_tables_available
 
 
 def _real_v1_available():
-    """Report whether the real v1 tables and both required artifacts exist.
+    """Report whether the real v1 tables and the ordinal artifact exist.
 
-    The skip guard for the end-to-end tests: all five Parquet tables
-    plus ``ordinal_logit_model.json`` must exist, i.e. ``materialize.py``,
-    ``labels.py``, ``splits.py`` and ``train_ordinal_logit.py`` have
-    been run.
+    The skip guard for the end-to-end tests: the parquet half is
+    delegated to ``tests._shared._real_v1_available`` (the single
+    shared home of the bare-table-name convention — all five
+    ``data/v1/*.parquet`` files, see :data:`tests._shared._REAL_V1_TABLES`,
+    which this module also uses directly in the missing-base-artifact
+    test's ``shutil.copy2`` loop), and this module additionally
+    requires the fitted ``ordinal_logit_model.json`` artifact (i.e.
+    ``train_ordinal_logit.py`` has been run) because the scaling fit
+    consumes it as its base model.
 
     Returns:
         A bool: ``True`` iff all five ``data/v1/*.parquet`` files and
@@ -55,9 +58,9 @@ def _real_v1_available():
     Raises:
         Nothing.
     """
-    return all(
-        Path(f"data/v1/{name}.parquet").exists() for name in _REAL_V1_TABLES
-    ) and Path("data/v1/ordinal_logit_model.json").exists()
+    return _real_v1_tables_available() and Path(
+        "data/v1/ordinal_logit_model.json"
+    ).exists()
 
 
 # --------------------------------------------------------------------------

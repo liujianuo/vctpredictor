@@ -19,7 +19,6 @@ dict-keyed predictors with no adapter code, and a skip-guarded real
 import json
 import math
 import time
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -41,6 +40,7 @@ from models.greedy_veto_simulator import (
     simulate_veto,
     team_map_scores,
 )
+from tests._shared import _real_v1_available
 
 # The as-of cutoff for the synthetic greedy-choice league: one hour
 # after the last fixture match, so every fixture row is strictly
@@ -868,28 +868,8 @@ def test_real_fitted_conditional_logit_closures_integration():
         assert seq.sequence_probability < 1.0
 
 
-def _real_v1_available():
-    """Report whether the real v1 tables needed by the smoke test exist.
-
-    The skip guard for the end-to-end smoke test: matches and maps must
-    both be materialised under ``data/v1`` (i.e. ``materialize.py`` has
-    been run). The sampler consumes only these two tables, so this
-    guard checks exactly what the test needs.
-
-    Returns:
-        A bool: ``True`` iff all :data:`_REAL_V1_TABLES`
-        ``data/v1/*.parquet`` files exist.
-
-    Raises:
-        Nothing.
-    """
-    return all(
-        Path(f"data/v1/{name}.parquet").exists() for name in _REAL_V1_TABLES
-    )
-
-
 @pytest.mark.skipif(
-    not _real_v1_available(),
+    not _real_v1_available(_REAL_V1_TABLES),
     reason="materialised v1 dataset not present (run materialize.py first)",
 )
 def test_real_v1_greedy_arm_smoke():

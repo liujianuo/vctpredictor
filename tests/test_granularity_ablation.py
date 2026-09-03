@@ -21,18 +21,19 @@ import numpy as np
 import pytest
 
 from evaluation import granularity_ablation as ga
-
-_REAL_V1_TABLES = ("matches", "maps", "labels", "splits", "player_map_stats")
+from tests._shared import _real_v1_available as _real_v1_tables_available
 
 
 def _real_v1_available():
     """Report whether the real v1 tables and both model artifacts exist.
 
-    The skip guard for the end-to-end ablation test: all five Parquet
-    tables plus both fitted model artifacts (``ordinal_logit_model.json``
-    and ``binary_logit_model.json``) must exist, i.e. ``materialize.py``,
-    ``labels.py``, ``splits.py`` and both training drivers have been
-    run.
+    The skip guard for the end-to-end ablation test: the parquet half
+    is delegated to ``tests._shared._real_v1_available`` (the single
+    shared home of the bare-table-name convention — all five
+    ``data/v1/*.parquet`` files), and this module additionally requires
+    both fitted model artifacts (``ordinal_logit_model.json`` and
+    ``binary_logit_model.json``, i.e. both training drivers have been
+    run) because the end-to-end ablation loads them.
 
     Returns:
         A bool: ``True`` iff all five ``data/v1/*.parquet`` files and
@@ -41,9 +42,7 @@ def _real_v1_available():
     Raises:
         Nothing.
     """
-    return all(
-        Path(f"data/v1/{name}.parquet").exists() for name in _REAL_V1_TABLES
-    ) and all(
+    return _real_v1_tables_available() and all(
         Path(f"data/v1/{name}_logit_model.json").exists()
         for name in ("ordinal", "binary")
     )

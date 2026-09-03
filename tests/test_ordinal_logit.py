@@ -41,6 +41,7 @@ from models.ordinal_logit import (
     predict_proba,
     to_dict,
 )
+from tests._shared import _real_v1_available
 
 # The as-of cutoff every synthetic feature test uses: the date of the
 # league's A-vs-B match itself (m3), so the as-of features exclude the
@@ -84,8 +85,6 @@ _PMS_COLS = [
     "first_kills",
     "first_deaths",
 ]
-
-_REAL_V1_TABLES = ("matches", "maps", "labels", "splits", "player_map_stats")
 
 
 def _league_tables():
@@ -413,73 +412,36 @@ def ordinal_logit_loss(X, y, beta, raw, l2_lambda):
     return ordinal_logit._loss_and_gradient(X, y, beta, raw, l2_lambda)[0]
 
 
-def _real_v1_available():
-    """Report whether the materialised v1 tables exist on disk.
-
-    The skip guard for the real-data tests, matching the convention in
-    ``test_evaluation_harness.py``: all five Parquet files must exist
-    (i.e. ``materialize.py``, ``labels.py`` and ``splits.py`` have been
-    run).
-
-    Returns:
-        A bool: ``True`` iff all five ``data/v1/*.parquet`` files exist.
-
-    Raises:
-        Nothing.
-    """
-    return all(
-        Path(f"data/v1/{name}.parquet").exists() for name in _REAL_V1_TABLES
-    )
-
-
 @pytest.fixture(scope="module")
-def real_v1_train_model():
+def real_v1_train_model(real_v1_train_design_matrix):
     """Fit the model on the real v1 train split once per module.
 
-    Assembles the ``(209, 15)`` training matrix exactly the way
-    ``drivers/train_ordinal_logit.py`` does (held-out maps restricted to
-    ``split="train"``, one :func:`build_feature_vector` per row, labels
-    from ``outcome_ordinal``) and fits with the documented defaults.
-    Shared by the real-data monotonic-loss and threshold-ordering tests
-    so the expensive feature assembly runs once.
+    Fits the ordinal logit with the documented defaults on the shared
+    session-scoped design matrix. The expensive feature assembly (the
+    five table reads plus the per-row :func:`build_feature_vector`
+    loop) runs once per pytest session inside the
+    ``real_v1_train_design_matrix`` fixture; this fixture only performs
+    the cheap fit, cached per module for the real-data monotonic-loss
+    and threshold-ordering tests.
+
+    Args:
+        real_v1_train_design_matrix: The session-scoped fixture
+            providing ``(X, y_ordinal, train_rows, matches_df, maps_df,
+            player_map_stats_df)``; only ``X`` and ``y_ordinal`` are
+            consumed here, both read-only (never mutate them in place).
 
     Returns:
         The fitted :class:`OrdinalLogitModel`.
 
     Raises:
-        pytest.skip: If the real v1 tables are absent (decorated
-            behaviour; the fixture body itself raises nothing).
+        pytest.skip: If the real v1 tables are absent (propagated from
+            the session fixture's own skip guard; the fixture body
+            itself raises nothing).
     """
-    if not _real_v1_available():
-        pytest.skip("materialised v1 dataset not present (run materialize.py first)")
-    matches_df = pd.read_parquet("data/v1/matches.parquet")
-    maps_df = pd.read_parquet("data/v1/maps.parquet")
-    labels_df = pd.read_parquet("data/v1/labels.parquet")
-    splits_df = pd.read_parquet("data/v1/splits.parquet")
-    player_map_stats_df = pd.read_parquet("data/v1/player_map_stats.parquet")
-    train_rows = harness.build_held_out_maps(
-        matches_df, maps_df, labels_df, splits_df, split="train"
+    X, y_ordinal, _train_rows, _matches_df, _maps_df, _pms_df = (
+        real_v1_train_design_matrix
     )
-    X = np.asarray(
-        [
-            build_feature_vector(
-                row.team1_id,
-                row.team2_id,
-                row.map_name,
-                row.date,
-                matches_df,
-                maps_df,
-                player_map_stats_df,
-            )
-            for row in train_rows.itertuples(index=False)
-        ],
-        dtype=float,
-    )
-    y = np.asarray(
-        [int(row.outcome_ordinal) for row in train_rows.itertuples(index=False)],
-        dtype=int,
-    )
-    return fit(X, y)
+    return fit(X, y_ordinal)
 
 
 # --------------------------------------------------------------------------

@@ -9,13 +9,13 @@ check at real ``data/v1`` scale that cross-checks the prediction's
 """
 
 import math
-from pathlib import Path
 
 import pandas as pd
 import pytest
 
 from features import closeness, map_win_rate
 from models.four_way_baseline import OUTCOME_LABELS, predict_map_outcome
+from tests._shared import _real_v1_available
 from utils import asof, scoring
 
 # The as-of cutoff used by the synthetic fixtures: one hour after the
@@ -448,27 +448,8 @@ def test_swapping_teams_swaps_a_b_probabilities():
 # --------------------------------------------------------------------------
 
 
-def _real_v1_available():
-    """Report whether the materialised v1 tables exist on disk.
-
-    The skip guard for the real-data tests, matching the convention in
-    ``test_map_win_rate.py`` / ``test_closeness.py``: both Parquet
-    files must exist (i.e. ``materialize.py`` has been run).
-
-    Returns:
-        A bool: ``True`` iff ``data/v1/matches.parquet`` and
-        ``data/v1/maps.parquet`` both exist.
-
-    Raises:
-        Nothing.
-    """
-    return Path("data/v1/matches.parquet").exists() and Path(
-        "data/v1/maps.parquet"
-    ).exists()
-
-
 @pytest.mark.skipif(
-    not _real_v1_available(),
+    not _real_v1_available(("matches", "maps")),
     reason="materialised v1 dataset not present (run materialize.py first)",
 )
 def test_real_v1_simplex_and_scoring_usability():
@@ -496,7 +477,7 @@ def test_real_v1_simplex_and_scoring_usability():
 
 
 @pytest.mark.skipif(
-    not _real_v1_available(),
+    not _real_v1_available(("matches", "maps")),
     reason="materialised v1 dataset not present (run materialize.py first)",
 )
 def test_real_v1_end_to_end_cross_checks_feature_calls():
