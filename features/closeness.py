@@ -761,3 +761,333 @@ def map_ot_rate(
         mean=mean,
         variance=variance,
     )
+
+
+def _league_finished_maps_with_ot(
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Return every eligible league map with its derived OT flag and date.
+
+    The shared league event source for both batched closeness entry
+    points: every finished map (``winner`` non-null) of every completed
+    match, in ``maps_df``'s original row order (the same order
+    :func:`_league_maps_as_of` produces — order matters for the margin
+    variance path, which must feed :func:`np.var` the literal same
+    values in the literal same order the single-row path uses). The OT
+    flag and the absolute margin are derived from the raw scores with
+    :func:`_margin_and_ot`, so the null-score guard (the module's
+    fail-loud convention) runs once over the whole league here rather
+    than per query's as-of subset — the documented whole-league
+    validation difference of the batched path; real ``data/v1`` has no
+    null-score rows, so it never fires on valid data.
+
+    Args:
+        matches_df: The materialised ``matches`` table (needs
+            ``match_id``, ``date``, ``status``).
+        maps_df: The materialised ``maps`` table (needs ``match_id``,
+            ``winner``, ``map_name``, ``team1_score``, ``team2_score``).
+
+    Returns:
+        A ``pandas.DataFrame`` with columns ``match_id``, ``date``,
+        ``map_name`` (raw, unnormalized — normalization is the
+        variance path's job so its per-name arrays keep the raw row
+        order), ``abs_margin`` (float) and ``is_ot`` (bool), one row
+        per eligible map in ``maps_df``'s original row order.
+
+    Raises:
+        KeyError: If a table lacks a required column (propagated from
+            ``utils.asof.require_columns``).
+        ValueError: If ``matches_df`` contains duplicate ``match_id``
+            values among the completed rows, or if any eligible map has
+            a null/NaN score (see :func:`_margin_and_ot`).
+    """
+    asof.require_columns(
+        matches_df,
+        (asof.MATCH_ID_COL, asof.DATE_COL, asof.STATUS_COL),
+        "matches_df",
+    )
+    asof.require_columns(
+        maps_df,
+        (
+            asof.MATCH_ID_COL,
+            asof.WINNER_COL,
+            MAP_NAME_COL,
+            TEAM1_SCORE_COL,
+            TEAM2_SCORE_COL,
+        ),
+        "maps_df",
+    )
+    completed = matches_df[matches_df[asof.STATUS_COL] == asof.COMPLETED_STATUS]
+    if not completed[asof.MATCH_ID_COL].is_unique:
+        raise ValueError(
+            "matches_df contains duplicate match_id values among the "
+            "completed rows; the map-event join would fan out and "
+            "duplicate map rows"
+        )
+    finished = maps_df[maps_df[asof.WINNER_COL].notna()]
+    merged = finished.merge(
+        completed[[asof.MATCH_ID_COL, asof.DATE_COL]],
+        on=asof.MATCH_ID_COL,
+        how="inner",
+    )
+    abs_margin, _is_close, is_ot = _margin_and_ot(
+        merged[TEAM1_SCORE_COL], merged[TEAM2_SCORE_COL]
+    )
+    return pd.DataFrame(
+        {
+            asof.MATCH_ID_COL: merged[asof.MATCH_ID_COL].to_numpy(),
+            asof.DATE_COL: merged[asof.DATE_COL].to_numpy(),
+            MAP_NAME_COL: merged[MAP_NAME_COL].to_numpy(),
+            "abs_margin": abs_margin,
+            "is_ot": is_ot,
+        }
+    )
+
+
+def batched_ot_rate_diff(
+    rows_df: pd.DataFrame,
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+    k=DEFAULT_OT_K,
+) -> np.ndarray:
+    """Return per-row heavily-shrunk OT-rate differentials (A minus B).
+
+    The batched sibling of the two :func:`team_ot_rate` calls
+    :func:`models._shared.build_feature_vector` makes per row (task
+    052). It builds the league event frame once via
+    :func:`_league_finished_maps_with_ot` and records two families of
+    running totals over the chronologically-sorted events: a keyless
+    "league" ledger (every eligible map, feeding the global pooled OT
+    prior :func:`global_ot_rate` reproduces) and a per-team ledger
+    (each map appearing once per participating side, feeding the team's
+    own OT ``events``/``games``). Both sides of every row are then
+    resolved against those static ledgers with
+    ``utils.asof.merge_asof_lookup`` (strict ``<`` per query, enforced
+    by the as-of primitive), and the Beta posterior
+    ``mean = (events + k*prior) / (games + k)`` is applied vectorized
+    with the same arithmetic and operand order as the single-row
+    estimator, where ``prior`` is the league rate as of the row's own
+    date (``0.0`` when the pool is empty). A zero-history side degrades
+    to exactly ``prior`` (full shrinkage), bit-for-bit identical to
+    looping the single-row calls.
+
+    Args:
+        rows_df: The row table; needs ``team1_id``, ``team2_id`` and
+            ``date`` columns. Row order is preserved in the output.
+        matches_df: The materialised ``matches`` table.
+        maps_df: The materialised ``maps`` table.
+        k: The shrinkage strength (see :func:`_validate_k`).
+
+    Returns:
+        A ``(n,)`` numpy array of ``float``:
+        ``team_ot_rate(team1, date, ...).mean`` minus
+        ``team_ot_rate(team2, date, ...).mean`` per row.
+
+    Raises:
+        KeyError: If a table lacks a required column (propagated from
+            the event builder / as-of helpers).
+        ValueError: If ``k`` is invalid (see :func:`_validate_k`), if
+            any eligible league map has a null/NaN score (see
+            :func:`_league_finished_maps_with_ot`), or if a row date is
+            null/unparseable (propagated from
+            ``utils.asof.parse_date_column``).
+    """
+    k_value = _validate_k(k)
+    events = _league_finished_maps_with_ot(matches_df, maps_df)
+    parsed = asof.parse_date_column(events[asof.DATE_COL])
+    events = (
+        events.assign(_parsed_date=parsed)
+        .sort_values(
+            ["_parsed_date", asof.MATCH_ID_COL, asof.DATE_COL],
+            kind="stable",
+        )
+        .drop(columns=["_parsed_date"])
+        .reset_index(drop=True)
+    )
+
+    # League (keyless) running totals: one game per eligible map.
+    events["league_games_after"] = np.arange(1, len(events) + 1)
+    events["league_events_after"] = events["is_ot"].astype(int).cumsum()
+
+    # Per-team running totals: one game per map per participating side.
+    # (Re)join the team ids so each map yields one event per side.
+    completed = matches_df[matches_df[asof.STATUS_COL] == asof.COMPLETED_STATUS][
+        [asof.MATCH_ID_COL, asof.TEAM1_ID_COL, asof.TEAM2_ID_COL]
+    ]
+    events_t = events.merge(completed, on=asof.MATCH_ID_COL, how="inner")
+    is_ot_int = events_t["is_ot"].astype(int)
+    side1 = pd.DataFrame(
+        {
+            "team_id": events_t[asof.TEAM1_ID_COL].to_numpy(),
+            "date": events_t[asof.DATE_COL].to_numpy(),
+            "is_ot": is_ot_int.to_numpy(),
+        }
+    )
+    side2 = pd.DataFrame(
+        {
+            "team_id": events_t[asof.TEAM2_ID_COL].to_numpy(),
+            "date": events_t[asof.DATE_COL].to_numpy(),
+            "is_ot": is_ot_int.to_numpy(),
+        }
+    )
+    team_events = pd.concat([side1, side2], ignore_index=True)
+    team_events = team_events.sort_values("date", kind="stable").reset_index(
+        drop=True
+    )
+    team_events["team_games_after"] = (
+        team_events.groupby("team_id").cumcount() + 1
+    )
+    team_events["team_events_after"] = team_events.groupby("team_id")[
+        "is_ot"
+    ].cumsum()
+
+    league_lookup = asof.merge_asof_lookup(
+        events,
+        (),
+        asof.DATE_COL,
+        ("league_games_after", "league_events_after"),
+        rows_df[[asof.DATE_COL]].reset_index(drop=True),
+        (),
+        asof.DATE_COL,
+    )
+    league_games = league_lookup["league_games_after"].to_numpy(dtype=float)
+    league_events = league_lookup["league_events_after"].to_numpy(dtype=float)
+    league_games = np.where(np.isnan(league_games), 0.0, league_games)
+    league_events = np.where(np.isnan(league_events), 0.0, league_events)
+    prior = np.full(len(rows_df), 0.0)
+    has_pool = league_games > 0.0
+    prior[has_pool] = league_events[has_pool] / league_games[has_pool]
+
+    def _side_result(team_col: str) -> tuple[np.ndarray, np.ndarray]:
+        """Resolve one side's team OT totals for every row.
+
+        Args:
+            team_col: The row-table team id column
+                (``"team1_id"``/``"team2_id"``).
+
+        Returns:
+            A ``(team_games, team_events)`` tuple of float arrays
+            aligned to ``rows_df`` (NaN where the side has no
+            strictly-prior map).
+
+        Raises:
+            Nothing (validation propagated from the lookup).
+        """
+        queries = rows_df[[team_col, asof.DATE_COL]].reset_index(drop=True)
+        looked = asof.merge_asof_lookup(
+            team_events,
+            ("team_id",),
+            asof.DATE_COL,
+            ("team_games_after", "team_events_after"),
+            queries,
+            (team_col,),
+            asof.DATE_COL,
+        )
+        return (
+            looked["team_games_after"].to_numpy(dtype=float),
+            looked["team_events_after"].to_numpy(dtype=float),
+        )
+
+    games_a, events_a = _side_result(asof.TEAM1_ID_COL)
+    games_b, events_b = _side_result(asof.TEAM2_ID_COL)
+
+    def _shrunk_mean(games, team_events):
+        """Apply the OT Beta formula vectorized for one side.
+
+        Args:
+            games: The side's as-of games (float array, NaN = none).
+            team_events: The side's as-of OT maps (float array).
+
+        Returns:
+            The per-row posterior mean array.
+
+        Raises:
+            Nothing.
+        """
+        games = np.where(np.isnan(games), 0.0, games)
+        team_events = np.where(np.isnan(team_events), 0.0, team_events)
+        alpha = team_events + k_value * prior
+        beta = (games - team_events) + k_value * (1.0 - prior)
+        return alpha / (alpha + beta)
+
+    return _shrunk_mean(games_a, events_a) - _shrunk_mean(games_b, events_b)
+
+
+def batched_map_round_margin_variance(
+    rows_df: pd.DataFrame,
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+) -> np.ndarray:
+    """Return per-row per-map absolute-margin sample variances.
+
+    The batched sibling of the :func:`map_round_margin_variance` call
+    :func:`models._shared.build_feature_vector` makes per row (task
+    052, decision 4 — the one feature where a running-moments ledger is
+    deliberately *not* used, because ``np.var(ddof=1)`` is a two-pass
+    algorithm whose result must be reproduced by feeding it the literal
+    same values in the literal same order). The league event frame
+    (:func:`_league_finished_maps_with_ot`) is built once — the
+    per-row league filter/join cost amortized away — and then, per
+    distinct map name, the eligible maps' ``(date, abs_margin)`` pairs
+    are kept **in ``maps_df``'s original row order** (the exact order
+    the single-row as-of path assembles; verified against real
+    ``data/v1``, the maps table is *not* date-ordered per map name, so
+    a date-sorted prefix slice would assemble the wrong set — the
+    batched path therefore applies a strict ``date < cutoff`` boolean
+    mask over the original-order per-name array instead, which selects
+    the literal same rows in the literal same order the single-row path
+    would filter, for every cutoff). Each row then calls
+    ``np.var(mask_slice, ddof=1)`` — the same function on the same
+    values in the same order, hence bit-for-bit identical by
+    construction — returning ``NaN`` when the slice has ``n <= 1``
+    (the same degenerate convention as the single-row estimator; the
+    caller applies the documented ``NaN -> 0.0`` fallback).
+
+    Args:
+        rows_df: The row table; needs ``map_name`` and ``date``
+            columns. Row order is preserved in the output.
+        matches_df: The materialised ``matches`` table.
+        maps_df: The materialised ``maps`` table.
+
+    Returns:
+        A ``(n,)`` numpy array of ``float``: the ``ddof=1`` sample
+        variance of absolute round margins over every eligible map of
+        the row's (normalized) map name dated strictly before the row's
+        date, or ``NaN`` when fewer than two such maps exist.
+
+    Raises:
+        KeyError: If a table lacks a required column (propagated from
+            the event builder).
+        ValueError: If any eligible league map has a null/NaN score
+            (see :func:`_league_finished_maps_with_ot`), or if a row
+            date is null/unparseable (propagated from
+            ``utils.asof.parse_date_column``).
+        ConfigError: If a map name is not a string (propagated from
+            :func:`utils.config.normalize_map_name`).
+    """
+    events = _league_finished_maps_with_ot(matches_df, maps_df)
+    parsed_dates = asof.parse_date_column(events[asof.DATE_COL])
+    row_dates = asof.parse_date_column(rows_df[asof.DATE_COL])
+
+    per_name: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    normalized = events[MAP_NAME_COL].map(config.normalize_map_name)
+    for name, group in events.groupby(normalized, sort=False):
+        per_name[str(name)] = (
+            parsed_dates.loc[group.index].to_numpy(),
+            group["abs_margin"].to_numpy(),
+        )
+
+    query_names = rows_df[MAP_NAME_COL].map(config.normalize_map_name).to_numpy()
+    query_ns = row_dates.to_numpy()
+    out = np.full(len(rows_df), np.nan)
+    for i in range(len(rows_df)):
+        pair = per_name.get(query_names[i])
+        if pair is None:
+            continue
+        dates, margins = pair
+        mask = dates < query_ns[i]
+        n = int(mask.sum())
+        if n > 1:
+            out[i] = float(np.var(margins[mask], ddof=1))
+    return out

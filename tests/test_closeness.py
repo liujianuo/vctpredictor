@@ -701,3 +701,120 @@ def test_real_data_smoke_sane_numbers():
     assert var.n >= 0
     if var.n > 1:
         assert not math.isnan(var.variance)
+
+
+# --------------------------------------------------------------------------
+# batched closeness parity (task 052)
+# --------------------------------------------------------------------------
+
+
+def _closeness_parity_fixture():
+    """Build a small multi-team, multi-map fixture plus a row table.
+
+    Two teams (``A``/``B``) over four completed matches/maps across
+    four dates, including an OT map (``13-11`` — wait, an OT map needs
+    ``min(score) >= 12``; ``13-11`` has min 11, so the OT maps here are
+    the ``13-12`` ones) and a close map (``13-12`` has abs margin 1,
+    OT by the ``min >= 12`` rule). Dates deliberately repeat across
+    maps of different matches to exercise same-date as-of resolution.
+
+    Returns:
+        A ``(matches_df, maps_df, rows_df)`` tuple; ``rows_df`` has
+        ``team1_id, team2_id, map_name, date`` columns.
+
+    Raises:
+        Nothing.
+    """
+    matches_rows = [
+        {"match_id": "m1", "date": "2026-01-01T10:00:00", "team1_id": "A",
+         "team2_id": "B", "status": "completed"},
+        {"match_id": "m2", "date": "2026-01-02T10:00:00", "team1_id": "B",
+         "team2_id": "A", "status": "completed"},
+        {"match_id": "m3", "date": "2026-01-03T10:00:00", "team1_id": "A",
+         "team2_id": "B", "status": "completed"},
+        {"match_id": "m4", "date": "2026-01-05T10:00:00", "team1_id": "B",
+         "team2_id": "A", "status": "completed"},
+    ]
+    maps_rows = [
+        {"match_id": "m1", "map_index": 0, "map_name": "Haven",
+         "team1_score": 13, "team2_score": 8, "winner": "A"},
+        {"match_id": "m2", "map_index": 0, "map_name": "Bind",
+         "team1_score": 13, "team2_score": 12, "winner": "B"},
+        {"match_id": "m3", "map_index": 0, "map_name": "haven",
+         "team1_score": 13, "team2_score": 11, "winner": "A"},
+        {"match_id": "m3", "map_index": 1, "map_name": "Haven",
+         "team1_score": 13, "team2_score": 5, "winner": "B"},
+        {"match_id": "m4", "map_index": 0, "map_name": "Bind",
+         "team1_score": 13, "team2_score": 6, "winner": "A"},
+    ]
+    matches_df = _matches_df(matches_rows)
+    maps_df = _maps_df(maps_rows)
+    rows_df = pd.DataFrame(
+        [
+            {"team1_id": "A", "team2_id": "B", "map_name": "Haven",
+             "date": "2026-01-02T10:00:00"},
+            {"team1_id": "A", "team2_id": "B", "map_name": "Bind",
+             "date": "2026-01-03T10:00:00"},
+            {"team1_id": "A", "team2_id": "B", "map_name": "haven",
+             "date": "2026-01-04T10:00:00"},
+            {"team1_id": "A", "team2_id": "B", "map_name": "Bind",
+             "date": "2026-01-05T10:00:00"},
+            {"team1_id": "A", "team2_id": "B", "map_name": "Haven",
+             "date": "2026-01-06T10:00:00"},
+        ]
+    )
+    return matches_df, maps_df, rows_df
+
+
+def test_batched_ot_rate_diff_bit_exact_parity():
+    # batched_ot_rate_diff reproduces, element-for-element, the looped
+    # single-row team_ot_rate means per row (no tolerance), including
+    # rows whose teams have zero prior maps (full shrinkage to the
+    # global pooled prior at that row's own date).
+    matches_df, maps_df, rows_df = _closeness_parity_fixture()
+    expected = np.zeros(len(rows_df))
+    for i, row in enumerate(rows_df.itertuples(index=False)):
+        mean_a = closeness.team_ot_rate(
+            row.team1_id, row.date, matches_df, maps_df,
+            k=closeness.DEFAULT_OT_K,
+        ).mean
+        mean_b = closeness.team_ot_rate(
+            row.team2_id, row.date, matches_df, maps_df,
+            k=closeness.DEFAULT_OT_K,
+        ).mean
+        expected[i] = mean_a - mean_b
+    got = closeness.batched_ot_rate_diff(rows_df, matches_df, maps_df)
+    assert got.shape == (len(rows_df),)
+    assert np.array_equal(got, expected)
+
+
+def test_batched_map_round_margin_variance_bit_exact_parity():
+    # The variance path must reproduce the single-row estimator's
+    # np.var(ddof=1) output bit-for-bit — same values, same order,
+    # same call — including the NaN (n <= 1) degenerate rows.
+    matches_df, maps_df, rows_df = _closeness_parity_fixture()
+    expected = np.zeros(len(rows_df))
+    for i, row in enumerate(rows_df.itertuples(index=False)):
+        v = closeness.map_round_margin_variance(
+            row.map_name, row.date, matches_df, maps_df
+        ).variance
+        expected[i] = v
+    got = closeness.batched_map_round_margin_variance(rows_df, matches_df, maps_df)
+    assert got.shape == (len(rows_df),)
+    # NaN-vs-NaN counts as equal here (array_equal's equal_nan), so the
+    # degenerate n <= 1 rows align too; every non-NaN value is exact.
+    assert np.array_equal(got, expected, equal_nan=True)
+
+
+def test_batched_map_round_margin_variance_nan_rows_match_single_row():
+    # The NaN degenerate rows (n <= 1 prior maps on that map) must line
+    # up positionally with the single-row path's NaN values.
+    matches_df, maps_df, rows_df = _closeness_parity_fixture()
+    got = closeness.batched_map_round_margin_variance(rows_df, matches_df, maps_df)
+    # Row 0 queries Haven at m1's own date: no strictly-prior Haven map
+    # exists anywhere -> n == 0 -> NaN.
+    assert np.isnan(got[0])
+    # Row 2 queries Haven at 2026-01-04: exactly m1's Haven is prior
+    # (m3's two Havens are dated 01-03 and excluded? no -- 01-03 < 01-04
+    # so both are prior) -> n == 3.
+    assert not np.isnan(got[2])
