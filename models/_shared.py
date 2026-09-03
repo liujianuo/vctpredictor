@@ -692,3 +692,192 @@ def build_feature_vector(
         ],
         dtype=float,
     )
+
+
+def build_feature_matrix(
+    rows_df: pd.DataFrame,
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+    player_map_stats_df: pd.DataFrame,
+) -> np.ndarray:
+    """Build the 13-feature design matrix for a whole row table at once.
+
+    The batched sibling of :func:`build_feature_vector` (task 052): it
+    computes the identical 13 features, in the identical
+    :data:`FEATURE_NAMES` order, for *every* row of ``rows_df`` in one
+    call, by delegating each column to the corresponding feature
+    module's batched entry point (which builds its full-history ledger
+    once and resolves all rows against it, instead of re-filtering and
+    re-folding per row). Each batched entry point reproduces its
+    single-row estimator's arithmetic bit-for-bit (same inputs, same
+    operand order — proven by the per-feature synthetic parity tests
+    and the real-v1 parity test in ``tests/test_build_feature_matrix.py``),
+    so the returned matrix is element-for-element identical, per column,
+    to looping :func:`build_feature_vector` over the same rows.
+
+    **Required-columns contract.** ``rows_df`` must carry ``team1_id``,
+    ``team2_id``, ``map_name``, ``date`` **and ``match_id``** — the
+    ``match_id`` column is what lets the event-stage feature resolve
+    each row's stage without a ``(team1_id, team2_id, date)``
+    re-resolution (the three training-data assemblers' row tables, via
+    ``evaluation.harness.build_held_out_maps``, all carry it). The three
+    materialised tables must carry the full column sets the 13 feature
+    modules read (matches: ids, names, date/status/event_name; maps:
+    scores, ``winner``, ``map_name``, ``map_index`` and the eight
+    round-detail columns; player_map_stats: the roster/stat/first-blood
+    columns).
+
+    **Missing-value fallback policy (restated from this module's
+    docstring — applied in the same places, never altered).** Each
+    batched column entry point applies its single-row estimator's
+    per-side fallback exactly as :func:`build_feature_vector` applies
+    it: ``acs_form_diff``/``rating_form_diff`` are ``0.0`` when either
+    side's form mean is ``None``; ``days_since_diff`` treats a side
+    with no prior match as ``0``; ``roster_decay_diff`` treats a side
+    with no declared roster change as ``1.0``. The one fallback applied
+    here (mirroring ``build_feature_vector``'s step 4) is
+    ``map_round_margin_variance``'s ``NaN`` (``n <= 1`` prior maps on
+    that map) -> ``0.0`` conversion, done vectorized with a boolean
+    mask. The three M38 features (``attack_side_win_rate_diff``,
+    ``signed_margin_diff``, ``first_blood_diff``) need no fallback:
+    their estimators degrade to numeric priors at zero history. No
+    standardization happens here — the returned matrix holds raw
+    feature values; standardization is :func:`fit_standardizer` /
+    :func:`apply_standardizer`'s job (training-side only).
+
+    Args:
+        rows_df: The row table (one row per held-out map), with
+            ``team1_id``, ``team2_id``, ``map_name``, ``date`` and
+            ``match_id`` columns. Row order is preserved in the output.
+        matches_df: The materialised ``matches`` table.
+        maps_df: The materialised ``maps`` table.
+        player_map_stats_df: The materialised ``player_map_stats``
+            table.
+
+    Returns:
+        An ``(n, 13)`` numpy array of ``float`` in
+        :data:`FEATURE_NAMES` order, one row per ``rows_df`` row.
+
+    Raises:
+        KeyError: If ``rows_df`` lacks a required column, or any table
+            lacks a column a feature module needs (propagated from the
+            feature modules / ``utils.asof``).
+        ValueError: If a feature computation fails (null/tied scores,
+            invalid hyperparameters, a missing or ambiguous match row,
+            round-detail validation, roster/name or first-blood
+            conservation violations, unparseable dates — all propagated
+            from the individual feature modules, which validate the
+            whole league once up front on the batched path).
+        ConfigError: If a map name is not a string (propagated from
+            :func:`utils.config.normalize_map_name` via the feature
+            modules).
+    """
+    required = (
+        asof.TEAM1_ID_COL,
+        asof.TEAM2_ID_COL,
+        "map_name",
+        asof.DATE_COL,
+        asof.MATCH_ID_COL,
+    )
+    asof.require_columns(rows_df, required, "rows_df")
+
+    # 1. map_win_rate_diff — shrunk per-map win rate, A minus B.
+    map_win_rate_diff = map_win_rate.batched_map_win_rate_diff(
+        rows_df, matches_df, maps_df, k=map_win_rate.DEFAULT_K
+    )
+    # 2. elo_differential — signed A-minus-B from one shared league
+    #    replay (the ledger path replays once for the whole table).
+    elo_diff = elo.batched_elo_differential(
+        rows_df,
+        matches_df,
+        maps_df,
+        k=elo.DEFAULT_K,
+        initial_rating=elo.INITIAL_RATING,
+    )
+    # 3. ot_rate_diff — heavily-shrunk team OT rate, A minus B.
+    ot_rate_diff = closeness.batched_ot_rate_diff(
+        rows_df, matches_df, maps_df, k=closeness.DEFAULT_OT_K
+    )
+    # 4. map_round_margin_variance — match-level (not a team diff);
+    #    NaN (n <= 1) replaced with 0.0 per the documented fallback.
+    raw_margin_var = closeness.batched_map_round_margin_variance(
+        rows_df, matches_df, maps_df
+    )
+    map_round_margin_variance = np.where(
+        np.isnan(raw_margin_var), 0.0, raw_margin_var
+    )
+    # 5/6. acs_form_diff / rating_form_diff — recency-weighted form,
+    #    A minus B, with the either-side-None -> 0.0 fallback applied
+    #    inside batched_form_diff.
+    acs_form_diff, rating_form_diff = player_form.batched_form_diff(
+        rows_df,
+        matches_df,
+        maps_df,
+        player_map_stats_df,
+        n=player_form.DEFAULT_FORM_WINDOW,
+        decay_rate=player_form.DEFAULT_DECAY_RATE,
+    )
+    # 7. h2h_win_rate_centered — shrunk H2H mean minus the 0.5 prior.
+    h2h_win_rate_centered = h2h_context.batched_h2h_win_rate_centered(
+        rows_df, matches_df, maps_df, k=h2h_context.DEFAULT_H2H_K
+    )
+    # 8. event_stage — the match's own stage, resolved by match_id.
+    event_stage = h2h_context.batched_event_stage(rows_df, matches_df)
+    # 9. days_since_diff — rest gap, A minus B, None -> 0 per side.
+    days_since_diff = h2h_context.batched_days_since_diff(rows_df, matches_df)
+    # 10. roster_decay_diff — post-change decay multiplier, A minus B,
+    #     None -> 1.0 per side.
+    roster_decay_diff = h2h_context.batched_roster_decay_diff(
+        rows_df,
+        matches_df,
+        maps_df,
+        player_map_stats_df,
+        jaccard_threshold=h2h_context.DEFAULT_JACCARD_THRESHOLD,
+        half_life_days=h2h_context.DEFAULT_HALF_LIFE_DAYS,
+    )
+    # 11. attack_side_win_rate_diff — two-level shrunk per-map attack
+    #     phase rate (M38.2), A minus B, CV-chosen outer k.
+    attack_side_win_rate_diff = side_win_rate.batched_attack_side_win_rate_diff(
+        rows_df,
+        matches_df,
+        maps_df,
+        k=side_win_rate.BEST_K_ATTACK,
+        prior_k=side_win_rate.DEFAULT_PRIOR_K,
+    )
+    # 12. signed_margin_diff — two-level shrunk mean signed margin
+    #     (M38.3), A minus B, fixed outer k.
+    signed_margin_diff = signed_margin.batched_signed_margin_diff(
+        rows_df,
+        matches_df,
+        maps_df,
+        k=signed_margin.DEFAULT_MAP_K,
+        overall_k=signed_margin.DEFAULT_OVERALL_K,
+    )
+    # 13. first_blood_diff — two-level shrunk first-blood rate (M38.4),
+    #     A minus B, CV-chosen outer k.
+    first_blood_diff = first_blood.batched_first_blood_diff(
+        rows_df,
+        matches_df,
+        maps_df,
+        player_map_stats_df,
+        k=first_blood.BEST_K,
+        overall_k=first_blood.DEFAULT_OVERALL_K,
+    )
+
+    return np.column_stack(
+        [
+            map_win_rate_diff,
+            elo_diff,
+            ot_rate_diff,
+            map_round_margin_variance,
+            acs_form_diff,
+            rating_form_diff,
+            h2h_win_rate_centered,
+            event_stage,
+            days_since_diff,
+            roster_decay_diff,
+            attack_side_win_rate_diff,
+            signed_margin_diff,
+            first_blood_diff,
+        ]
+    ).astype(dtype=float, copy=False)
