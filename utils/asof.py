@@ -578,6 +578,189 @@ def features_as_of(
     return AsOfBundle(team_id=team_id, date=date, matches=matches, maps=maps)
 
 
+def merge_asof_lookup(
+    events_df: pd.DataFrame,
+    event_key_cols: tuple[str, ...],
+    event_date_col: str,
+    value_cols: tuple[str, ...],
+    queries_df: pd.DataFrame,
+    query_key_cols: tuple[str, ...],
+    query_date_col: str,
+) -> pd.DataFrame:
+    """Resolve, per query row, the last strictly-prior event's value columns.
+
+    The single as-of-lookup primitive the batched feature entry points
+    (task 052) are built on: it answers "for each query row, what were
+    the recorded ``value_cols`` of that key's *last* event dated strictly
+    before the query's date?" in one ``pandas.merge_asof`` call instead
+    of one filter-and-fold per query. It is a genuine leaf utility
+    (pure positional as-of resolution with no team/feature business
+    logic), so it lives here beside ``matches_as_of``/``maps_as_of`` and
+    deliberately does **not** compute any running aggregate itself: a
+    caller wanting a "count of prior events" builds a per-key running
+    ``cumcount`` column on its event frame (a rank is just another
+    ``value_cols`` entry, per the task-052 design decision 2) and reads
+    it back through this function.
+
+    **Strict ``<`` boundary, same as the rest of this module.** The
+    merge is ``direction="backward"`` with
+    ``allow_exact_matches=False``: an event dated *equal to* the query
+    date is never a match, reproducing byte-for-byte the strict ``<``
+    exclusion every other as-of consumer enforces. An event dated
+    ``>=`` the query date can never be the nearest backward match.
+
+    **Event tie-breaks follow the caller's pre-sort order.** The
+    function sorts both frames by their parsed date column with a
+    *stable* sort, so rows sharing one date keep the order they had in
+    the caller's ``events_df``; when ``merge_asof`` must choose among
+    several same-date events of one key it returns the **last** such
+    row (verified empirically against pandas). Callers whose value
+    columns differ across same-date events (notably the Elo rating
+    ledger, where each event records the rating *after* that event)
+    must therefore pre-sort ``events_df`` in true chronological tie-break
+    order (e.g. ``(date, match_id, map_index)``) so the last same-date
+    row is the chronologically-last event. Callers whose value columns
+    are per-key running totals (counts/sums) need no such care: every
+    same-date row of a key carries the same total-through-that-date, so
+    whichever same-date row is returned carries the correct value.
+
+    "Unseen key" is a normal, non-error outcome (matching the module's
+    "unknown team is empty, not an error" convention): a query whose
+    key never appears in ``events_df``, or appears only at dates ``>=
+    the query date, receives ``NaN`` in every ``value_cols`` position
+    (the float NaN of the as-of fill; integer value columns therefore
+    arrive as float). Each feature module applies its own existing
+    default for that case (e.g. ``initial_rating`` for Elo, ``0``
+    games for the Beta estimators, ``None``-pass-through for
+    days-since/form) — never this function.
+
+    Args:
+        events_df: The pre-computed ledger of prior events. Needs
+            ``event_key_cols``, ``event_date_col`` (a raw date column
+            parsed with :func:`parse_date_column`, so a null or
+            unparseable date raises) and ``value_cols``. Every event
+            row is a candidate "last strictly-prior event" for the
+            queries of its key.
+        event_key_cols: The column(s) identifying which event rows are
+            comparable to which query rows, aligned positionally with
+            ``query_key_cols``. May be empty (a keyless/single-key
+            "league" ledger, e.g. a global rate's running totals).
+        event_date_col: ``events_df``'s raw date column name (the as-of
+            key of the right-hand side).
+        value_cols: The ``events_df`` columns whose values the queries
+            receive from their matched event (the last strictly-prior
+            one per key). The returned frame carries one column per
+            name, ``NaN`` where a query has no prior event. Names must
+            not collide with any ``queries_df`` column (see Returns).
+        queries_df: The query rows to resolve. Needs
+            ``query_key_cols`` and ``query_date_col``; every other
+            column is carried through unchanged.
+        query_key_cols: The column(s) identifying each query's key,
+            aligned positionally with ``event_key_cols`` (same length;
+            a ``ValueError`` otherwise).
+        query_date_col: ``queries_df``'s raw date column name (the
+            as-of cutoff of the left-hand side; parsed with
+            :func:`parse_date_column`, so a null/unparseable query date
+            raises).
+
+    Returns:
+        A ``pandas.DataFrame`` with exactly ``queries_df``'s columns
+        (in their original order) followed by one column per
+        ``value_cols`` name, row count and row order identical to
+        ``queries_df`` (the internal date-sort-for-merge round-trips
+        back to the input order). ``value_cols`` entries hold the
+        recorded value of the key's last strictly-prior event, or
+        ``NaN`` for a query with no such event.
+
+    Raises:
+        KeyError: If either frame lacks a required column (propagated
+            from :func:`require_columns`).
+        ValueError: If ``len(query_key_cols) != len(event_key_cols)``
+            (the key tuples must align positionally); if a ``value_cols``
+            name collides with a ``queries_df`` column (the union of
+            the two column sets would be ambiguous); or if any event or
+            query date is null/unparseable (propagated from
+            :func:`parse_date_column`).
+    """
+    all_event_cols = tuple(event_key_cols) + (event_date_col,) + tuple(value_cols)
+    all_query_cols = tuple(query_key_cols) + (query_date_col,)
+    require_columns(events_df, all_event_cols, "events_df")
+    require_columns(queries_df, all_query_cols, "queries_df")
+
+    if len(query_key_cols) != len(event_key_cols):
+        raise ValueError(
+            f"query_key_cols {list(query_key_cols)} and event_key_cols "
+            f"{list(event_key_cols)} must have the same length (they "
+            "align positionally); got "
+            f"{len(query_key_cols)} vs {len(event_key_cols)}"
+        )
+    collisions = [col for col in value_cols if col in queries_df.columns]
+    if collisions:
+        raise ValueError(
+            f"value_cols {collisions} collide with queries_df column name(s); "
+            "the returned frame carries queries_df's columns plus one "
+            "column per value_cols name, so a value column must be "
+            "distinctly named (rename the event column or the query "
+            "column before calling)"
+        )
+
+    events = events_df.copy()
+    queries = queries_df.copy()
+
+    event_parsed_col = "_asof_event_date_parsed"
+    query_parsed_col = "_asof_query_date_parsed"
+    order_col = "_asof_query_order"
+
+    events[event_parsed_col] = parse_date_column(events[event_date_col])
+    queries[query_parsed_col] = parse_date_column(queries[query_date_col])
+
+    # Stable ascending date sort on both sides. Equal-date rows keep the
+    # caller's input order (events) / the input row order (queries), so
+    # the caller's pre-sort governs same-date event tie-breaks and the
+    # queries' original order is recoverable via order_col afterwards.
+    events = events.sort_values(event_parsed_col, kind="stable")
+    queries[order_col] = np.arange(len(queries))
+    queries = queries.sort_values([query_parsed_col, order_col], kind="stable")
+
+    # Rename the value columns to collision-free internal names so the
+    # merge cannot suffix-collide with a query column, then restore the
+    # caller's names on the output frame.
+    internal_value_names = [f"_asof_value_{i}" for i in range(len(value_cols))]
+    value_renames = dict(zip(value_cols, internal_value_names))
+    events = events.rename(columns=value_renames)
+
+    left_by = list(query_key_cols)
+    right_by = list(event_key_cols)
+    if left_by:
+        merged = pd.merge_asof(
+            queries,
+            events,
+            left_on=query_parsed_col,
+            right_on=event_parsed_col,
+            left_by=left_by,
+            right_by=right_by,
+            direction="backward",
+            allow_exact_matches=False,
+        )
+    else:
+        merged = pd.merge_asof(
+            queries,
+            events,
+            left_on=query_parsed_col,
+            right_on=event_parsed_col,
+            direction="backward",
+            allow_exact_matches=False,
+        )
+
+    merged = merged.sort_values(order_col, kind="stable")
+    merged = merged.drop(columns=[query_parsed_col, event_parsed_col, order_col])
+    merged = merged.rename(
+        columns=dict(zip(internal_value_names, value_cols))
+    )
+    output_cols = list(queries_df.columns) + list(value_cols)
+    return merged[output_cols].reset_index(drop=True)
+
+
 def load_asof_tables(
     version: str,
     output_dir: Path | str = DEFAULT_OUTPUT_DIR,

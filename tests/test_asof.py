@@ -463,3 +463,206 @@ def test_real_data_cached_parsed_date_column_matches_oracle():
     cached = asof.cached_parsed_date_column(matches_df)
     assert cached.equals(pd.to_datetime(matches_df[asof.DATE_COL]))
     assert asof.cached_parsed_date_column(matches_df) is cached
+
+
+# --------------------------------------------------------------------------
+# merge_asof_lookup (task 052 batched-feature primitive)
+# --------------------------------------------------------------------------
+
+
+def _lookup_fixture():
+    """Build a small events+queries pair exercising every lookup branch.
+
+    The events frame is a per-key running-total ledger with interleaved
+    keys and dates (deliberately passed out of chronological order to
+    prove the internal sort is the caller's friend, not a hidden
+    assumption): team ``"A"`` has events on Jan 1 (running 1), Jan 3
+    (running 2) and Jan 3 again (running 3); team ``"B"`` has events on
+    Jan 2 (running 10) and Jan 4 (running 20); team ``"C"`` (an unseen
+    query key) has no events at all. The queries ask, for each of
+    several dates, what the key's last strictly-prior running total
+    was.
+
+    Returns:
+        An ``(events_df, queries_df)`` tuple. ``events_df`` has columns
+        ``key, date, running`` (running is the per-key total *through*
+        that event); ``queries_df`` has columns ``key, qdate, tag``
+        (``tag`` a carried-through non-key column proving pass-through).
+
+    Raises:
+        Nothing.
+    """
+    events = pd.DataFrame(
+        [
+            {"key": "A", "date": "2026-01-01T00:00:00", "running": 1},
+            {"key": "A", "date": "2026-01-03T00:00:00", "running": 2},
+            {"key": "A", "date": "2026-01-03T00:00:00", "running": 3},
+            {"key": "B", "date": "2026-01-02T00:00:00", "running": 10},
+            {"key": "B", "date": "2026-01-04T00:00:00", "running": 20},
+            # Deliberately out of order: proves the internal sort, not
+            # input order, governs the resolution.
+            {"key": "A", "date": "2026-01-05T00:00:00", "running": 4},
+        ]
+    )
+    queries = pd.DataFrame(
+        [
+            {"key": "A", "qdate": "2026-01-01T00:00:00", "tag": "exact-first"},
+            {"key": "A", "qdate": "2026-01-04T00:00:00", "tag": "between"},
+            {"key": "A", "qdate": "2026-01-06T00:00:00", "tag": "after-all"},
+            {"key": "B", "qdate": "2026-01-03T00:00:00", "tag": "b-between"},
+            {"key": "C", "qdate": "2026-01-09T00:00:00", "tag": "unseen"},
+        ]
+    )
+    return events, queries
+
+
+def test_merge_asof_lookup_strict_lt_excludes_exact_date_events():
+    # The load-bearing leakage rule of the primitive: a query at a date
+    # equal to an event's date must resolve to NaN (that event and any
+    # later one are excluded); only strictly-prior events count.
+    events, queries = _lookup_fixture()
+    out = asof.merge_asof_lookup(
+        events,
+        ("key",),
+        "date",
+        ("running",),
+        queries,
+        ("key",),
+        "qdate",
+    )
+    assert pd.isna(out["running"].iloc[0])  # NaN: exact-date event excluded
+    assert out["running"].iloc[1] == 3.0  # A: last prior event total (Jan 3 pair -> 3)
+    assert out["running"].iloc[2] == 4.0  # A: after all events -> 4
+
+
+def test_merge_asof_lookup_per_key_grouping_no_cross_contamination():
+    # Two keys with interleaved dates never cross-contaminate: B's Jan 2
+    # and Jan 4 totals are resolved from B's own events only, even
+    # though A's events sit chronologically between them.
+    events, queries = _lookup_fixture()
+    out = asof.merge_asof_lookup(
+        events,
+        ("key",),
+        "date",
+        ("running",),
+        queries,
+        ("key",),
+        "qdate",
+    )
+    b_between = out[out["tag"] == "b-between"].iloc[0]
+    assert b_between["running"] == 10.0  # B's Jan 2 event, not A's Jan 3 total
+
+
+def test_merge_asof_lookup_unmatched_key_returns_nan():
+    # An unseen key (no events at all) is a normal outcome: NaN in the
+    # value column, never a raise and never a wrong cross-key value.
+    events, queries = _lookup_fixture()
+    out = asof.merge_asof_lookup(
+        events,
+        ("key",),
+        "date",
+        ("running",),
+        queries,
+        ("key",),
+        "qdate",
+    )
+    unseen = out[out["tag"] == "unseen"].iloc[0]
+    assert pd.isna(unseen["running"])
+
+
+def test_merge_asof_lookup_preserves_query_row_order():
+    # The output row order must exactly match the input queries_df order
+    # (the internal sort-for-merge round-trips back), and every original
+    # query column rides through untouched.
+    events, queries = _lookup_fixture()
+    out = asof.merge_asof_lookup(
+        events,
+        ("key",),
+        "date",
+        ("running",),
+        queries,
+        ("key",),
+        "qdate",
+    )
+    assert list(out["tag"]) == list(queries["tag"])
+    assert list(out["key"]) == list(queries["key"])
+    assert list(out["qdate"]) == list(queries["qdate"])
+    assert list(out.columns) == ["key", "qdate", "tag", "running"]
+
+
+def test_merge_asof_lookup_no_prior_event_before_first_returns_nan():
+    # A query dated before its key's earliest event resolves to NaN:
+    # there is no strictly-prior event, which is the same class as an
+    # unseen key.
+    events, _ = _lookup_fixture()
+    queries = pd.DataFrame(
+        {"key": ["B"], "qdate": ["2026-01-02T00:00:00"]}  # == B's first event
+    )
+    out = asof.merge_asof_lookup(
+        events, ("key",), "date", ("running",), queries, ("key",), "qdate"
+    )
+    assert pd.isna(out["running"].iloc[0])
+
+
+def test_merge_asof_lookup_keyless_league_ledger():
+    # A keyless (single-group) ledger is supported: querying totals as
+    # of a date resolves to the last league-wide event strictly before
+    # it. This is the shape the league-prior features use.
+    events = pd.DataFrame(
+        [
+            {"date": "2026-01-01T00:00:00", "total": 5},
+            {"date": "2026-01-02T00:00:00", "total": 8},
+            {"date": "2026-01-04T00:00:00", "total": 11},
+        ]
+    )
+    queries = pd.DataFrame({"qdate": ["2026-01-02T00:00:00", "2026-01-03T00:00:00", "2026-01-05T00:00:00"]})
+    out = asof.merge_asof_lookup(
+        events, (), "date", ("total",), queries, (), "qdate"
+    )
+    # Jan 2 query excludes the exact-date event -> Jan 1 total 5; Jan 3
+    # -> Jan 2 total 8; Jan 5 -> Jan 4 total 11.
+    assert list(out["total"]) == [5.0, 8.0, 11.0]
+
+
+def test_merge_asof_lookup_missing_column_raises():
+    # A missing required column surfaces as a KeyError naming it, the
+    # same contract as every other as-of function.
+    events, queries = _lookup_fixture()
+    with pytest.raises(KeyError, match="running"):
+        asof.merge_asof_lookup(
+            events.drop(columns=["running"]),
+            ("key",),
+            "date",
+            ("running",),
+            queries,
+            ("key",),
+            "qdate",
+        )
+
+
+def test_merge_asof_lookup_mismatched_key_arity_raises():
+    # The two key tuples align positionally and must have equal length;
+    # a mismatch is a caller bug and raises ValueError up front.
+    events, queries = _lookup_fixture()
+    with pytest.raises(ValueError, match="same length"):
+        asof.merge_asof_lookup(
+            events,
+            ("key",),
+            "date",
+            ("running",),
+            queries,
+            (),
+            "qdate",
+        )
+
+
+def test_merge_asof_lookup_null_query_date_raises():
+    # A null query date parses to NaT and is rejected (no chronological
+    # position to resolve against), matching the module's null-date
+    # contract.
+    events, _ = _lookup_fixture()
+    queries = pd.DataFrame({"key": ["A"], "qdate": [None]})
+    with pytest.raises(ValueError, match="null"):
+        asof.merge_asof_lookup(
+            events, ("key",), "date", ("running",), queries, ("key",), "qdate"
+        )
