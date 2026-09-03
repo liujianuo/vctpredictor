@@ -63,9 +63,16 @@ Scope of what is wired up today:
   to ids first; this module's API shape does not preclude that, but it
   also does not silently paper over the gap with a fragile
   name-matching join.
-- No performance work (per-team history caching/indexing) is done
-  here — correctness and the leakage proof come first; that is a
-  candidate follow-up, not this task's job.
+- No per-team performance work (history caching/indexing) is done
+  here. What is cached is narrower and orthogonal: the parsed
+  ``matches`` table date column is parsed once per table per process
+  (keyed on the table's identity via
+  :func:`cached_parsed_date_column`) instead of on every as-of call,
+  since date parsing is the one pure cost identical across every
+  query against the same table. The per-team filtering logic itself
+  still runs on every call, and correctness and the leakage proof
+  still come first; per-team caching remains a candidate follow-up,
+  not this module's job.
 
 This module lives in ``utils/`` next to ``utils/scoring.py`` and
 ``utils/table_io.py`` per the boundary rule: it is a pure in-memory
@@ -118,6 +125,17 @@ _MATCHES_REQUIRED = (TEAM1_ID_COL, TEAM2_ID_COL, DATE_COL, STATUS_COL)
 # The columns :func:`maps_as_of` needs on the maps table: the join key
 # plus the map-completion signal used by the map-level filter.
 _MAPS_REQUIRED = (MATCH_ID_COL, WINNER_COL)
+
+# Process-lifetime cache of parsed matches-table date columns, keyed on
+# ``id(matches_df)`` (the DataFrame's identity — stable for the lifetime
+# of a feature-build/evaluation loop, unlike a Series-keyed cache, whose
+# key would silently invalidate on any unrelated column reassignment).
+# Each value pins a strong reference to the DataFrame it was parsed from
+# so the id cannot be freed and reused by an unrelated DataFrame while
+# the entry is alive (id-reuse would otherwise risk a stale hit);
+# :func:`cached_parsed_date_column` additionally checks the pinned frame
+# is the same object and its length is unchanged before returning a hit.
+_DATE_COLUMN_CACHE: dict[int, tuple[pd.DataFrame, pd.Series]] = {}
 
 
 @dataclass(eq=False)
@@ -182,9 +200,12 @@ def parse_query_date(date: str) -> pd.Timestamp:
 
     Turns the caller's cutoff into a single ``pandas.Timestamp`` that
     can be compared against the parsed table date column. The parse is
-    done with ``pandas.to_datetime`` (the convention shared with
-    ``utils.splits``) rather than left as a string, and the result is
-    validated to be exactly one real (non-null, timezone-naive)
+    done with ``pandas.to_datetime`` in its ``format="ISO8601"``
+    precision-adaptive mode (the convention shared with
+    ``utils.splits``, with the ISO-8601 format pinned so any precision
+    within the ISO-8601 family — with or without sub-second digits —
+    parses identically) rather than left as a string, and the result
+    is validated to be exactly one real (non-null, timezone-naive)
     timestamp, so a null or list-like cutoff fails loudly instead of
     silently producing an empty or mis-ordered result.
 
@@ -208,7 +229,7 @@ def parse_query_date(date: str) -> pd.Timestamp:
             scalar timestamp.
     """
     try:
-        parsed = pd.to_datetime(date)
+        parsed = pd.to_datetime(date, format="ISO8601")
     except (ValueError, TypeError, OverflowError) as exc:
         raise ValueError(
             f"query date {date!r} is not a parseable timestamp: {exc}"
@@ -235,11 +256,13 @@ def parse_date_column(dates: pd.Series) -> pd.Series:
     """Parse and null-check a table's date column for as-of filtering.
 
     Parses the raw (ISO-8601 string) date column with
-    ``pandas.to_datetime`` and rejects any null value, mirroring the
-    null-date guard already established in ``utils.splits``: a null
-    date parses to ``NaT`` rather than raising, and ``NaT`` has no
-    chronological position, so it must not silently pass (or fail) an
-    as-of comparison.
+    ``pandas.to_datetime`` in its ``format="ISO8601"`` mode (pandas'
+    precision-adaptive ISO-8601 parser, so rows with differing
+    second/microsecond precision still parse) and rejects any null
+    value, mirroring the null-date guard already established in
+    ``utils.splits``: a null date parses to ``NaT`` rather than
+    raising, and ``NaT`` has no chronological position, so it must not
+    silently pass (or fail) an as-of comparison.
 
     Args:
         dates: The raw date column (typically the ``"date"`` column of
@@ -256,7 +279,7 @@ def parse_date_column(dates: pd.Series) -> pd.Series:
             (``None``/``NaN`` -> ``NaT``).
     """
     try:
-        parsed = pd.to_datetime(dates)
+        parsed = pd.to_datetime(dates, format="ISO8601")
     except (ValueError, TypeError, OverflowError) as exc:
         raise ValueError(f"date column contains an unparseable value: {exc}") from exc
     null_mask = parsed.isna()
@@ -267,6 +290,79 @@ def parse_date_column(dates: pd.Series) -> pd.Series:
             f"{positions}: a null date (None/NaN) parses to NaT and has no "
             "chronological position, so it cannot be as-of filtered"
         )
+    return parsed
+
+
+def cached_parsed_date_column(matches_df: pd.DataFrame) -> pd.Series:
+    """Return ``matches_df``'s parsed date column, parsed once per table.
+
+    The performance wrapper over :func:`parse_date_column` that every
+    as-of date-parse call site routes through (``matches_as_of`` and
+    the league-wide helpers in ``features/``/``evaluation/`` that call
+    ``parse_date_column(matches_df[DATE_COL])`` directly): parsing the
+    date column is a pure cost identical for every as-of query against
+    the same table, so it is done once per table per process and
+    reused, rather than re-parsed on every call.
+
+    The cache is keyed on ``id(matches_df)`` — the DataFrame's object
+    identity, which is stable for the whole lifetime of a feature-build
+    or evaluation loop because the same ``matches_df`` object is
+    threaded through unchanged. It is deliberately *not* keyed on
+    ``matches_df[DATE_COL]`` (the Series): pandas clears its internal
+    per-column cache whenever any column is reassigned, so a Series
+    key would silently degrade to perpetual misses under an unrelated
+    mutation elsewhere, and a bare Series carries no back-reference to
+    its parent DataFrame anyway. Each cache value is the
+    ``(matches_df, parsed_series)`` pair, not just the parsed series:
+    pinning a strong reference to the DataFrame prevents its ``id``
+    from being freed and reused by a new, unrelated DataFrame while
+    the entry is alive, which would otherwise risk a stale hit. A hit
+    additionally requires the pinned frame to *be* the queried object
+    (``entry[0] is matches_df``) and to have unchanged length
+    (``len(entry[1]) == len(matches_df)`` — a defense-in-depth
+    backstop against in-place row mutation, the documented-immutable
+    claim being the primary safety argument). Any of those checks
+    failing is treated as a miss: the column is re-parsed, the entry
+    is overwritten, and the fresh result is returned — a stale-cache
+    detection never raises, because a fresh parse is always a safe
+    fallback.
+
+    This is purely a performance cache, not a new validation layer:
+    behavior on a miss is identical to calling :func:`parse_date_column`
+    directly (null/parse-error handling is not duplicated here), and a
+    hit performs no parsing at all and raises nothing.
+
+    Args:
+        matches_df: The materialised ``matches`` table whose ``date``
+            column (see :data:`DATE_COL`) is to be parsed. Only its
+            identity (``id``) and length are read on a cache hit; the
+            ``date`` column itself is read only on a miss.
+
+    Returns:
+        The parsed ``date`` column as a ``pandas.Series`` of
+        ``datetime64[ns]`` values aligned to ``matches_df``'s index.
+        Repeat calls with the same (unmutated) ``matches_df`` object
+        return the exact same cached Series object; a different
+        ``matches_df`` (even one with identical contents) or a length-
+        mutated one re-parses and returns a fresh Series.
+
+    Raises:
+        KeyError: If ``matches_df`` has no ``date`` column and no
+            valid cache entry exists (propagated from the
+            ``matches_df[DATE_COL]`` indexing on a miss).
+        ValueError: If the ``date`` column contains a null or
+            unparseable value and no valid cache entry exists
+            (propagated from :func:`parse_date_column` on a miss).
+            A cache hit raises nothing.
+    """
+    key = id(matches_df)
+    entry = _DATE_COLUMN_CACHE.get(key)
+    if entry is not None and entry[0] is matches_df and len(entry[1]) == len(
+        matches_df
+    ):
+        return entry[1]
+    parsed = parse_date_column(matches_df[DATE_COL])
+    _DATE_COLUMN_CACHE[key] = (matches_df, parsed)
     return parsed
 
 
@@ -316,7 +412,7 @@ def matches_as_of(team_id: str, date: str, matches_df: pd.DataFrame) -> pd.DataF
     """
     require_columns(matches_df, _MATCHES_REQUIRED, "matches_df")
 
-    parsed_dates = parse_date_column(matches_df[DATE_COL])
+    parsed_dates = cached_parsed_date_column(matches_df)
     query = parse_query_date(date)
 
     team1 = matches_df[TEAM1_ID_COL]
@@ -457,9 +553,13 @@ def features_as_of(
         :func:`matches_as_of` result and whose ``maps`` field is the
         :func:`maps_as_of` result (the two filters are computed
         independently, so the match-level filter runs twice — once for
-        the bundle and once inside ``maps_as_of``; that minor
-        redundancy is deliberate, since correctness-first is the
-        priority this task and per-team caching is an explicit
+        the bundle and once inside ``maps_as_of``. That redundant
+        *filtering* work is deliberate and unchanged; only its
+        date-parsing cost is gone, since the second
+        :func:`matches_as_of` call reuses the parsed date column cached
+        by :func:`cached_parsed_date_column`. Removing the redundant
+        filtering itself is a separate structural refactor, not this
+        module's job; per-team caching/indexing remains an explicit
         follow-up).
 
     Raises:

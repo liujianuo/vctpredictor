@@ -352,14 +352,14 @@ def _league_maps_as_of(
             map rows); or if the query date or a row date is
             null/unparseable/timezone-aware (propagated from
             ``utils.asof.parse_query_date`` /
-            ``utils.asof.parse_date_column``).
+            ``utils.asof.cached_parsed_date_column``).
         TypeError: If the query date is list-like (propagated from
             ``utils.asof.parse_query_date``).
     """
     asof.require_columns(matches_df, _MATCHES_REQUIRED, "matches_df")
     asof.require_columns(maps_df, _MAPS_REQUIRED, "maps_df")
 
-    parsed_dates = asof.parse_date_column(matches_df[asof.DATE_COL])
+    parsed_dates = asof.cached_parsed_date_column(matches_df)
     query = asof.parse_query_date(date)
 
     is_completed = matches_df[asof.STATUS_COL] == asof.COMPLETED_STATUS

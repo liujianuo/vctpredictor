@@ -684,7 +684,7 @@ def _as_of_map_play_counts(
         ValueError: If ``date`` is null/unparseable/timezone-aware or
             any match date is null/unparseable (propagated from
             :func:`utils.asof.parse_query_date` /
-            :func:`utils.asof.parse_date_column`).
+            :func:`utils.asof.cached_parsed_date_column`).
         TypeError: If ``date`` is list-like (propagated from
             :func:`utils.asof.parse_query_date`).
         KeyError: If ``matches_df`` lacks ``match_id``/``date`` or
@@ -694,7 +694,7 @@ def _as_of_map_play_counts(
             :func:`utils.config.normalize_map_name`).
     """
     query = asof.parse_query_date(date)
-    parsed_dates = asof.parse_date_column(matches_df[asof.DATE_COL])
+    parsed_dates = asof.cached_parsed_date_column(matches_df)
     prior_matches = matches_df[parsed_dates < query]
     joined = prior_matches.merge(
         maps_df[["match_id", "winner", "map_name"]], on="match_id", how="inner"

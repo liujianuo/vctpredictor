@@ -245,6 +245,58 @@ def test_timezone_aware_query_date_raises():
         asof.features_as_of("T1", "2026-01-03T10:00:00+00:00", matches_df, maps_df)
 
 
+def test_cached_parsed_date_column_equals_direct_parse():
+    # The cache wrapper is behavior-identical to calling the public
+    # parser directly: byte-identical values (not just equal
+    # length/dtype) on the same table.
+    matches_df, _ = _synthetic_tables()
+    direct = asof.parse_date_column(matches_df[asof.DATE_COL])
+    cached = asof.cached_parsed_date_column(matches_df)
+    assert cached.equals(direct)
+    assert list(cached.index) == list(direct.index)
+
+
+def test_cached_parsed_date_column_keyed_on_table_identity():
+    # Cache-key proof: a second call on the SAME DataFrame object
+    # returns the exact same Series object (a hit — no re-parse), while
+    # a different DataFrame object with identical contents (a .copy())
+    # returns a different object (the cache never conflates two
+    # distinct tables by content, only by identity).
+    matches_df, _ = _synthetic_tables()
+    first = asof.cached_parsed_date_column(matches_df)
+    second = asof.cached_parsed_date_column(matches_df)
+    assert second is first
+    copy_df = matches_df.copy()
+    copy_parsed = asof.cached_parsed_date_column(copy_df)
+    assert copy_parsed is not first
+    assert copy_parsed.equals(first)
+
+
+def test_cached_parsed_date_column_reparses_on_in_place_length_change():
+    # The len() guard in the hit check: an in-place row drop keeps the
+    # DataFrame object (and its id) but changes its length, so the next
+    # call must re-parse the shrunken table instead of returning the
+    # stale, misaligned cached Series.
+    matches_df, _ = _synthetic_tables()
+    full = asof.cached_parsed_date_column(matches_df)
+    assert len(full) == len(matches_df)
+    matches_df.drop(index=matches_df.index[0], inplace=True)
+    shrunken = asof.cached_parsed_date_column(matches_df)
+    assert shrunken is not full
+    assert len(shrunken) == len(matches_df)
+    assert shrunken.equals(pd.to_datetime(matches_df[asof.DATE_COL]))
+
+
+def test_iso8601_format_parse_matches_no_format_oracle():
+    # format="ISO8601" is pandas' precision-adaptive ISO-8601 mode, not
+    # a fixed strftime pattern: the parser's output on the synthetic
+    # fixture is byte-identical to pandas' no-format pd.to_datetime
+    # oracle, so the format pin changed no parsing behavior.
+    matches_df, _ = _synthetic_tables()
+    parsed = asof.parse_date_column(matches_df[asof.DATE_COL])
+    assert parsed.equals(pd.to_datetime(matches_df[asof.DATE_COL]))
+
+
 def test_matches_as_of_missing_column_raises():
     # A missing required column surfaces as KeyError naming it (same
     # contract as labels.py/splits.py), not a confusing pandas error.
@@ -392,3 +444,22 @@ def test_real_data_strict_boundary_excludes_equal_date():
     query_ts = pd.to_datetime(query)
     for frame in (bundle.matches, bundle.maps):
         assert (pd.to_datetime(frame["date"]) < query_ts).all()
+
+
+@pytest.mark.skipif(
+    not (
+        Path("data/v1/matches.parquet").exists()
+        and Path("data/v1/maps.parquet").exists()
+    ),
+    reason="materialised v1 dataset not present (run materialize.py first)",
+)
+def test_real_data_cached_parsed_date_column_matches_oracle():
+    # The cached wrapper on the real v1 matches table matches the
+    # no-format pd.to_datetime oracle value-for-value (a Parquet
+    # round-trip or dtype surprise the synthetic fixture cannot express
+    # would show up here), and a repeat call on the same loaded table
+    # returns the exact same cached object.
+    matches_df, _ = asof.load_asof_tables("v1")
+    cached = asof.cached_parsed_date_column(matches_df)
+    assert cached.equals(pd.to_datetime(matches_df[asof.DATE_COL]))
+    assert asof.cached_parsed_date_column(matches_df) is cached
