@@ -424,6 +424,7 @@ def test_binary_logit_loss_trace_non_increasing():
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(
     not _real_v1_available(),
     reason="materialised v1 dataset + trained model artifacts not present "

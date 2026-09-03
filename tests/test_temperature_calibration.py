@@ -330,6 +330,7 @@ def test_report_json_serializable_and_field_types():
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(
     not _real_v1_available(),
     reason="materialised v1 dataset + both model artifacts not present "

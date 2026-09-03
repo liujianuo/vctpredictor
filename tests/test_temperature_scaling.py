@@ -408,6 +408,7 @@ def test_train_temperature_scaling_raises_on_missing_base_artifact(tmp_path):
         )
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(
     not _real_v1_available(),
     reason="materialised v1 dataset + ordinal artifact not present (run "

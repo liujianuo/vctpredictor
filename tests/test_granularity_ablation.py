@@ -286,6 +286,7 @@ def test_build_ablation_report_rejects_invalid_labels():
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(
     not _real_v1_available(),
     reason="materialised v1 dataset + trained model artifacts not present "

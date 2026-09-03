@@ -1076,6 +1076,7 @@ def test_real_v1_thresholds_strictly_increasing(real_v1_train_model):
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(
     not _real_v1_available(),
     reason="materialised v1 dataset not present (run materialize.py first)",

@@ -1089,6 +1089,7 @@ def test_multi_arm_report_rejects_misaligned_rows():
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(
     not _real_v1_available(_REAL_V1_TABLES),
     reason="materialised v1 dataset not present (run materialize.py and "
