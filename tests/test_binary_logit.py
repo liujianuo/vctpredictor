@@ -55,6 +55,14 @@ _MAPS_COLS = [
     "team1_score",
     "team2_score",
     "winner",
+    "team1_first_half_rounds",
+    "team2_first_half_rounds",
+    "team1_second_half_rounds",
+    "team2_second_half_rounds",
+    "team1_atk_rounds",
+    "team1_def_rounds",
+    "team2_atk_rounds",
+    "team2_def_rounds",
 ]
 _PMS_COLS = [
     "match_id",
@@ -63,6 +71,8 @@ _PMS_COLS = [
     "team_name",
     "acs",
     "rating",
+    "first_kills",
+    "first_deaths",
 ]
 
 QUERY_DATE = "2026-01-02T12:00:00"
@@ -125,6 +135,17 @@ def _league_tables():
             "team1_score": 13,
             "team2_score": 11,
             "winner": "Alpha",
+            # Regulation 13-11: per-side atk+def == score (A 13 =
+            # 7 atk + 6 def; X 11 = 6 atk + 5 def), pairings
+            # 7+5=12 / 6+6=12 partition the 24 rounds.
+            "team1_first_half_rounds": 12.0,
+            "team2_first_half_rounds": 12.0,
+            "team1_second_half_rounds": 12.0,
+            "team2_second_half_rounds": 12.0,
+            "team1_atk_rounds": 7,
+            "team1_def_rounds": 6,
+            "team2_atk_rounds": 6,
+            "team2_def_rounds": 5,
         },
         {
             "match_id": "m2",
@@ -133,6 +154,17 @@ def _league_tables():
             "team1_score": 8,
             "team2_score": 13,
             "winner": "Yankee",
+            # Regulation 8-13: team1 8 = 4 atk + 4 def; team2 13 =
+            # 6 atk + 7 def; pairings 4+7=11 / 4+6=10 partition the
+            # 21 rounds.
+            "team1_first_half_rounds": 12.0,
+            "team2_first_half_rounds": 12.0,
+            "team1_second_half_rounds": 12.0,
+            "team2_second_half_rounds": 12.0,
+            "team1_atk_rounds": 4,
+            "team1_def_rounds": 4,
+            "team2_atk_rounds": 6,
+            "team2_def_rounds": 7,
         },
         {
             "match_id": "m3",
@@ -141,16 +173,27 @@ def _league_tables():
             "team1_score": 13,
             "team2_score": 8,
             "winner": "Alpha",
+            # Regulation 13-8: team1 13 = 7 atk + 6 def; team2 8 =
+            # 4 atk + 4 def; pairings 7+4=11 / 6+4=10 partition the
+            # 21 rounds.
+            "team1_first_half_rounds": 12.0,
+            "team2_first_half_rounds": 12.0,
+            "team1_second_half_rounds": 12.0,
+            "team2_second_half_rounds": 12.0,
+            "team1_atk_rounds": 7,
+            "team1_def_rounds": 6,
+            "team2_atk_rounds": 4,
+            "team2_def_rounds": 4,
         },
     ]
     pms_rows = []
-    for mid, team, players, acs, rating in [
-        ("m1", "Alpha", ["pA1", "pA2", "pA3", "pA4", "pA5"], 200.0, 1.1),
-        ("m1", "Xray", ["pX1", "pX2", "pX3", "pX4", "pX5"], 180.0, 0.9),
-        ("m2", "Bravo", ["pB1", "pB2", "pB3", "pB4", "pB5"], 250.0, 1.3),
-        ("m2", "Yankee", ["pY1", "pY2", "pY3", "pY4", "pY5"], 170.0, 0.8),
-        ("m3", "Alpha", ["pA1", "pA2", "pA3", "pA4", "pA5"], 210.0, 1.2),
-        ("m3", "Bravo", ["pB1", "pB2", "pB3", "pB4", "pB5"], 240.0, 1.25),
+    for mid, team, players, acs, rating, fk, fd in [
+        ("m1", "Alpha", ["pA1", "pA2", "pA3", "pA4", "pA5"], 200.0, 1.1, 3, 2),
+        ("m1", "Xray", ["pX1", "pX2", "pX3", "pX4", "pX5"], 180.0, 0.9, 2, 3),
+        ("m2", "Bravo", ["pB1", "pB2", "pB3", "pB4", "pB5"], 250.0, 1.3, 2, 3),
+        ("m2", "Yankee", ["pY1", "pY2", "pY3", "pY4", "pY5"], 170.0, 0.8, 3, 2),
+        ("m3", "Alpha", ["pA1", "pA2", "pA3", "pA4", "pA5"], 210.0, 1.2, 3, 2),
+        ("m3", "Bravo", ["pB1", "pB2", "pB3", "pB4", "pB5"], 240.0, 1.25, 2, 3),
     ]:
         for player in players:
             pms_rows.append(
@@ -161,6 +204,10 @@ def _league_tables():
                     "team_name": team,
                     "acs": acs,
                     "rating": rating,
+                    # Per-map conservation (sum FK == sum FD) holds
+                    # per match: m1 5==5, m2 5==5, m3 5==5.
+                    "first_kills": fk,
+                    "first_deaths": fd,
                 }
             )
     matches_df = pd.DataFrame(match_rows, columns=_MATCHES_COLS)
@@ -233,7 +280,7 @@ def _real_v1_available():
 def real_v1_train_model():
     """Fit the binary model on the real v1 train split once per module.
 
-    Assembles the ``(209, 11)`` training matrix exactly the way
+    Assembles the ``(209, 15)`` training matrix exactly the way
     ``drivers/train_binary_logit.py`` does (held-out maps restricted to
     ``split="train"``, one :func:`build_feature_vector` per row, labels
     from ``outcome_ordinal`` converted to the binary "A wins" target)

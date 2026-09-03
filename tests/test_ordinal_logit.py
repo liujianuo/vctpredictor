@@ -1,6 +1,6 @@
 """Tests for the ordinal logistic regression model (M20).
 
-Covers the 11-feature vector builder (a real-league integration check
+Covers the 15-feature vector builder (a real-league integration check
 plus one test per section-A missing-value fallback rule, asserting the
 exact documented fallback value), the +eta sign-convention regression
 (a synthetic single-informative-feature dataset must fit a positive
@@ -65,6 +65,14 @@ _MAPS_COLS = [
     "team1_score",
     "team2_score",
     "winner",
+    "team1_first_half_rounds",
+    "team2_first_half_rounds",
+    "team1_second_half_rounds",
+    "team2_second_half_rounds",
+    "team1_atk_rounds",
+    "team1_def_rounds",
+    "team2_atk_rounds",
+    "team2_def_rounds",
 ]
 _PMS_COLS = [
     "match_id",
@@ -73,6 +81,8 @@ _PMS_COLS = [
     "team_name",
     "acs",
     "rating",
+    "first_kills",
+    "first_deaths",
 ]
 
 _REAL_V1_TABLES = ("matches", "maps", "labels", "splits", "player_map_stats")
@@ -137,6 +147,17 @@ def _league_tables():
             "team1_score": 13,
             "team2_score": 11,
             "winner": "Alpha",
+            # Regulation 13-11: per-side atk+def == score (A 13 =
+            # 7 atk + 6 def; X 11 = 6 atk + 5 def), pairings
+            # 7+5=12 / 6+6=12 partition the 24 rounds.
+            "team1_first_half_rounds": 12.0,
+            "team2_first_half_rounds": 12.0,
+            "team1_second_half_rounds": 12.0,
+            "team2_second_half_rounds": 12.0,
+            "team1_atk_rounds": 7,
+            "team1_def_rounds": 6,
+            "team2_atk_rounds": 6,
+            "team2_def_rounds": 5,
         },
         {
             "match_id": "m2",
@@ -145,6 +166,17 @@ def _league_tables():
             "team1_score": 8,
             "team2_score": 13,
             "winner": "Yankee",
+            # Regulation 8-13: team1 8 = 4 atk + 4 def; team2 13 =
+            # 6 atk + 7 def; pairings 4+7=11 / 4+6=10 partition the
+            # 21 rounds.
+            "team1_first_half_rounds": 12.0,
+            "team2_first_half_rounds": 12.0,
+            "team1_second_half_rounds": 12.0,
+            "team2_second_half_rounds": 12.0,
+            "team1_atk_rounds": 4,
+            "team1_def_rounds": 4,
+            "team2_atk_rounds": 6,
+            "team2_def_rounds": 7,
         },
         {
             "match_id": "m3",
@@ -153,16 +185,27 @@ def _league_tables():
             "team1_score": 13,
             "team2_score": 8,
             "winner": "Alpha",
+            # Regulation 13-8: team1 13 = 7 atk + 6 def; team2 8 =
+            # 4 atk + 4 def; pairings 7+4=11 / 6+4=10 partition the
+            # 21 rounds.
+            "team1_first_half_rounds": 12.0,
+            "team2_first_half_rounds": 12.0,
+            "team1_second_half_rounds": 12.0,
+            "team2_second_half_rounds": 12.0,
+            "team1_atk_rounds": 7,
+            "team1_def_rounds": 6,
+            "team2_atk_rounds": 4,
+            "team2_def_rounds": 4,
         },
     ]
     pms_rows = []
-    for mid, team, players, acs, rating in [
-        ("m1", "Alpha", ["pA1", "pA2", "pA3", "pA4", "pA5"], 200.0, 1.1),
-        ("m1", "Xray", ["pX1", "pX2", "pX3", "pX4", "pX5"], 180.0, 0.9),
-        ("m2", "Bravo", ["pB1", "pB2", "pB3", "pB4", "pB5"], 250.0, 1.3),
-        ("m2", "Yankee", ["pY1", "pY2", "pY3", "pY4", "pY5"], 170.0, 0.8),
-        ("m3", "Alpha", ["pA1", "pA2", "pA3", "pA4", "pA5"], 210.0, 1.2),
-        ("m3", "Bravo", ["pB1", "pB2", "pB3", "pB4", "pB5"], 240.0, 1.25),
+    for mid, team, players, acs, rating, fk, fd in [
+        ("m1", "Alpha", ["pA1", "pA2", "pA3", "pA4", "pA5"], 200.0, 1.1, 3, 2),
+        ("m1", "Xray", ["pX1", "pX2", "pX3", "pX4", "pX5"], 180.0, 0.9, 2, 3),
+        ("m2", "Bravo", ["pB1", "pB2", "pB3", "pB4", "pB5"], 250.0, 1.3, 2, 3),
+        ("m2", "Yankee", ["pY1", "pY2", "pY3", "pY4", "pY5"], 170.0, 0.8, 3, 2),
+        ("m3", "Alpha", ["pA1", "pA2", "pA3", "pA4", "pA5"], 210.0, 1.2, 3, 2),
+        ("m3", "Bravo", ["pB1", "pB2", "pB3", "pB4", "pB5"], 240.0, 1.25, 2, 3),
     ]:
         for player in players:
             pms_rows.append(
@@ -173,11 +216,100 @@ def _league_tables():
                     "team_name": team,
                     "acs": acs,
                     "rating": rating,
+                    # Per-map conservation (sum FK == sum FD) holds
+                    # per match: m1 5==5, m2 5==5, m3 5==5.
+                    "first_kills": fk,
+                    "first_deaths": fd,
                 }
             )
     matches_df = pd.DataFrame(match_rows, columns=_MATCHES_COLS)
     maps_df = pd.DataFrame(map_rows, columns=_MAPS_COLS)
     pms_df = pd.DataFrame(pms_rows, columns=_PMS_COLS)
+    return matches_df, maps_df, pms_df
+
+
+def _zero_history_league_tables():
+    """Build the 4-match league where the queried pair has zero history.
+
+    Extends :func:`_league_tables`'s three matches (m1/m2/m3) with a
+    fourth match ``m4`` — ``C`` (Charlie) beats ``D`` (Delta) on Lotus
+    13-9, dated strictly after the others — where neither ``C`` nor
+    ``D`` appears in any earlier match, so an as-of query at m4's own
+    date sees an empty history for both sides. All three tables carry
+    the same column conventions as :func:`_league_tables` (round detail
+    present and internally consistent; first-kill/first-death
+    conservation per map), so the four M38.5 estimators run and each
+    returns exactly its prior.
+
+    Returns:
+        A ``(matches_df, maps_df, player_map_stats_df)`` tuple with the
+        fixed column conventions of :func:`_league_tables` plus the m4
+        rows.
+
+    Raises:
+        Nothing (the fixture is static and well-formed).
+    """
+    matches_df, maps_df, pms_df = _league_tables()
+    m4_date = "2026-01-01T16:00:00"
+    m4_match = {
+        "match_id": "m4",
+        "date": m4_date,
+        "team1_id": "C",
+        "team2_id": "D",
+        "team1_name": "Charlie",
+        "team2_name": "Delta",
+        "event_name": "VCT 2026: EMEA Stage 2",
+        "status": "completed",
+    }
+    m4_map = {
+        "match_id": "m4",
+        "map_index": 0,
+        "map_name": "Lotus",
+        "team1_score": 13,
+        "team2_score": 9,
+        "winner": "Charlie",
+        # Regulation 13-9: team1 13 = 7 atk + 6 def; team2 9 = 5 atk
+        # + 4 def; pairings 7+4=11 / 6+5=11 partition the 22 rounds.
+        "team1_first_half_rounds": 12.0,
+        "team2_first_half_rounds": 12.0,
+        "team1_second_half_rounds": 12.0,
+        "team2_second_half_rounds": 12.0,
+        "team1_atk_rounds": 7,
+        "team1_def_rounds": 6,
+        "team2_atk_rounds": 5,
+        "team2_def_rounds": 4,
+    }
+    m4_pms = []
+    for team, players, acs, rating, fk, fd in [
+        ("Charlie", ["pC1", "pC2", "pC3", "pC4", "pC5"], 200.0, 1.1, 3, 2),
+        ("Delta", ["pD1", "pD2", "pD3", "pD4", "pD5"], 180.0, 0.9, 2, 3),
+    ]:
+        for player in players:
+            m4_pms.append(
+                {
+                    "match_id": "m4",
+                    "map_index": 0,
+                    "player_name": player,
+                    "team_name": team,
+                    "acs": acs,
+                    "rating": rating,
+                    # Conservation per map: 3+2 == 2+3 per side sums.
+                    "first_kills": fk,
+                    "first_deaths": fd,
+                }
+            )
+    matches_df = pd.concat(
+        [matches_df, pd.DataFrame([m4_match], columns=_MATCHES_COLS)],
+        ignore_index=True,
+    )
+    maps_df = pd.concat(
+        [maps_df, pd.DataFrame([m4_map], columns=_MAPS_COLS)],
+        ignore_index=True,
+    )
+    pms_df = pd.concat(
+        [pms_df, pd.DataFrame(m4_pms, columns=_PMS_COLS)],
+        ignore_index=True,
+    )
     return matches_df, maps_df, pms_df
 
 
@@ -304,7 +436,7 @@ def _real_v1_available():
 def real_v1_train_model():
     """Fit the model on the real v1 train split once per module.
 
-    Assembles the ``(209, 11)`` training matrix exactly the way
+    Assembles the ``(209, 15)`` training matrix exactly the way
     ``drivers/train_ordinal_logit.py`` does (held-out maps restricted to
     ``split="train"``, one :func:`build_feature_vector` per row, labels
     from ``outcome_ordinal``) and fits with the documented defaults.
@@ -356,7 +488,7 @@ def real_v1_train_model():
 
 
 def test_build_feature_vector_real_league_exact_values():
-    # The full 11-vector at m3's own date (as-of cutoff = the queried
+    # The full 15-vector at m3's own date (as-of cutoff = the queried
     # match, so its own outcome is never in its feature history), with
     # every entry hand-computed from the fixture league:
     #   map_win_rate_diff 1.0 (A prior 1.0 full-shrink vs B prior 0.0),
@@ -370,6 +502,20 @@ def test_build_feature_vector_real_league_exact_values():
     #   event_stage 2.0 (m3 is Stage 2),
     #   days_since_diff 1.0 (A last played 1 day before, B 0 days),
     #   roster_decay_diff 0.0 (both sides have 1 map -> 1.0 each).
+    # The four M38.5 additions (slots 11-14) are Bind-at-m3 estimates:
+    # neither side has any prior Bind map, so each estimator returns
+    # that side's shrunk overall prior (never None — the ambiguity-3
+    # no-fallback contract), and the diff is the A-minus-B of two
+    # genuinely different team priors (A won its one prior Haven map
+    # 13-11, B lost its one prior Haven map 8-13):
+    #   attack_side_win_rate_diff 0.040572... (A overall-attack prior
+    #     0.525090... minus B's 0.484517...),
+    #   defense_side_win_rate_diff 0.016965... (A 0.491039... minus
+    #     B 0.474074...),
+    #   signed_margin_diff 7/11 (A's shrunk overall mean margin
+    #     (+2 + 10*0)/(1+10) = 2/11 minus B's (-5 + 10*0)/(1+10) =
+    #     -5/11),
+    #   first_blood_diff 0.066667 (A 0.533333 minus B 0.466667).
     matches_df, maps_df, pms_df = _league_tables()
     vec = build_feature_vector(
         "A", "B", "Bind", QUERY_DATE, matches_df, maps_df, pms_df
@@ -387,6 +533,10 @@ def test_build_feature_vector_real_league_exact_values():
         "event_stage",
         "days_since_diff",
         "roster_decay_diff",
+        "attack_side_win_rate_diff",
+        "defense_side_win_rate_diff",
+        "signed_margin_diff",
+        "first_blood_diff",
     ]
     assert vec[0] == pytest.approx(1.0)
     assert vec[1] == pytest.approx(32.0, abs=1e-9)
@@ -399,6 +549,51 @@ def test_build_feature_vector_real_league_exact_values():
     assert vec[8] == pytest.approx(2.0)
     assert vec[9] == pytest.approx(1.0)
     assert vec[10] == pytest.approx(0.0)
+    # The four M38.5 additions (slots 11-14) at Bind on m3's date: no
+    # side has prior Bind history, so each estimator returns that side's
+    # shrunk *overall* prior as its map-level mean (never None — the
+    # ambiguity-3 no-fallback contract), and the diff is the A-minus-B
+    # of two genuinely different team priors (A won m1 13-11, B lost m2
+    # 8-13):
+    #   attack_side_win_rate_diff 0.040572... = A's shrunk overall
+    #     attack prior (0.525090...) minus B's (0.484517...);
+    #   defense_side_win_rate_diff 0.016965... = A's defense prior
+    #     (0.491039...) minus B's (0.474074...);
+    #   signed_margin_diff 0.636363... = A's shrunk overall mean margin
+    #     ((+2 + 10*0)/(1+10) = 2/11) minus B's ((-5 + 10*0)/(1+10) =
+    #     -5/11): +7/11;
+    #   first_blood_diff 0.066667 = A's overall first-blood mean
+    #     (0.533333...) minus B's (0.466667...).
+    assert vec[11] == pytest.approx(0.04057230154533176, abs=1e-9)
+    assert vec[12] == pytest.approx(0.01696535244922337, abs=1e-9)
+    assert vec[13] == pytest.approx(0.6363636363636362, abs=1e-9)
+    assert vec[14] == pytest.approx(0.06666666666666665, abs=1e-9)
+
+
+def test_build_feature_vector_zero_history_new_slots_are_zero():
+    # M38.5 ambiguity 3, asserted in code: for a pair of teams with no
+    # as-of history at all (C and D appear only in the queried match m4,
+    # dated after every prior match), each of the four M38.5 estimators
+    # returns exactly its (non-None) prior and the A-minus-B difference
+    # is exactly 0.0 — no missing-value fallback branch is needed. Also
+    # pins the ambiguity-1 name order for the four appended features and
+    # the length-15 output contract.
+    matches_df, maps_df, pms_df = _zero_history_league_tables()
+    query_date = "2026-01-01T16:00:00"  # m4's own date (strictly after m1-m3)
+    vec = build_feature_vector(
+        "C", "D", "Lotus", query_date, matches_df, maps_df, pms_df
+    )
+    assert vec.shape == (len(FEATURE_NAMES),)
+    assert list(FEATURE_NAMES)[-4:] == [
+        "attack_side_win_rate_diff",
+        "defense_side_win_rate_diff",
+        "signed_margin_diff",
+        "first_blood_diff",
+    ]
+    assert vec[11] == 0.0
+    assert vec[12] == 0.0
+    assert vec[13] == 0.0
+    assert vec[14] == 0.0
 
 
 def test_form_diff_falls_back_to_zero_when_one_side_missing(monkeypatch):

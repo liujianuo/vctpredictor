@@ -180,7 +180,7 @@ def _ordinal_logit_temperature_factory(output_dir: Path, version: str) -> harnes
     (``<output_dir>/<version>/temperature_scaling_model.json``, produced
     by ``drivers/train_temperature_scaling.py``), enforces the
     decision-E staleness guard, loads the ``player_map_stats`` table,
-    and returns a closure that computes the raw 11-feature vector
+    and returns a closure that computes the raw 15-feature vector
     (:func:`models._shared.build_feature_vector`), standardizes it with
     the *base* model's stored training means/stds
     (:func:`models.ordinal_logit.apply_standardizer`), computes
@@ -252,7 +252,7 @@ def _ordinal_logit_temperature_factory(output_dir: Path, version: str) -> harnes
     ) -> tuple[float, float, float, float]:
         """Predict the four temperature-scaled category probabilities.
 
-        Computes the raw 11-feature vector via
+        Computes the raw 15-feature vector via
         :func:`models._shared.build_feature_vector` (using the
         closed-over ``player_map_stats_df`` — the table the generic
         interface does not pass), standardizes it with the base model's

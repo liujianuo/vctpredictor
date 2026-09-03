@@ -4,7 +4,7 @@ The fourth fitted model in the repository and the M22 granularity-
 ablation arm: a plain sigmoid-link binary logistic regression fit
 directly on the binary "does team1 (A) win the map" target
 (``outcome_ordinal in {0, 1}`` — A-regulation or A-OT), over the
-identical M13-M17 11-feature vector and identical M10 train/test split
+identical M13-M17 15-feature vector and identical M10 train/test split
 as M20's ordinal logit (:mod:`models.ordinal_logit`). Its predictions
 (a 2-vector ``(p_a, p_b)``) are compared against the ordinal model's
 four-way output marginalized down to the same binary target by
@@ -19,7 +19,7 @@ Design decisions (recorded here, do not re-derive in later milestones):
 - **Target and sign convention (must never be inverted).** The binary
   label is ``y_i = 1`` if team1 ("A") wins the map (``outcome_ordinal_i
   in {0, 1}``) else ``0`` (B wins). The link is ``eta_i = alpha +
-  xs_i . beta`` — one scalar intercept ``alpha`` plus an 11-vector
+  xs_i . beta`` — one scalar intercept ``alpha`` plus a 15-vector
   ``beta``, both fit, unlike ``ordinal_logit``'s "no intercept,
   thresholds serve as per-category intercepts" convention (a two-class
   model needs exactly one intercept) — with ``p_a_i = sigmoid(eta_i)``
@@ -71,7 +71,7 @@ Design decisions (recorded here, do not re-derive in later milestones):
   against central finite differences at multiple points — the
   non-negotiable correctness bar tasks 023/024 already set.
 
-- **Initialization.** ``beta = zeros(11)``; ``alpha =
+- **Initialization.** ``beta = zeros(15)``; ``alpha =
   logit(clip(mean(y), eps, 1 - eps))`` where ``eps`` is
   ``_PROB_CLIP_EPS`` — the intercept that reproduces the training label
   marginal at ``beta = 0``, the same role
@@ -386,10 +386,10 @@ class BinaryLogitModel:
 
     Attributes:
         intercept: The fitted scalar intercept ``alpha``.
-        coefficients: The 11-vector of fitted coefficients ``beta``.
+        coefficients: The 15-vector of fitted coefficients ``beta``.
         standardizer_means: Per-feature training-column means (length
-            11).
-        standardizer_stds: Per-feature training-column stds (length 11;
+            15).
+        standardizer_stds: Per-feature training-column stds (length 15;
             a zero-variance column's std is ``1.0`` per the guard).
         feature_names: The feature name tuple (:data:`FEATURE_NAMES`).
         converged: Whether gradient descent converged (``True``) or hit
@@ -439,7 +439,7 @@ def fit(
     statistics.
 
     Args:
-        X: The raw (unstandardized) training design matrix, ``(n, 11)``
+        X: The raw (unstandardized) training design matrix, ``(n, 15)``
             floats in :data:`FEATURE_NAMES` order — the output of
             :func:`build_feature_vector` over the training rows. The
             standardizer is fit on this matrix inside this function.
@@ -545,7 +545,7 @@ def predict_proba(
     inputs.
 
     Args:
-        x: A raw feature vector, length 11 in :data:`FEATURE_NAMES`
+        x: A raw feature vector, length 15 in :data:`FEATURE_NAMES`
             order (the output of :func:`build_feature_vector`).
         model: The fitted model whose stored standardizer and
             coefficients are applied.
@@ -777,7 +777,7 @@ def make_model_fn(
     ) -> tuple[float, float]:
         """Predict the two binary probabilities for one held-out map.
 
-        Computes the raw 11-feature vector via
+        Computes the raw 15-feature vector via
         :func:`build_feature_vector` (using the closed-over
         ``player_map_stats_df`` — the table the generic interface does
         not pass) and returns :func:`predict_proba`'s 2-tuple. See

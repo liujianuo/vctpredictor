@@ -91,7 +91,10 @@ def _oof_fixture(n_train: int = 28, n_test: int = 5):
         )
         # A close-but-finished 13-8 scoreline; win/loss is derived from
         # scores, never from the winner string, so any non-null winner
-        # works as the completion signal.
+        # works as the completion signal. The eight round-detail columns
+        # are present but null (the ``round_detail`` exclusion case), so
+        # the M38 round-level estimators see zero usable round history
+        # and degrade to priors instead of raising on a missing column.
         map_rows.append(
             {
                 "match_id": match_id,
@@ -100,6 +103,14 @@ def _oof_fixture(n_train: int = 28, n_test: int = 5):
                 "team1_score": 13,
                 "team2_score": 8,
                 "winner": _TEAM_NAMES[team1],
+                "team1_first_half_rounds": None,
+                "team2_first_half_rounds": None,
+                "team1_second_half_rounds": None,
+                "team2_second_half_rounds": None,
+                "team1_atk_rounds": None,
+                "team1_def_rounds": None,
+                "team2_atk_rounds": None,
+                "team2_def_rounds": None,
             }
         )
         label_rows.append(
@@ -119,6 +130,11 @@ def _oof_fixture(n_train: int = 28, n_test: int = 5):
                         "team_name": _TEAM_NAMES[team],
                         "acs": 200.0 + i,
                         "rating": 1.1 + 0.01 * i,
+                        # FK/FD present so the M38.4 first-blood
+                        # estimator's no-nulls/conservation checks pass
+                        # (all-zero rows conserve trivially).
+                        "first_kills": 0,
+                        "first_deaths": 0,
                     }
                 )
 
@@ -386,6 +402,19 @@ def _bootstrap_fixture():
                     "team1_score": s1,
                     "team2_score": s2,
                     "winner": _TEAM_NAMES[team1] if s1 > s2 else _TEAM_NAMES[team2],
+                    # Round-detail columns present but null (the
+                    # ``round_detail`` exclusion case): the M38
+                    # round-level estimators see zero usable history and
+                    # degrade to priors instead of raising on a missing
+                    # column.
+                    "team1_first_half_rounds": None,
+                    "team2_first_half_rounds": None,
+                    "team1_second_half_rounds": None,
+                    "team2_second_half_rounds": None,
+                    "team1_atk_rounds": None,
+                    "team1_def_rounds": None,
+                    "team2_atk_rounds": None,
+                    "team2_def_rounds": None,
                 }
             )
             label_rows.append(
@@ -405,6 +434,11 @@ def _bootstrap_fixture():
                         "team_name": _TEAM_NAMES[team],
                         "acs": 200.0 + i,
                         "rating": 1.1 + 0.01 * i,
+                        # FK/FD present so the M38.4 first-blood
+                        # estimator's no-nulls/conservation checks pass
+                        # (all-zero rows conserve trivially).
+                        "first_kills": 0,
+                        "first_deaths": 0,
                     }
                 )
     matches_df = pd.DataFrame(match_rows)
@@ -480,8 +514,8 @@ def test_bootstrap_matrix_same_seed_deterministic():
     assert np.array_equal(X1, X2)
     assert np.array_equal(y1, y2)
     # The resample keeps the base train row count (4 match slots, 2
-    # maps each) and the 11-feature width.
-    assert X1.shape == (8, 11)
+    # maps each) and the 15-feature width.
+    assert X1.shape == (8, 15)
     assert y1.shape == (8,)
 
 

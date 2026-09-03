@@ -55,7 +55,7 @@ def _real_v1_available():
 def _tiny_fixture(n=24):
     """Build a tiny synthetic training fixture with hand-computable shape.
 
-    A small ``(n, 11)`` design matrix and ``(n,)`` ordinal label vector
+    A small ``(n, 15)`` design matrix and ``(n,)`` ordinal label vector
     with a fixed seed, plus matching hand-built ordinal/multinomial
     models (constructed directly, not fitted — the report's arithmetic
     is what's under test, not the fit quality).
@@ -65,7 +65,7 @@ def _tiny_fixture(n=24):
 
     Returns:
         A ``(X, y, ordinal_model, multinomial_model)`` tuple: ``X`` an
-        ``(n, 11)`` float matrix, ``y`` an ``(n,)`` int ordinal vector,
+        ``(n, 15)`` float matrix, ``y`` an ``(n,)`` int ordinal vector,
         and the two hand-built model objects.
 
     Raises:
@@ -277,13 +277,13 @@ def test_aic_bic_arithmetic_hand_computed(monkeypatch):
     )
     n = len(y)
     assert report["n_train"] == n
-    assert report["k_ordinal"] == 14
-    assert report["k_multinomial"] == 36
-    assert report["aic_ordinal"] == pytest.approx(-2 * ll_ordinal + 2 * 14)
-    assert report["bic_ordinal"] == pytest.approx(-2 * ll_ordinal + 14 * math.log(n))
-    assert report["aic_multinomial"] == pytest.approx(-2 * ll_multinomial + 2 * 36)
+    assert report["k_ordinal"] == 18
+    assert report["k_multinomial"] == 48
+    assert report["aic_ordinal"] == pytest.approx(-2 * ll_ordinal + 2 * 18)
+    assert report["bic_ordinal"] == pytest.approx(-2 * ll_ordinal + 18 * math.log(n))
+    assert report["aic_multinomial"] == pytest.approx(-2 * ll_multinomial + 2 * 48)
     assert report["bic_multinomial"] == pytest.approx(
-        -2 * ll_multinomial + 36 * math.log(n)
+        -2 * ll_multinomial + 48 * math.log(n)
     )
     assert report["ll_ordinal"] == pytest.approx(ll_ordinal)
     assert report["ll_multinomial"] == pytest.approx(ll_multinomial)
@@ -296,12 +296,15 @@ def test_aic_bic_arithmetic_hand_computed(monkeypatch):
         # the shared-coefficient restriction holds -> "holds".
         (None, -100.0, -140.0, "holds"),
         # No sign instability, BIC favors multinomial (multinomial ll
-        # much better) -> "violated".
-        (None, -140.0, -100.0, "violated"),
+        # much better) -> "violated". (ll_ordinal is -150 so that with
+        # k_ordinal=18 / k_multinomial=48 and n=24 the BIC comparison
+        # still favors the multinomial arm: -2*(-150)+18*ln24 >
+        # -2*(-100)+48*ln24.)
+        (None, -150.0, -100.0, "violated"),
         # Sign instability, BIC favors ordinal -> "violated".
         (4, -100.0, -140.0, "violated"),
         # Sign instability, BIC favors multinomial -> "violated".
-        (4, -140.0, -100.0, "violated"),
+        (4, -150.0, -100.0, "violated"),
     ],
 )
 def test_verdict_rule_all_four_combinations(
@@ -355,7 +358,7 @@ def test_report_json_serializable_with_real_ll():
         }
     assert report["sign_instability_count"] == 1
     assert report["per_feature"][2]["sign_unstable"] is True
-    # With real ll, BIC penalizes the 36-parameter multinomial arm on a
+    # With real ll, BIC penalizes the 48-parameter multinomial arm on a
     # tiny random fixture, so the verdict follows the sign instability.
     assert report["bic_favors_multinomial"] in (True, False)
 
@@ -444,8 +447,8 @@ def test_real_v1_diagnostic_end_to_end():
         Path("data/v1/proportional_odds_diagnostic.json").read_text(encoding="utf-8")
     )
     assert artifact["n_train"] == 209
-    assert artifact["k_ordinal"] == 14
-    assert artifact["k_multinomial"] == 36
+    assert artifact["k_ordinal"] == 18
+    assert artifact["k_multinomial"] == 48
     assert len(artifact["per_feature"]) == len(FEATURE_NAMES)
     assert artifact["proportional_odds_verdict"] in ("violated", "holds")
 

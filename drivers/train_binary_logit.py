@@ -9,7 +9,7 @@ module's :func:`drivers.evaluate.load_player_map_stats_table`),
 assembling the training design matrix via
 :func:`drivers.training_data.assemble_design_matrix` (the shared
 helper every fitted-model driver in this milestone uses — the identical
-11-feature matrix M20's ordinal logit and M21's multinomial logit were
+15-feature matrix M20's ordinal logit and M21's multinomial logit were
 trained on, so the M22 granularity comparison is on identical splits),
 converting the ordinal labels to the binary "A wins" target, calling
 :func:`models.binary_logit.fit`, and writing the serialized model

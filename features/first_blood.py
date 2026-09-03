@@ -309,6 +309,15 @@ DEFAULT_K = 10.0
 # CV loop.
 DEFAULT_K_GRID = (1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0)
 
+# M38.4's real-``data/v1`` :func:`select_k` result, recorded as a named
+# module constant (the value the ``DEFAULT_K_GRID`` comment above
+# reports as the CV argmin: 1000.0, the grid's top edge in the heavy-k
+# asymptote). :func:`models._shared.build_feature_vector` (M38.5) is its
+# consumer: it passes this as the outer-level shrinkage strength for the
+# first-blood feature, NOT :data:`DEFAULT_K` (the documented ad-hoc
+# fallback for callers with no CV run).
+BEST_K = 1000.0
+
 # Clip epsilon for the per-trial probability handed to binomial log loss
 # inside :func:`select_k`, mirroring ``map_win_rate._PROB_CLIP_EPS`` /
 # ``side_win_rate._PROB_CLIP_EPS``: a posterior mean can reach exactly

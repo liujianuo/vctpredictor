@@ -243,6 +243,17 @@ DEFAULT_K = 10.0
 # number buried in the CV loop.
 DEFAULT_K_GRID = (1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0)
 
+# M38.2's real-``data/v1`` :func:`select_k` results, recorded as named
+# module constants (the values the ``DEFAULT_K_GRID`` comment above
+# reports as the CV argmins: attack 1000.0 — the heavy-``k`` asymptote —
+# and defence 500.0 — the interior optimum). :func:`models._shared.build_feature_vector`
+# (M38.5) is their consumer: it passes these as the outer-level
+# shrinkage strength for the attack/defense side-win-rate features,
+# NOT :data:`DEFAULT_K` (the documented ad-hoc fallback for callers
+# with no CV run).
+BEST_K_ATTACK = 1000.0
+BEST_K_DEFENSE = 500.0
+
 # Clip epsilon for the per-round probability handed to binomial log loss
 # inside :func:`select_k`, mirroring ``map_win_rate._PROB_CLIP_EPS``: a
 # posterior mean can reach exactly 0.0/1.0 (a 100%-win sample with a 1.0
