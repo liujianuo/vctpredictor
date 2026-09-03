@@ -514,8 +514,8 @@ def test_bootstrap_matrix_same_seed_deterministic():
     assert np.array_equal(X1, X2)
     assert np.array_equal(y1, y2)
     # The resample keeps the base train row count (4 match slots, 2
-    # maps each) and the 15-feature width.
-    assert X1.shape == (8, 15)
+    # maps each) and the 13-feature width.
+    assert X1.shape == (8, 13)
     assert y1.shape == (8,)
 
 

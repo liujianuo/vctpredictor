@@ -7,7 +7,7 @@ that assembles the leakage-safe walk-forward out-of-fold calibration
 rows the temperature-scaling fit consumes. The M10 train split is
 assembled via :func:`evaluation.harness.build_held_out_maps` with
 ``split="train"`` (the existing, reused way to build a training set —
-no new join logic is written), and each training row's 15-feature
+no new join logic is written), and each training row's 13-feature
 vector is built with :func:`models._shared.build_feature_vector` (the
 identical feature vector both M20's ordinal logit and M21's
 multinomial logit must consume for the "identical splits" comparison).
@@ -71,7 +71,7 @@ def assemble_design_matrix(
     maps at v1 scale), then iterates the returned rows in order and, for
     each, calls :func:`models._shared.build_feature_vector` with the
     row's ``team1_id``/``team2_id``/``map_name``/``date`` plus the five
-    tables, collecting ``X`` (``n x 15`` floats in
+    tables, collecting ``X`` (``n x 13`` floats in
     :data:`models._shared.FEATURE_NAMES` order) and reading
     ``row.outcome_ordinal`` into ``y`` (``n,`` ints in ``{0, 1, 2, 3}``).
 
@@ -89,7 +89,7 @@ def assemble_design_matrix(
             proportional-odds diagnostic all use the train split).
 
     Returns:
-        A ``(X, y)`` tuple: ``X`` an ``(n, 15)`` numpy array of
+        A ``(X, y)`` tuple: ``X`` an ``(n, 13)`` numpy array of
         ``float`` in :data:`models._shared.FEATURE_NAMES` order, ``y``
         an ``(n,)`` numpy array of ``int`` outcome ordinals — exactly
         the input shape :func:`models.ordinal_logit.fit` /
@@ -182,7 +182,7 @@ def assemble_bootstrap_design_matrix(
             ``--bootstrap-seed`` rng for exactly this).
 
     Returns:
-        A ``(X, y)`` tuple: ``X`` an ``(n, 15)`` numpy array of
+        A ``(X, y)`` tuple: ``X`` an ``(n, 13)`` numpy array of
         ``float`` in :data:`models._shared.FEATURE_NAMES` order, ``y``
         an ``(n,)`` numpy array of ``int`` outcome ordinals — the
         resampled training matrix/label vector, sized exactly like the

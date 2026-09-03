@@ -632,11 +632,11 @@ class OrdinalLogitModel:
     model carries an empty trace.
 
     Attributes:
-        coefficients: The 15-vector of fitted coefficients.
+        coefficients: The 13-vector of fitted coefficients.
         thresholds: The 3-vector of strictly increasing thresholds.
         standardizer_means: Per-feature training-column means (length
-            15).
-        standardizer_stds: Per-feature training-column stds (length 15;
+            13).
+        standardizer_stds: Per-feature training-column stds (length 13;
             a zero-variance column's std is ``1.0`` per the guard).
         feature_names: The feature name tuple (:data:`FEATURE_NAMES`).
         converged: Whether gradient descent converged (``True``) or hit
@@ -685,7 +685,7 @@ def fit(
     later rows with the exact training-population statistics.
 
     Args:
-        X: The raw (unstandardized) training design matrix, ``(n, 15)``
+        X: The raw (unstandardized) training design matrix, ``(n, 13)``
             floats in :data:`FEATURE_NAMES` order — the output of
             :func:`build_feature_vector` over the training rows. The
             standardizer is fit on this matrix inside this function.
@@ -783,7 +783,7 @@ def predict_proba(
     so the tuple is a valid, scorable simplex even for extreme inputs).
 
     Args:
-        x: A raw feature vector, length 15 in :data:`FEATURE_NAMES`
+        x: A raw feature vector, length 13 in :data:`FEATURE_NAMES`
             order (the output of :func:`build_feature_vector`).
         model: The fitted model whose stored standardizer and
             coefficients are applied.
@@ -1018,7 +1018,7 @@ def make_model_fn(
     ) -> tuple[float, float, float, float]:
         """Predict the four category probabilities for one held-out map.
 
-        Computes the raw 15-feature vector via
+        Computes the raw 13-feature vector via
         :func:`build_feature_vector` (using the closed-over
         ``player_map_stats_df`` — the table the generic interface does
         not pass) and returns :func:`predict_proba`'s 4-tuple in
@@ -1077,7 +1077,7 @@ def total_log_likelihood(
     multinomial arm for the AIC/BIC comparison.
 
     Args:
-        X: The raw (unstandardized) training design matrix, ``(n, 15)``
+        X: The raw (unstandardized) training design matrix, ``(n, 13)``
             floats in :data:`FEATURE_NAMES` order. Rows are standardized
             inside :func:`predict_proba` with the model's stored
             training-population statistics.

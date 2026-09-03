@@ -21,7 +21,7 @@ restriction two complementary ways:
 - **Step 1 — three independent binary logistic fits, one per
   cutpoint.** For ``j = 1, 2, 3``, define the binary label
   ``z_i = 1`` if ``outcome_ordinal_i >= j`` else ``0`` and fit a plain
-  binary logistic regression (intercept ``alpha`` plus ``beta`` (15,),
+  binary logistic regression (intercept ``alpha`` plus ``beta`` (13,),
   **not** sharing parameters across cutpoints) on the same standardized
   design matrix (fit once, reused for all three cutpoints — the matrix
   is identical across cutpoints, only the binary label differs, so
@@ -35,14 +35,14 @@ restriction two complementary ways:
   feature whose three independently-estimated coefficient *signs* are
   not all equal is direct evidence the restriction does not hold for
   that feature. ``sign_instability_count`` counts such features
-  (``0..15``); a feature where all three estimates are exactly zero is
+  (``0..13``); a feature where all three estimates are exactly zero is
   trivially stable, not unstable.
 - **Step 3 — quantitative AIC/BIC comparison of the two actual
   four-class models.** ``ll`` for each arm comes from
   :func:`models.ordinal_logit.total_log_likelihood` /
   :func:`models.multinomial_logit.total_log_likelihood` on the same
-  training rows; ``k_ordinal = 18`` (15 coefficients + 3 thresholds),
-  ``k_multinomial = 48`` (45 coefficients + 3 intercepts); ``aic =
+  training rows; ``k_ordinal = 16`` (13 coefficients + 3 thresholds),
+  ``k_multinomial = 42`` (39 coefficients + 3 intercepts); ``aic =
   -2*ll + 2*k``, ``bic = -2*ll + k*log(n_train)``. Lower is better for
   both. **AIC/BIC are valid for comparing non-nested models** (unlike a
   likelihood-ratio chi-square, which requires nesting the ordinal model
@@ -89,11 +89,11 @@ from models._shared import (
 )
 
 # The free-parameter counts of the two four-class arms, hard-coded here
-# (recorded in the module docstring): the ordinal arm has 15 shared
-# coefficients + 3 thresholds = 18; the multinomial arm has 3 * 15
-# coefficients + 3 intercepts = 48.
-_K_ORDINAL = 18
-_K_MULTINOMIAL = 48
+# (recorded in the module docstring): the ordinal arm has 13 shared
+# coefficients + 3 thresholds = 16; the multinomial arm has 3 * 13
+# coefficients + 3 intercepts = 42.
+_K_ORDINAL = 16
+_K_MULTINOMIAL = 42
 
 # The exact verdict rule, embedded verbatim in the report JSON as
 # ``verdict_rule`` so the artifact is self-documenting.
@@ -108,7 +108,7 @@ class BinaryLogitModel:
     """A fitted binary logistic regression for one ordinal cutpoint.
 
     A plain sigmoid-link binary logit (intercept ``intercept`` plus
-    coefficient vector ``coefficients`` (15,)) fit on one cumulative
+    coefficient vector ``coefficients`` (13,)) fit on one cumulative
     binary split ``z_i = 1 {outcome_ordinal_i >= cutpoint}``. The
     ``standardizer_means``/``standardizer_stds`` describe the shared
     training standardizer and are stored on every entry for
@@ -118,11 +118,11 @@ class BinaryLogitModel:
     split this model governs).
 
     Attributes:
-        coefficients: The 15-vector of fitted coefficients.
+        coefficients: The 13-vector of fitted coefficients.
         intercept: The fitted scalar intercept.
         standardizer_means: Per-feature training-column means (length
-            15).
-        standardizer_stds: Per-feature training-column stds (length 15;
+            13).
+        standardizer_stds: Per-feature training-column stds (length 13;
             a zero-variance column's std is ``1.0`` per the guard).
         cutpoint: The cutpoint this model was fit for (1, 2 or 3).
         converged: Whether gradient descent converged.
@@ -163,7 +163,7 @@ def _binary_loss_and_gradient(
     convention of both four-class arms).
 
     Args:
-        Xs: The (already-standardized) design matrix, ``(n, 15)``
+        Xs: The (already-standardized) design matrix, ``(n, 13)``
             floats.
         z: The binary labels, ``(n,)`` ints in ``{0, 1}``.
         alpha: The current scalar intercept.
@@ -346,7 +346,7 @@ def fit_binary_logit(
     fallback for callers who only have the standardized matrix.
 
     Args:
-        Xs: The already-standardized design matrix, ``(n, 15)`` floats
+        Xs: The already-standardized design matrix, ``(n, 13)`` floats
             (standardized once by the caller with
             :func:`models._shared.apply_standardizer`).
         z: The binary labels, ``(n,)`` ints in ``{0, 1}`` (``1`` iff
@@ -362,11 +362,11 @@ def fit_binary_logit(
         loss_tol: Loss-improvement convergence tolerance (default
             1e-10).
         standardizer_means: The per-feature training-column means of
-            the *raw* training matrix (length 15), shared across all
+            the *raw* training matrix (length 13), shared across all
             three cutpoints; if ``None``, derived from ``Xs``'s own
             column means (the documented fallback).
         standardizer_stds: The per-feature training-column stds of the
-            *raw* training matrix (length 15), shared across all three
+            *raw* training matrix (length 13), shared across all three
             cutpoints; if ``None``, derived from ``Xs``'s own column
             stds (the documented fallback).
 
@@ -468,7 +468,7 @@ def fit_cutpoint_binary_models(
 
     Args:
         X_train: The raw (unstandardized) training design matrix,
-            ``(n, 15)`` floats in :data:`FEATURE_NAMES` order.
+            ``(n, 13)`` floats in :data:`FEATURE_NAMES` order.
         y_train: The true outcome ordinals, ``(n,)`` ints in
             ``{0, 1, 2, 3}``.
         l2_lambda: L2 regularization strength on the coefficient vector
@@ -633,8 +633,8 @@ def _aic_bic(
     Args:
         log_likelihood: The model's total training log-likelihood
             (``<= 0``).
-        n_parameters: The model's free-parameter count (18 for the
-            ordinal arm, 48 for the multinomial arm).
+        n_parameters: The model's free-parameter count (16 for the
+            ordinal arm, 42 for the multinomial arm).
         n_train: The number of training rows.
 
     Returns:
@@ -682,7 +682,7 @@ def build_diagnostic_report(
         cutpoint_models: The ``{1: model_1, 2: model_2, 3: model_3}``
             dict from :func:`fit_cutpoint_binary_models`.
         X_train: The raw (unstandardized) training design matrix,
-            ``(n, 15)`` floats in :data:`FEATURE_NAMES` order — the same
+            ``(n, 13)`` floats in :data:`FEATURE_NAMES` order — the same
             matrix both models were fit on.
         y_train: The true outcome ordinals, ``(n,)`` ints in
             ``{0, 1, 2, 3}``.

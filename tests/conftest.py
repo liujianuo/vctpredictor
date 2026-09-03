@@ -46,7 +46,7 @@ def real_v1_train_design_matrix():
     Returns:
         A ``(X, y_ordinal, train_rows, matches_df, maps_df,
         player_map_stats_df)`` tuple:
-        ``X`` — the ``(n, 15)`` float numpy design matrix in
+        ``X`` — the ``(n, 13)`` float numpy design matrix in
         :data:`models._shared.FEATURE_NAMES` order (``n`` is 209 at
         v1 scale); ``y_ordinal`` — the ``(n,)`` int numpy array of
         ``outcome_ordinal`` labels in ``{0, 1, 2, 3}``; ``train_rows``

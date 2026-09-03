@@ -1,6 +1,6 @@
 """Tests for the ordinal logistic regression model (M20).
 
-Covers the 15-feature vector builder (a real-league integration check
+Covers the 13-feature vector builder (a real-league integration check
 plus one test per section-A missing-value fallback rule, asserting the
 exact documented fallback value), the +eta sign-convention regression
 (a synthetic single-informative-feature dataset must fit a positive
@@ -237,8 +237,8 @@ def _zero_history_league_tables():
     date sees an empty history for both sides. All three tables carry
     the same column conventions as :func:`_league_tables` (round detail
     present and internally consistent; first-kill/first-death
-    conservation per map), so the four M38.5 estimators run and each
-    returns exactly its prior.
+    conservation per map), so the three surviving M38.5 estimators
+    run and each returns exactly its prior.
 
     Returns:
         A ``(matches_df, maps_df, player_map_stats_df)`` tuple with the
@@ -450,12 +450,11 @@ def real_v1_train_model(real_v1_train_design_matrix):
 
 
 def test_build_feature_vector_real_league_exact_values():
-    # The full 15-vector at m3's own date (as-of cutoff = the queried
+    # The full 13-vector at m3's own date (as-of cutoff = the queried
     # match, so its own outcome is never in its feature history), with
     # every entry hand-computed from the fixture league:
     #   map_win_rate_diff 1.0 (A prior 1.0 full-shrink vs B prior 0.0),
     #   elo_differential 32.0 (A won m1 -> 1516, B lost m2 -> 1484),
-    #   close_map_freq_diff 1.0 (A's m1 is close, B's m2 is not),
     #   ot_rate_diff 0.0 (no OT maps in the as-of pool),
     #   map_round_margin_variance 0.0 (n=0 Bind maps -> NaN -> 0.0),
     #   acs_form_diff -50.0 (A 200 vs B 250, one map each),
@@ -464,16 +463,14 @@ def test_build_feature_vector_real_league_exact_values():
     #   event_stage 2.0 (m3 is Stage 2),
     #   days_since_diff 1.0 (A last played 1 day before, B 0 days),
     #   roster_decay_diff 0.0 (both sides have 1 map -> 1.0 each).
-    # The four M38.5 additions (slots 11-14) are Bind-at-m3 estimates:
-    # neither side has any prior Bind map, so each estimator returns
-    # that side's shrunk overall prior (never None — the ambiguity-3
-    # no-fallback contract), and the diff is the A-minus-B of two
-    # genuinely different team priors (A won its one prior Haven map
-    # 13-11, B lost its one prior Haven map 8-13):
+    # The three surviving M38.5 additions (slots 10-12) are
+    # Bind-at-m3 estimates: neither side has any prior Bind map, so
+    # each estimator returns that side's shrunk overall prior (never
+    # None — the ambiguity-3 no-fallback contract), and the diff is the
+    # A-minus-B of two genuinely different team priors (A won its one
+    # prior Haven map 13-11, B lost its one prior Haven map 8-13):
     #   attack_side_win_rate_diff 0.040572... (A overall-attack prior
     #     0.525090... minus B's 0.484517...),
-    #   defense_side_win_rate_diff 0.016965... (A 0.491039... minus
-    #     B 0.474074...),
     #   signed_margin_diff 7/11 (A's shrunk overall mean margin
     #     (+2 + 10*0)/(1+10) = 2/11 minus B's (-5 + 10*0)/(1+10) =
     #     -5/11),
@@ -486,7 +483,6 @@ def test_build_feature_vector_real_league_exact_values():
     assert list(FEATURE_NAMES) == [
         "map_win_rate_diff",
         "elo_differential",
-        "close_map_freq_diff",
         "ot_rate_diff",
         "map_round_margin_variance",
         "acs_form_diff",
@@ -496,66 +492,59 @@ def test_build_feature_vector_real_league_exact_values():
         "days_since_diff",
         "roster_decay_diff",
         "attack_side_win_rate_diff",
-        "defense_side_win_rate_diff",
         "signed_margin_diff",
         "first_blood_diff",
     ]
     assert vec[0] == pytest.approx(1.0)
     assert vec[1] == pytest.approx(32.0, abs=1e-9)
-    assert vec[2] == pytest.approx(1.0)
+    assert vec[2] == pytest.approx(0.0)
     assert vec[3] == pytest.approx(0.0)
-    assert vec[4] == pytest.approx(0.0)
-    assert vec[5] == pytest.approx(-50.0)
-    assert vec[6] == pytest.approx(-0.2)
-    assert vec[7] == pytest.approx(0.0)
-    assert vec[8] == pytest.approx(2.0)
-    assert vec[9] == pytest.approx(1.0)
-    assert vec[10] == pytest.approx(0.0)
-    # The four M38.5 additions (slots 11-14) at Bind on m3's date: no
-    # side has prior Bind history, so each estimator returns that side's
-    # shrunk *overall* prior as its map-level mean (never None — the
-    # ambiguity-3 no-fallback contract), and the diff is the A-minus-B
-    # of two genuinely different team priors (A won m1 13-11, B lost m2
-    # 8-13):
+    assert vec[4] == pytest.approx(-50.0)
+    assert vec[5] == pytest.approx(-0.2)
+    assert vec[6] == pytest.approx(0.0)
+    assert vec[7] == pytest.approx(2.0)
+    assert vec[8] == pytest.approx(1.0)
+    assert vec[9] == pytest.approx(0.0)
+    # The three surviving M38.5 additions (slots 10-12) at Bind on m3's
+    # date: no side has prior Bind history, so each estimator returns
+    # that side's shrunk *overall* prior as its map-level mean (never
+    # None — the ambiguity-3 no-fallback contract), and the diff is the
+    # A-minus-B of two genuinely different team priors (A won m1 13-11,
+    # B lost m2 8-13):
     #   attack_side_win_rate_diff 0.040572... = A's shrunk overall
     #     attack prior (0.525090...) minus B's (0.484517...);
-    #   defense_side_win_rate_diff 0.016965... = A's defense prior
-    #     (0.491039...) minus B's (0.474074...);
     #   signed_margin_diff 0.636363... = A's shrunk overall mean margin
     #     ((+2 + 10*0)/(1+10) = 2/11) minus B's ((-5 + 10*0)/(1+10) =
     #     -5/11): +7/11;
     #   first_blood_diff 0.066667 = A's overall first-blood mean
     #     (0.533333...) minus B's (0.466667...).
-    assert vec[11] == pytest.approx(0.04057230154533176, abs=1e-9)
-    assert vec[12] == pytest.approx(0.01696535244922337, abs=1e-9)
-    assert vec[13] == pytest.approx(0.6363636363636362, abs=1e-9)
-    assert vec[14] == pytest.approx(0.06666666666666665, abs=1e-9)
+    assert vec[10] == pytest.approx(0.04057230154533176, abs=1e-9)
+    assert vec[11] == pytest.approx(0.6363636363636362, abs=1e-9)
+    assert vec[12] == pytest.approx(0.06666666666666665, abs=1e-9)
 
 
 def test_build_feature_vector_zero_history_new_slots_are_zero():
     # M38.5 ambiguity 3, asserted in code: for a pair of teams with no
     # as-of history at all (C and D appear only in the queried match m4,
-    # dated after every prior match), each of the four M38.5 estimators
-    # returns exactly its (non-None) prior and the A-minus-B difference
-    # is exactly 0.0 — no missing-value fallback branch is needed. Also
-    # pins the ambiguity-1 name order for the four appended features and
-    # the length-15 output contract.
+    # dated after every prior match), each of the three surviving M38.5
+    # estimators returns exactly its (non-None) prior and the A-minus-B
+    # difference is exactly 0.0 — no missing-value fallback branch is
+    # needed. Also pins the ambiguity-1 name order for the three
+    # surviving appended features and the length-13 output contract.
     matches_df, maps_df, pms_df = _zero_history_league_tables()
     query_date = "2026-01-01T16:00:00"  # m4's own date (strictly after m1-m3)
     vec = build_feature_vector(
         "C", "D", "Lotus", query_date, matches_df, maps_df, pms_df
     )
     assert vec.shape == (len(FEATURE_NAMES),)
-    assert list(FEATURE_NAMES)[-4:] == [
+    assert list(FEATURE_NAMES)[-3:] == [
         "attack_side_win_rate_diff",
-        "defense_side_win_rate_diff",
         "signed_margin_diff",
         "first_blood_diff",
     ]
+    assert vec[10] == 0.0
     assert vec[11] == 0.0
     assert vec[12] == 0.0
-    assert vec[13] == 0.0
-    assert vec[14] == 0.0
 
 
 def test_form_diff_falls_back_to_zero_when_one_side_missing(monkeypatch):

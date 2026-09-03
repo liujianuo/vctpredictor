@@ -12,7 +12,7 @@ for genuine, leaf-level utilities" rule).
 
 It is consumed by :mod:`models.ordinal_logit` (roadmap M20) and
 :mod:`models.multinomial_logit` (roadmap M21), both of which need the
-identical 15-feature vector (the roadmap's "compare M21 against M20 on
+identical 13-feature vector (the roadmap's "compare M21 against M20 on
 identical splits" requirement means the identical vector, not merely a
 similar one), the same per-feature z-score standardizer, the same
 hyperparameter validators, and the same probability-clip and Armijo
@@ -40,8 +40,9 @@ subtraction in :func:`build_feature_vector`:
   that map is replaced with ``0.0`` — documented as "no observed-
   variance signal contributes no information", not a statistically
   principled imputation.
-- ``attack_side_win_rate_diff`` / ``defense_side_win_rate_diff`` /
-  ``signed_margin_diff`` / ``first_blood_diff`` (M38.5 additions): **no
+- ``attack_side_win_rate_diff`` / ``signed_margin_diff`` /
+  ``first_blood_diff`` (M38.5 additions; the M38.7 pruning removed
+  ``defense_side_win_rate_diff`` and ``close_map_freq_diff``): **no
   fallback needed**. All three wrapped estimators
   (``side_win_rate.team_map_side_rate``,
   ``signed_margin.team_map_signed_margin``,
@@ -83,17 +84,18 @@ from features import (
 )
 from utils import asof
 
-# The 15 features in the fixed order every model consumes, one shared
+# The 13 features in the fixed order every model consumes, one shared
 # coefficient each. Team-specific features are expressed as A-minus-B
 # differences (A = team1_id, B = team2_id, matching the
 # ``drivers.labels``/``models.four_way_baseline`` convention) so one
 # coefficient vector applies regardless of which side is "A" in a given
 # match row. See this module's docstring and :func:`build_feature_vector`
 # for the exact per-feature recipe and the missing-value fallbacks.
+# (M38.7: pruned ``close_map_freq_diff`` and ``defense_side_win_rate_diff``
+# down from the M38.5 15-feature tuple to these 13.)
 FEATURE_NAMES = (
     "map_win_rate_diff",
     "elo_differential",
-    "close_map_freq_diff",
     "ot_rate_diff",
     "map_round_margin_variance",
     "acs_form_diff",
@@ -103,7 +105,6 @@ FEATURE_NAMES = (
     "days_since_diff",
     "roster_decay_diff",
     "attack_side_win_rate_diff",
-    "defense_side_win_rate_diff",
     "signed_margin_diff",
     "first_blood_diff",
 )
@@ -392,7 +393,7 @@ def build_feature_vector(
     maps_df: pd.DataFrame,
     player_map_stats_df: pd.DataFrame,
 ) -> np.ndarray:
-    """Build the 15-feature vector for one map, in FEATURE_NAMES order.
+    """Build the 13-feature vector for one map, in FEATURE_NAMES order.
 
     Computes every feature exactly as the consuming models' designs
     specify (section A of :mod:`models.ordinal_logit`'s design; the
@@ -408,8 +409,8 @@ def build_feature_vector(
     raw feature values; standardization is :func:`fit_standardizer` /
     :func:`apply_standardizer`'s job (training-side only).
 
-    The four features added by roadmap M38.5 (steps 12-15 below —
-    ``attack_side_win_rate_diff``, ``defense_side_win_rate_diff``,
+    The three features added by roadmap M38.5 that survive M38.7's
+    pruning (steps 11-13 below — ``attack_side_win_rate_diff``,
     ``signed_margin_diff``, ``first_blood_diff``) need **no
     missing-value fallback**: all three wrapped estimators
     (:func:`features.side_win_rate.team_map_side_rate`,
@@ -422,7 +423,9 @@ def build_feature_vector(
     so no ``if ... is None`` fallback code is needed (unlike the
     ``acs_form_diff``/``days_since_diff``/``roster_decay_diff`` steps
     immediately above, which wrap M16/M17 estimators that do return
-    ``None``).
+    ``None``). (The two M38.5 features pruned by M38.7 —
+    ``close_map_freq_diff`` and ``defense_side_win_rate_diff`` — were
+    removed from this vector entirely.)
 
     Args:
         team1_id: The queried team1's stable id ("A").
@@ -441,12 +444,11 @@ def build_feature_vector(
             :func:`models.multinomial_logit.make_model_fn`).
 
     Returns:
-        A 15-vector numpy array of ``float`` in :data:`FEATURE_NAMES`
-        order: ``map_win_rate_diff, elo_differential,
-        close_map_freq_diff, ot_rate_diff, map_round_margin_variance,
-        acs_form_diff, rating_form_diff, h2h_win_rate_centered,
-        event_stage, days_since_diff, roster_decay_diff,
-        attack_side_win_rate_diff, defense_side_win_rate_diff,
+        A 13-vector numpy array of ``float`` in :data:`FEATURE_NAMES`
+        order: ``map_win_rate_diff, elo_differential, ot_rate_diff,
+        map_round_margin_variance, acs_form_diff, rating_form_diff,
+        h2h_win_rate_centered, event_stage, days_since_diff,
+        roster_decay_diff, attack_side_win_rate_diff,
         signed_margin_diff, first_blood_diff``.
 
     Raises:
@@ -488,16 +490,7 @@ def build_feature_vector(
         initial_rating=elo.INITIAL_RATING,
     ).differential
 
-    # 3. close_map_freq_diff — unshrunk close-map frequency, A minus B.
-    close_a = closeness.team_close_map_frequency(
-        team1_id, date, matches_df, maps_df
-    ).rate
-    close_b = closeness.team_close_map_frequency(
-        team2_id, date, matches_df, maps_df
-    ).rate
-    close_map_freq_diff = close_a - close_b
-
-    # 4. ot_rate_diff — heavily-shrunk team OT rate, A minus B.
+    # 3. ot_rate_diff — heavily-shrunk team OT rate, A minus B.
     ot_a = closeness.team_ot_rate(
         team1_id,
         date,
@@ -514,7 +507,7 @@ def build_feature_vector(
     ).mean
     ot_rate_diff = ot_a - ot_b
 
-    # 5. map_round_margin_variance — match-level (not a team diff);
+    # 4. map_round_margin_variance — match-level (not a team diff);
     #    NaN (n <= 1) replaced with 0.0 per the documented fallback.
     margin_var = closeness.map_round_margin_variance(
         map_name, date, matches_df, maps_df
@@ -524,7 +517,7 @@ def build_feature_vector(
     else:
         map_round_margin_variance = float(margin_var)
 
-    # 6/7. acs_form_diff / rating_form_diff — recency-weighted form,
+    # 5/6. acs_form_diff / rating_form_diff — recency-weighted form,
     #    A minus B, with the either-side-None -> 0.0 fallback.
     form_a = player_form.team_player_form(
         team1_id,
@@ -553,7 +546,7 @@ def build_feature_vector(
     else:
         rating_form_diff = form_a.rating.mean - form_b.rating.mean
 
-    # 8. h2h_win_rate_centered — shrunk H2H mean minus the 0.5 prior
+    # 7. h2h_win_rate_centered — shrunk H2H mean minus the 0.5 prior
     #    (0 = no/even history, matching the estimator's own
     #    full-shrinkage default).
     h2h_mean = h2h_context.team_pair_h2h(
@@ -566,14 +559,14 @@ def build_feature_vector(
     ).mean
     h2h_win_rate_centered = h2h_mean - h2h_context.H2H_PRIOR
 
-    # 9. event_stage — the match's own stage (match-level int), resolved
+    # 8. event_stage — the match's own stage (match-level int), resolved
     #    through the unique (team1, team2, date) match row.
     match_id = _match_id_for(team1_id, team2_id, date, matches_df)
     event_stage = float(
         h2h_context.match_event_stage(match_id, matches_df)
     )
 
-    # 10. days_since_diff — rest gap, A minus B, with None (unseen team
+    # 9. days_since_diff — rest gap, A minus B, with None (unseen team
     #     / no strictly-prior match) treated as 0 per the fallback.
     days_a = h2h_context.days_since_last_match(team1_id, date, matches_df)
     days_b = h2h_context.days_since_last_match(team2_id, date, matches_df)
@@ -581,7 +574,7 @@ def build_feature_vector(
         days_b if days_b is not None else 0
     )
 
-    # 11. roster_decay_diff — post-change decay multiplier, A minus B,
+    # 10. roster_decay_diff — post-change decay multiplier, A minus B,
     #     with None (changed is None/False) treated as 1.0 per the
     #     fallback.
     roster_a = h2h_context.team_roster_change(
@@ -606,12 +599,14 @@ def build_feature_vector(
     decay_b = roster_b.decay_multiplier if roster_b.decay_multiplier is not None else 1.0
     roster_decay_diff = decay_a - decay_b
 
-    # 12/13. attack_side_win_rate_diff / defense_side_win_rate_diff —
-    #     two-level shrunk per-map-phase round win rates (M38.2), A minus
-    #     B, with the CV-chosen outer k (BEST_K_ATTACK / BEST_K_DEFENSE;
-    #     NOT DEFAULT_K, which is the no-CV fallback). Zero history on
-    #     the map degrades each side to its shrunk overall-phase prior,
-    #     never None, so no fallback branch is needed (see the docstring).
+    # 11. attack_side_win_rate_diff — two-level shrunk per-map
+    #     attack-phase round win rates (M38.2), A minus B, with the
+    #     CV-chosen outer k (BEST_K_ATTACK; NOT DEFAULT_K, which is the
+    #     no-CV fallback). Zero history on the map degrades each side to
+    #     its shrunk overall-phase prior, never None, so no fallback
+    #     branch is needed (see the docstring). (M38.7: the sibling
+    #     defense_side_win_rate_diff feature was pruned, so only the
+    #     attack half of M38.2's two-side-rate feature survives here.)
     attack_a = side_win_rate.team_map_side_rate(
         team1_id,
         map_name,
@@ -631,27 +626,8 @@ def build_feature_vector(
         side_win_rate.BEST_K_ATTACK,
     ).mean
     attack_side_win_rate_diff = attack_a - attack_b
-    defense_a = side_win_rate.team_map_side_rate(
-        team1_id,
-        map_name,
-        side_win_rate.PHASE_DEFENSE,
-        date,
-        matches_df,
-        maps_df,
-        side_win_rate.BEST_K_DEFENSE,
-    ).mean
-    defense_b = side_win_rate.team_map_side_rate(
-        team2_id,
-        map_name,
-        side_win_rate.PHASE_DEFENSE,
-        date,
-        matches_df,
-        maps_df,
-        side_win_rate.BEST_K_DEFENSE,
-    ).mean
-    defense_side_win_rate_diff = defense_a - defense_b
 
-    # 14. signed_margin_diff — two-level shrunk mean signed round margin
+    # 12. signed_margin_diff — two-level shrunk mean signed round margin
     #     (M38.3), A minus B, with the fixed outer k DEFAULT_MAP_K (M38.3
     #     ran no CV; DEFAULT_MAP_K is the real, documented constant).
     #     Zero history degrades each side to the 0.0 league prior.
@@ -673,7 +649,7 @@ def build_feature_vector(
     ).mean
     signed_margin_diff = margin_a - margin_b
 
-    # 15. first_blood_diff — two-level shrunk first-blood rate (M38.4), A
+    # 13. first_blood_diff — two-level shrunk first-blood rate (M38.4), A
     #     minus B, with the CV-chosen outer k first_blood.BEST_K. The one
     #     M38.5 feature that also reads player_map_stats_df (already a
     #     parameter). Zero history degrades each side to the 0.5
@@ -702,7 +678,6 @@ def build_feature_vector(
         [
             map_win_rate_diff,
             elo_diff,
-            close_map_freq_diff,
             ot_rate_diff,
             map_round_margin_variance,
             acs_form_diff,
@@ -712,7 +687,6 @@ def build_feature_vector(
             days_since_diff,
             roster_decay_diff,
             attack_side_win_rate_diff,
-            defense_side_win_rate_diff,
             signed_margin_diff,
             first_blood_diff,
         ],

@@ -2,7 +2,7 @@
 
 The comparison arm to M20's ordinal logistic regression
 (:mod:`models.ordinal_logit`): a four-class softmax model fit on the
-*identical* 15-feature vector (:func:`models._shared.build_feature_vector`
+*identical* 13-feature vector (:func:`models._shared.build_feature_vector`
 over the M13-M17 features) and the *identical* M10 train/test split, so
 the two arms differ only in their link function and parameter count —
 which is the entire point of the roadmap's "compare against M20 on
@@ -22,11 +22,11 @@ Design decisions (recorded here, do not re-derive in later milestones):
   other three classes' free logits. The three free classes are indexed
   ``m = 0, 1, 2`` internally, corresponding to
   ``OUTCOME_LABELS[1..3]`` (A-OT, B-OT, B-regulation); parameters are
-  a 3-vector of intercepts and a ``(3, 15)`` coefficient matrix, row
+  a 3-vector of intercepts and a ``(3, 13)`` coefficient matrix, row
   ``m`` being the free coefficient vector for class ``m + 1``. This is
   the natural four-class analogue of a binary logit and the standard
-  multinomial parameterization; it has ``3 * 15 + 3 = 48`` free
-  parameters versus the ordinal arm's ``15 + 3 = 18`` — over twice as
+  multinomial parameterization; it has ``3 * 13 + 3 = 42`` free
+  parameters versus the ordinal arm's ``13 + 3 = 16`` — over twice as
   many, on the same 209 training rows, which is exactly the
   overfitting risk the M21 proportional-odds diagnostic
   (:mod:`evaluation.proportional_odds`) is built to surface (via
@@ -93,7 +93,7 @@ Design decisions (recorded here, do not re-derive in later milestones):
   "non-converged is a valid returned model, not an error" contract as
   ``models.ordinal_logit._gradient_descent`` — but written as this
   module's own self-contained loop for this module's own parameter
-  shape (``intercepts (3,)`` + ``coefficients (3, 15)``) and loss
+  shape (``intercepts (3,)`` + ``coefficients (3, 13)``) and loss
   formula, deliberately *not* extracted into a generic shared
   optimizer (the three Armijo fits in this milestone each have a
   different flat-parameter shape and different loss/gradient formulas;
@@ -223,7 +223,7 @@ def _loss_and_gradient(
     not be shrunk).
 
     Args:
-        Xs: The (already-standardized) design matrix, ``(n, 15)``
+        Xs: The (already-standardized) design matrix, ``(n, 13)``
             floats.
         y: The true outcome ordinals, ``(n,)`` ints in ``{0, 1, 2, 3}``.
         intercepts: The current free-class intercepts, length 3.
@@ -429,7 +429,7 @@ class MultinomialLogitModel:
     Holds the fitted parameters and the diagnostics needed to (a) make
     predictions via :func:`predict_proba`, (b) serialize/deserialize
     via :func:`to_dict` / :func:`from_dict`, and (c) interpret the fit
-    via the coefficient report. ``coefficients`` is a ``(3, 15)``
+    via the coefficient report. ``coefficients`` is a ``(3, 13)``
     matrix whose row ``m`` is the free coefficient vector for
     ``OUTCOME_LABELS[m + 1]`` (relative-log-odds against the
     A-regulation reference class; see the module docstring's
@@ -442,12 +442,12 @@ class MultinomialLogitModel:
     :func:`to_dict` — a deserialized model carries an empty trace.
 
     Attributes:
-        coefficients: The ``(3, 15)`` matrix of free-class
+        coefficients: The ``(3, 13)`` matrix of free-class
             coefficients.
         intercepts: The 3-vector of free-class intercepts.
         standardizer_means: Per-feature training-column means (length
-            15).
-        standardizer_stds: Per-feature training-column stds (length 15;
+            13).
+        standardizer_stds: Per-feature training-column stds (length 13;
             a zero-variance column's std is ``1.0`` per the guard).
         feature_names: The feature name tuple (:data:`FEATURE_NAMES`).
         converged: Whether gradient descent converged (``True``) or hit
@@ -497,7 +497,7 @@ def fit(
     training-population statistics.
 
     Args:
-        X: The raw (unstandardized) training design matrix, ``(n, 15)``
+        X: The raw (unstandardized) training design matrix, ``(n, 13)``
             floats in :data:`FEATURE_NAMES` order — the output of
             :func:`models._shared.build_feature_vector` over the
             training rows. The standardizer is fit on this matrix inside
@@ -596,7 +596,7 @@ def predict_proba(
     for extreme inputs).
 
     Args:
-        x: A raw feature vector, length 15 in :data:`FEATURE_NAMES`
+        x: A raw feature vector, length 13 in :data:`FEATURE_NAMES`
             order (the output of
             :func:`models._shared.build_feature_vector`).
         model: The fitted model whose stored standardizer and
@@ -685,7 +685,7 @@ def to_dict(model: MultinomialLogitModel) -> dict:
     """Serialize a fitted model to a plain JSON-serializable dict.
 
     Produces the artifact dict the training driver writes:
-    ``feature_names``, ``coefficients`` (a nested ``3 x 15`` list via
+    ``feature_names``, ``coefficients`` (a nested ``3 x 13`` list via
     ``.tolist()``), ``intercepts`` (a 3-list), ``standardizer_means``,
     ``standardizer_stds``, ``l2_lambda``, ``converged``, ``n_iter``,
     ``final_loss``, ``n_train``, plus a ``coefficient_report`` list
@@ -726,7 +726,7 @@ def from_dict(d: dict) -> MultinomialLogitModel:
     :func:`to_dict` produces (or from ``json.loads`` of the artifact the
     training driver writes). Arrays are rebuilt as numpy arrays;
     shape consistency is validated (the flat coefficient list must hold
-    3 * 15 entries, intercepts/means/stds must line up with
+    3 * 13 entries, intercepts/means/stds must line up with
     ``feature_names``). The ``coefficient_report`` key is ignored on
     read (it is derived, not stored) and ``loss_trace`` is empty for a
     deserialized model. No file I/O happens here.
@@ -839,7 +839,7 @@ def make_model_fn(
     ) -> tuple[float, float, float, float]:
         """Predict the four category probabilities for one held-out map.
 
-        Computes the raw 15-feature vector via
+        Computes the raw 13-feature vector via
         :func:`models._shared.build_feature_vector` (using the
         closed-over ``player_map_stats_df`` — the table the generic
         interface does not pass) and returns :func:`predict_proba`'s
@@ -901,7 +901,7 @@ def total_log_likelihood(
     multinomial arm for the AIC/BIC comparison.
 
     Args:
-        X: The raw (unstandardized) training design matrix, ``(n, 15)``
+        X: The raw (unstandardized) training design matrix, ``(n, 13)``
             floats in :data:`FEATURE_NAMES` order. Rows are standardized
             inside :func:`predict_proba` with the model's stored
             training-population statistics.

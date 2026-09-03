@@ -251,6 +251,15 @@ DEFAULT_K_GRID = (1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0)
 # shrinkage strength for the attack/defense side-win-rate features,
 # NOT :data:`DEFAULT_K` (the documented ad-hoc fallback for callers
 # with no CV run).
+#
+# M38.7 pruning note: as of M38.7, :data:`BEST_K_DEFENSE` (and the
+# ``PHASE_DEFENSE`` half of M38.2's side-win-rate feature) is **unwired**
+# from :func:`models._shared.build_feature_vector` — that task pruned the
+# ``defense_side_win_rate_diff`` feature, keeping only the attack half
+# (``attack_side_win_rate_diff`` + :data:`BEST_K_ATTACK`). The defense
+# constant and the function it configures are unchanged and still
+# independently tested; this remains a documented, tested CV result
+# that may be rewired later.
 BEST_K_ATTACK = 1000.0
 BEST_K_DEFENSE = 500.0
 

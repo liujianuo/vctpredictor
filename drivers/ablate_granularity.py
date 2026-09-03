@@ -8,7 +8,7 @@ verdict). This module adds only the CLI/IO glue: argument parsing
 module's :func:`drivers.evaluate.load_player_map_stats_table`),
 assembling the *test*-split design matrix via
 :func:`drivers.training_data.assemble_design_matrix` (the identical
-15-feature matrix both M20's ordinal logit and M22's binary logit were
+13-feature matrix both M20's ordinal logit and M22's binary logit were
 trained on, restricted to ``split="test"`` — the same 35-map v1
 held-out set the M19 harness scores), loading the two fitted model
 artifacts (``ordinal_logit_model.json`` and
@@ -142,7 +142,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     :func:`drivers.evaluate.load_player_map_stats_table`), the test
     design matrix is assembled *once*
     (:func:`drivers.training_data.assemble_design_matrix` with
-    ``split="test"`` — the identical shared 15-feature matrix both
+    ``split="test"`` — the identical shared 13-feature matrix both
     models score against; it is not assembled a second time), both
     fitted model artifacts are loaded via ``json.load`` + the two
     ``from_dict`` functions, every test row is scored by both models'
@@ -203,7 +203,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     # The shared test design matrix, assembled once: both models consume
-    # the identical 15-feature vector, so there is exactly one join and
+    # the identical 13-feature vector, so there is exactly one join and
     # one feature computation per test row (do not call
     # assemble_design_matrix a second time).
     X_test, y_test_ordinal = training_data.assemble_design_matrix(
