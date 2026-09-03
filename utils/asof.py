@@ -707,36 +707,44 @@ def merge_asof_lookup(
     events = events_df.copy()
     queries = queries_df.copy()
 
+    # Parse both date columns against the caller's column names first
+    # (the parse helpers raise on null/unparseable dates), then rename
+    # every column of both frames to a collision-free internal name so
+    # pandas' merge-asof suffixing can never silently rename a query or
+    # value column out from under the caller.
     event_parsed_col = "_asof_event_date_parsed"
     query_parsed_col = "_asof_query_date_parsed"
     order_col = "_asof_query_order"
-
     events[event_parsed_col] = parse_date_column(events[event_date_col])
     queries[query_parsed_col] = parse_date_column(queries[query_date_col])
+    queries[order_col] = np.arange(len(queries))
+
+    query_internal = {c: f"_asof_q_{i}" for i, c in enumerate(queries.columns)}
+    event_internal = {c: f"_asof_e_{i}" for i, c in enumerate(events.columns)}
+    queries = queries.rename(columns=query_internal)
+    events = events.rename(columns=event_internal)
+
+    left_on = query_internal[query_parsed_col]
+    right_on = event_internal[event_parsed_col]
+    left_by = [query_internal[c] for c in query_key_cols]
+    right_by = [event_internal[c] for c in event_key_cols]
+    value_internal = [event_internal[c] for c in value_cols]
 
     # Stable ascending date sort on both sides. Equal-date rows keep the
     # caller's input order (events) / the input row order (queries), so
     # the caller's pre-sort governs same-date event tie-breaks and the
     # queries' original order is recoverable via order_col afterwards.
-    events = events.sort_values(event_parsed_col, kind="stable")
-    queries[order_col] = np.arange(len(queries))
-    queries = queries.sort_values([query_parsed_col, order_col], kind="stable")
+    events = events.sort_values(right_on, kind="stable")
+    queries = queries.sort_values(
+        [left_on, query_internal[order_col]], kind="stable"
+    )
 
-    # Rename the value columns to collision-free internal names so the
-    # merge cannot suffix-collide with a query column, then restore the
-    # caller's names on the output frame.
-    internal_value_names = [f"_asof_value_{i}" for i in range(len(value_cols))]
-    value_renames = dict(zip(value_cols, internal_value_names))
-    events = events.rename(columns=value_renames)
-
-    left_by = list(query_key_cols)
-    right_by = list(event_key_cols)
     if left_by:
         merged = pd.merge_asof(
             queries,
             events,
-            left_on=query_parsed_col,
-            right_on=event_parsed_col,
+            left_on=left_on,
+            right_on=right_on,
             left_by=left_by,
             right_by=right_by,
             direction="backward",
@@ -746,19 +754,24 @@ def merge_asof_lookup(
         merged = pd.merge_asof(
             queries,
             events,
-            left_on=query_parsed_col,
-            right_on=event_parsed_col,
+            left_on=left_on,
+            right_on=right_on,
             direction="backward",
             allow_exact_matches=False,
         )
 
-    merged = merged.sort_values(order_col, kind="stable")
-    merged = merged.drop(columns=[query_parsed_col, event_parsed_col, order_col])
-    merged = merged.rename(
-        columns=dict(zip(internal_value_names, value_cols))
-    )
-    output_cols = list(queries_df.columns) + list(value_cols)
-    return merged[output_cols].reset_index(drop=True)
+    merged = merged.sort_values(query_internal[order_col], kind="stable")
+
+    # Rebuild the output frame with the caller's original column names:
+    # every queries_df column (in its original order) plus one column
+    # per value_cols name. The collision check above guarantees the two
+    # name sets are disjoint.
+    output = pd.DataFrame(index=range(len(merged)))
+    for col in queries_df.columns:
+        output[col] = merged[query_internal[col]].to_numpy()
+    for col, internal in zip(value_cols, value_internal):
+        output[col] = merged[internal].to_numpy()
+    return output
 
 
 def load_asof_tables(

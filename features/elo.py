@@ -111,6 +111,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 
 from utils import asof
@@ -300,6 +301,69 @@ def _update_pair(
     return new_a, new_b
 
 
+def _league_maps_subset(
+    matches: pd.DataFrame,
+    maps_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Inner-join finished maps against an already-filtered matches frame.
+
+    The shared tail of :func:`_league_maps_as_of` and the unbounded
+    ledger builder: given the caller's already-selected ``matches``
+    rows (completed, and date-filtered when the caller is an as-of
+    query), join every finished map (``winner`` non-null) of those
+    matches onto the per-match team ids and date, guarding against
+    ``match_id`` fan-out exactly as the as-of path does.
+
+    Args:
+        matches: The selected ``matches`` rows (needs ``match_id``,
+            ``team1_id``, ``team2_id``, ``date``); its ``match_id``
+            values must be unique.
+        maps_df: The materialised ``maps`` table (needs ``match_id``,
+            ``winner``, ``map_index``, ``team1_score``,
+            ``team2_score``).
+
+    Returns:
+        A ``pandas.DataFrame`` with columns ``match_id``, ``map_index``,
+        ``team1_score``, ``team2_score``, ``team1_id``, ``team2_id``
+        and ``date`` — every finished map of every selected match, in
+        ``maps_df``'s original row order (ordering is
+        :func:`_fold_map_sequence`'s job).
+
+    Raises:
+        KeyError: If either table lacks a required column (propagated
+            from ``utils.asof.require_columns`` — the caller is
+            expected to have already run the matches-side checks; the
+            maps-side checks run here).
+        ValueError: If the selected ``matches`` frame contains
+            duplicate ``match_id`` values (the join would fan out and
+            duplicate map rows).
+    """
+    asof.require_columns(maps_df, _MAPS_REQUIRED, "maps_df")
+
+    if not matches[asof.MATCH_ID_COL].is_unique:
+        duplicates = (
+            matches.loc[
+                matches[asof.MATCH_ID_COL].duplicated(keep=False),
+                asof.MATCH_ID_COL,
+            ]
+            .unique()
+            .tolist()
+        )
+        raise ValueError(
+            "matches_df contains duplicate match_id value(s) "
+            f"{duplicates}; the maps join would fan out and duplicate "
+            "map rows"
+        )
+
+    finished_maps = maps_df[maps_df[asof.WINNER_COL].notna()][
+        [asof.MATCH_ID_COL, MAP_INDEX_COL, TEAM1_SCORE_COL, TEAM2_SCORE_COL]
+    ]
+    join_frame = matches[
+        [asof.MATCH_ID_COL, asof.TEAM1_ID_COL, asof.TEAM2_ID_COL, asof.DATE_COL]
+    ]
+    return finished_maps.merge(join_frame, on=asof.MATCH_ID_COL, how="inner")
+
+
 def _league_maps_as_of(
     date: str,
     matches_df: pd.DataFrame,
@@ -357,7 +421,6 @@ def _league_maps_as_of(
             ``utils.asof.parse_query_date``).
     """
     asof.require_columns(matches_df, _MATCHES_REQUIRED, "matches_df")
-    asof.require_columns(maps_df, _MAPS_REQUIRED, "maps_df")
 
     parsed_dates = asof.cached_parsed_date_column(matches_df)
     query = asof.parse_query_date(date)
@@ -366,28 +429,101 @@ def _league_maps_as_of(
     is_before = parsed_dates < query
     matches = matches_df[is_completed & is_before]
 
-    if not matches[asof.MATCH_ID_COL].is_unique:
-        duplicates = (
-            matches.loc[
-                matches[asof.MATCH_ID_COL].duplicated(keep=False),
-                asof.MATCH_ID_COL,
-            ]
-            .unique()
-            .tolist()
-        )
-        raise ValueError(
-            "matches_df contains duplicate match_id value(s) "
-            f"{duplicates} after as-of filtering; the maps join would "
-            "fan out and duplicate map rows"
-        )
+    return _league_maps_subset(matches, maps_df)
 
-    finished_maps = maps_df[maps_df[asof.WINNER_COL].notna()][
-        [asof.MATCH_ID_COL, MAP_INDEX_COL, TEAM1_SCORE_COL, TEAM2_SCORE_COL]
-    ]
-    join_frame = matches[
-        [asof.MATCH_ID_COL, asof.TEAM1_ID_COL, asof.TEAM2_ID_COL, asof.DATE_COL]
-    ]
-    return finished_maps.merge(join_frame, on=asof.MATCH_ID_COL, how="inner")
+
+def _fold_map_sequence(
+    maps: pd.DataFrame,
+    k_value: float,
+    initial: float,
+    record_ledger: bool,
+) -> tuple[dict[str, float], list[tuple] | None]:
+    """Fold a maps frame through the Elo update rule in chronological order.
+
+    The single shared implementation of the Elo fold behind both the
+    single-row replay (:func:`_replay_ratings_as_of`) and the batched
+    full-history ledger (:func:`_replay_full_ledger`), so the two never
+    drift: sort ``maps`` by ``(parsed date, match_id, map_index)``
+    (stable — the module's documented total order), start every team at
+    ``initial`` on its first appearance, and fold
+    :func:`_update_pair` over every row. When ``record_ledger`` is set,
+    a ``(team_id, date, match_id, map_index, rating_after)`` tuple is
+    appended for **both** sides after every map, in the same
+    chronological order the fold itself runs in — the pre-sorted,
+    tie-break-respecting order ``merge_asof_lookup`` needs for
+    same-date events (the as-of tie-break must resolve to the last map
+    actually replayed).
+
+    Args:
+        maps: A maps frame (output of :func:`_league_maps_as_of` or
+            :func:`_league_maps_subset` with the full league) carrying
+            ``match_id``, ``map_index``, ``team1_score``,
+            ``team2_score``, ``team1_id``, ``team2_id`` and ``date``.
+        k_value: The K-factor (already validated positive finite real).
+        initial: The starting rating (already validated finite real).
+        record_ledger: Whether to collect per-team ledger rows.
+
+    Returns:
+        A ``(ratings, ledger)`` tuple: ``ratings`` maps each team_id
+        that appears to its rating after the full fold; ``ledger`` is
+        the list of ``(team_id, date, match_id, map_index,
+        rating_after)`` tuples in fold order when ``record_ledger`` is
+        true, else ``None``.
+
+    Raises:
+        ValueError: If a map in the frame has a null/NaN score or tied
+            scores (see the replay functions' docstrings for the exact
+            guard ordering).
+    """
+    # Dates were already validated non-null/parseable by the caller's
+    # filter, so this re-parse cannot raise a null-date error; it
+    # exists purely to establish the sort key.
+    sort_keys = pd.DataFrame(
+        {
+            "date": pd.to_datetime(maps[asof.DATE_COL]).to_numpy(),
+            "match_id": maps[asof.MATCH_ID_COL].to_numpy(),
+            "map_index": maps[MAP_INDEX_COL].to_numpy(),
+        }
+    )
+    order = sort_keys.sort_values(
+        ["date", "match_id", "map_index"], kind="stable"
+    ).index.to_numpy()
+
+    ratings: dict[str, float] = {}
+    ledger: list[tuple] = [] if record_ledger else None
+    for position in order:
+        team1_id = maps[asof.TEAM1_ID_COL].iloc[position]
+        team2_id = maps[asof.TEAM2_ID_COL].iloc[position]
+        rating_a = ratings.get(team1_id, initial)
+        rating_b = ratings.get(team2_id, initial)
+
+        team1_score = maps[TEAM1_SCORE_COL].iloc[position]
+        team2_score = maps[TEAM2_SCORE_COL].iloc[position]
+        if pd.isna(team1_score) or pd.isna(team2_score):
+            raise ValueError(
+                f"map for match {maps[asof.MATCH_ID_COL].iloc[position]!r} has "
+                f"a null/NaN score ({team1_score!r} vs {team2_score!r}); a "
+                "finished map must have both scores present"
+            )
+        if team1_score == team2_score:
+            raise ValueError(
+                f"map for match {maps[asof.MATCH_ID_COL].iloc[position]!r} has "
+                f"tied scores ({team1_score} == {team2_score}); a finished "
+                "map must have a winner"
+            )
+
+        team1_won = team1_score > team2_score
+        new_a, new_b = _update_pair(rating_a, rating_b, team1_won, k_value)
+        ratings[team1_id] = new_a
+        ratings[team2_id] = new_b
+        if record_ledger:
+            row_date = maps[asof.DATE_COL].iloc[position]
+            row_match_id = maps[asof.MATCH_ID_COL].iloc[position]
+            row_map_index = maps[MAP_INDEX_COL].iloc[position]
+            ledger.append((team1_id, row_date, row_match_id, row_map_index, new_a))
+            ledger.append((team2_id, row_date, row_match_id, row_map_index, new_b))
+
+    return ratings, ledger
 
 
 def _replay_ratings_as_of(
@@ -443,49 +579,175 @@ def _replay_ratings_as_of(
     initial = _validate_initial_rating(initial_rating)
 
     maps = _league_maps_as_of(date, matches_df, maps_df)
-
-    # Dates were already validated non-null/parseable by
-    # _league_maps_as_of, so this re-parse cannot raise a null-date
-    # error; it exists purely to establish the sort key.
-    sort_keys = pd.DataFrame(
-        {
-            "date": pd.to_datetime(maps[asof.DATE_COL]).to_numpy(),
-            "match_id": maps[asof.MATCH_ID_COL].to_numpy(),
-            "map_index": maps[MAP_INDEX_COL].to_numpy(),
-        }
+    ratings, _ledger = _fold_map_sequence(
+        maps, k_value, initial, record_ledger=False
     )
-    order = sort_keys.sort_values(
-        ["date", "match_id", "map_index"], kind="stable"
-    ).index.to_numpy()
-
-    ratings: dict[str, float] = {}
-    for position in order:
-        team1_id = maps[asof.TEAM1_ID_COL].iloc[position]
-        team2_id = maps[asof.TEAM2_ID_COL].iloc[position]
-        rating_a = ratings.get(team1_id, initial)
-        rating_b = ratings.get(team2_id, initial)
-
-        team1_score = maps[TEAM1_SCORE_COL].iloc[position]
-        team2_score = maps[TEAM2_SCORE_COL].iloc[position]
-        if pd.isna(team1_score) or pd.isna(team2_score):
-            raise ValueError(
-                f"map for match {maps[asof.MATCH_ID_COL].iloc[position]!r} has "
-                f"a null/NaN score ({team1_score!r} vs {team2_score!r}); a "
-                "finished map must have both scores present"
-            )
-        if team1_score == team2_score:
-            raise ValueError(
-                f"map for match {maps[asof.MATCH_ID_COL].iloc[position]!r} has "
-                f"tied scores ({team1_score} == {team2_score}); a finished "
-                "map must have a winner"
-            )
-
-        team1_won = team1_score > team2_score
-        new_a, new_b = _update_pair(rating_a, rating_b, team1_won, k_value)
-        ratings[team1_id] = new_a
-        ratings[team2_id] = new_b
-
     return ratings
+
+
+def _replay_full_ledger(
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+    k: float = DEFAULT_K,
+    initial_rating: float = INITIAL_RATING,
+) -> pd.DataFrame:
+    """Replay the entire league history once and return the full rating ledger.
+
+    The batched-path ledger builder (task 052, decision 3): it runs the
+    *same* chronological fold :func:`_replay_ratings_as_of` performs
+    (via the shared :func:`_fold_map_sequence`) but over the whole
+    league — every finished map of every completed match, with no date
+    cutoff — and instead of discarding intermediate state it records a
+    ledger row after every single team update:
+    ``(team_id, date, match_id, map_index, rating_after)``. A later
+    as-of query is then a lookup, not a fresh replay.
+
+    **Bit-exactness argument.** The fold is the literal same arithmetic
+    on the literal same per-event values in the literal same
+    chronological order as the single-row replay, so the rating
+    recorded after team T's k-th map is identical, in every float bit,
+    to what :func:`_replay_ratings_as_of` computes today for a cutoff
+    between that map and T's next. The lookup picks the *same* last-
+    prior rating a single-row call would compute; no tolerance is
+    needed.
+
+    **Whole-league validation, documented difference.** Because the
+    ledger is built once up front, score validation runs over the whole
+    league at build time: a null/NaN/tied-score map anywhere raises,
+    whereas the single-row path raises only when such a map falls
+    inside a particular query's as-of prefix. Real ``data/v1`` has zero
+    such maps, so this is a failure-mode difference on corrupt input
+    only, never a value difference on valid input.
+
+    Args:
+        matches_df: The materialised ``matches`` table.
+        maps_df: The materialised ``maps`` table.
+        k: The K-factor (see :func:`_validate_k`).
+        initial_rating: The starting rating (see
+            :func:`_validate_initial_rating`).
+
+    Returns:
+        A ``pandas.DataFrame`` with columns ``team_id``, ``date``,
+        ``match_id``, ``map_index`` and ``rating`` (the rating *after*
+        that team's map, in full replay order — pre-sorted so
+        same-date as-of ties resolve to the chronologically-last map).
+
+    Raises:
+        KeyError: If either table lacks a required column (propagated
+            from :func:`_league_maps_subset` /
+            ``utils.asof.require_columns``).
+        ValueError: If ``k`` or ``initial_rating`` is invalid (see
+            :func:`_validate_k` / :func:`_validate_initial_rating`), or
+            if any league map has a null/NaN score or tied scores (see
+            :func:`_fold_map_sequence`).
+    """
+    k_value = _validate_k(k)
+    initial = _validate_initial_rating(initial_rating)
+
+    asof.require_columns(matches_df, _MATCHES_REQUIRED, "matches_df")
+    is_completed = matches_df[asof.STATUS_COL] == asof.COMPLETED_STATUS
+    completed = matches_df[is_completed]
+    maps = _league_maps_subset(completed, maps_df)
+
+    _ratings, ledger = _fold_map_sequence(
+        maps, k_value, initial, record_ledger=True
+    )
+    return pd.DataFrame(
+        ledger,
+        columns=[
+            "team_id",
+            asof.DATE_COL,
+            asof.MATCH_ID_COL,
+            MAP_INDEX_COL,
+            "rating",
+        ],
+    )
+
+
+def batched_elo_differential(
+    rows_df: pd.DataFrame,
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+    k: float = DEFAULT_K,
+    initial_rating: float = INITIAL_RATING,
+) -> np.ndarray:
+    """Return per-row ``rating_a - rating_b`` for every row of a row table.
+
+    The batched sibling of :func:`elo_differential` (task 052): builds
+    the full-history rating ledger once via
+    :func:`_replay_full_ledger` (O(all maps) — the same cost as one
+    full unbounded replay, paid once instead of once per row), then
+    resolves both sides of every row against that static ledger with
+    two ``utils.asof.merge_asof_lookup`` calls (team1 side, team2 side;
+    each row independently, so a later row's data can never leak into
+    an earlier row's value — the strict-``<`` boundary is enforced per
+    query by the as-of primitive itself). Each side's rating is the
+    rating recorded after that team's last map strictly before the
+    row's date — the exact value :func:`_replay_ratings_as_of` would
+    compute for that cutoff — with an unseen/never-played team
+    defaulting to ``initial_rating`` (``NaN`` from the as-of fill),
+    matching the single-row API's empty-history contract.
+
+    Args:
+        rows_df: The row table; needs ``team1_id``, ``team2_id`` and
+            ``date`` columns (each row's as-of cutoff). Row order is
+            preserved in the output.
+        matches_df: The materialised ``matches`` table.
+        maps_df: The materialised ``maps`` table.
+        k: The K-factor (see :func:`_validate_k`).
+        initial_rating: The starting rating (see
+            :func:`_validate_initial_rating`).
+
+    Returns:
+        A ``(n,)`` numpy array of ``float``: ``rating_a - rating_b``
+        per row, where an unseen side is ``initial_rating``.
+
+    Raises:
+        KeyError: If a table lacks a required column (propagated from
+            the ledger builder / as-of helpers).
+        ValueError: If ``k``/``initial_rating`` is invalid, or if any
+            league map has a null/NaN score or tied scores (propagated
+            from :func:`_replay_full_ledger`); or if any row date is
+            null/unparseable (propagated from
+            :func:`utils.asof.parse_date_column` inside
+            ``merge_asof_lookup``).
+    """
+    k_value = _validate_k(k)
+    initial = _validate_initial_rating(initial_rating)
+
+    ledger = _replay_full_ledger(matches_df, maps_df, k_value, initial)
+    queries_a = rows_df[[asof.TEAM1_ID_COL, asof.DATE_COL]].reset_index(drop=True)
+    queries_b = rows_df[[asof.TEAM2_ID_COL, asof.DATE_COL]].reset_index(drop=True)
+    looked_a = asof.merge_asof_lookup(
+        ledger,
+        ("team_id",),
+        asof.DATE_COL,
+        ("rating",),
+        queries_a,
+        (asof.TEAM1_ID_COL,),
+        asof.DATE_COL,
+    )
+    looked_b = asof.merge_asof_lookup(
+        ledger,
+        ("team_id",),
+        asof.DATE_COL,
+        ("rating",),
+        queries_b,
+        (asof.TEAM2_ID_COL,),
+        asof.DATE_COL,
+    )
+    rating_a = np.where(
+        np.isnan(looked_a["rating"].to_numpy(dtype=float)),
+        initial,
+        looked_a["rating"].to_numpy(dtype=float),
+    )
+    rating_b = np.where(
+        np.isnan(looked_b["rating"].to_numpy(dtype=float)),
+        initial,
+        looked_b["rating"].to_numpy(dtype=float),
+    )
+    return (rating_a - rating_b).astype(dtype=float, copy=False)
+
 
 
 def elo_rating(

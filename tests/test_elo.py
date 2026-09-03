@@ -13,6 +13,7 @@ assertion at real ``data/v1`` scale.
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -537,3 +538,112 @@ def test_real_scale_replay_strictly_before():
     assert set(rows["match_id"]) == set(expected_maps["match_id"])
     assert len(rows) > 0
     assert (pd.to_datetime(rows["date"]) < cutoff).all()
+
+
+# --------------------------------------------------------------------------
+# batched elo differential parity (task 052)
+# --------------------------------------------------------------------------
+
+
+def _parity_row_tables():
+    """Build a multi-team, multi-map fixture plus a row table for parity.
+
+    Three teams (``A``/``B``/``C``) across four completed matches over
+    four dates, ``A`` playing ``B`` twice (a two-map Bo3 at ``d2``) and
+    ``C`` playing each of them once, so the batched ledger must resolve
+    ratings that depend on the whole league's replay, not just one
+    pair's history. The row table queries each match's own date (the
+    real assembler shape: a row's cutoff is its own match's date), plus
+    one row for a wholly unseen team ``Z`` so the
+    ``initial_rating``-default path is exercised in the same call.
+
+    Returns:
+        A ``(matches_df, maps_df, rows_df)`` tuple: the two tables plus
+        a row table with ``team1_id, team2_id, date`` columns.
+
+    Raises:
+        Nothing.
+    """
+    d1, d2, d3, d4 = (
+        "2026-01-01T10:00:00",
+        "2026-01-03T10:00:00",
+        "2026-01-05T10:00:00",
+        "2026-01-07T10:00:00",
+    )
+    matches_rows = [
+        {"match_id": "m1", "date": d1, "team1_id": "A", "team2_id": "B",
+         "status": "completed"},
+        {"match_id": "m2", "date": d2, "team1_id": "B", "team2_id": "A",
+         "status": "completed"},
+        {"match_id": "m3", "date": d3, "team1_id": "A", "team2_id": "C",
+         "status": "completed"},
+        {"match_id": "m4", "date": d4, "team1_id": "C", "team2_id": "B",
+         "status": "completed"},
+    ]
+    maps_rows = [
+        {"match_id": "m1", "map_index": 0, "map_name": "Haven",
+         "team1_score": 13, "team2_score": 8, "winner": "A"},
+        {"match_id": "m2", "map_index": 0, "map_name": "Bind",
+         "team1_score": 11, "team2_score": 13, "winner": "A"},
+        {"match_id": "m2", "map_index": 1, "map_name": "Haven",
+         "team1_score": 13, "team2_score": 10, "winner": "B"},
+        {"match_id": "m3", "map_index": 0, "map_name": "Split",
+         "team1_score": 13, "team2_score": 5, "winner": "A"},
+        {"match_id": "m4", "map_index": 0, "map_name": "Lotus",
+         "team1_score": 13, "team2_score": 11, "winner": "C"},
+    ]
+    matches_df = _matches_df(matches_rows)
+    maps_df = _maps_df(maps_rows)
+    rows_df = pd.DataFrame(
+        [
+            {"team1_id": "A", "team2_id": "B", "date": d1},
+            {"team1_id": "A", "team2_id": "B", "date": d2},
+            {"team1_id": "A", "team2_id": "C", "date": d3},
+            {"team1_id": "C", "team2_id": "B", "date": d4},
+            {"team1_id": "B", "team2_id": "A", "date": d4},
+            {"team1_id": "Z", "team2_id": "A", "date": d4},
+        ]
+    )
+    return matches_df, maps_df, rows_df
+
+
+def test_batched_elo_differential_bit_exact_parity():
+    # The batched path must reproduce, element-for-element, the looped
+    # single-row elo_differential per row (no tolerance): the same
+    # league replay folded once vs. once per row. Includes the unseen
+    # team Z defaulting to initial_rating on both sides of the diff.
+    matches_df, maps_df, rows_df = _parity_row_tables()
+    expected = np.zeros(len(rows_df))
+    for i, row in enumerate(rows_df.itertuples(index=False)):
+        d = elo.elo_differential(
+            row.team1_id,
+            row.team2_id,
+            row.date,
+            matches_df,
+            maps_df,
+            k=elo.DEFAULT_K,
+            initial_rating=elo.INITIAL_RATING,
+        )
+        expected[i] = d.differential
+    got = elo.batched_elo_differential(
+        rows_df, matches_df, maps_df,
+        k=elo.DEFAULT_K,
+        initial_rating=elo.INITIAL_RATING,
+    )
+    assert got.shape == (len(rows_df),)
+    assert np.array_equal(got, expected)
+    # The unseen-team row is exactly initial - (A's rating at d4).
+    assert got[-1] == pytest.approx(
+        1500.0 - elo.elo_rating("A", "2026-01-07T10:00:00", matches_df, maps_df)
+    )
+
+
+def test_batched_elo_differential_same_results_on_shuffled_maps_rows():
+    # The ledger and the replay sort by (date, match_id, map_index), so
+    # shuffling the maps table's row order must not change either path
+    # — and both must stay bit-identical to each other.
+    matches_df, maps_df, rows_df = _parity_row_tables()
+    got = elo.batched_elo_differential(rows_df, matches_df, maps_df)
+    shuffled = maps_df.sample(frac=1.0, random_state=7)
+    got_shuffled = elo.batched_elo_differential(rows_df, matches_df, shuffled)
+    assert np.array_equal(got, got_shuffled)
