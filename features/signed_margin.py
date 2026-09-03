@@ -166,6 +166,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 
 from features import round_detail as rd
@@ -553,3 +554,259 @@ def team_map_signed_margin(
         prior=prior,
         mean=mean,
     )
+
+
+def _league_signed_margin_events(
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Derive every eligible map's two seat signed margins, resolved to team ids.
+
+    The league event source for the batched signed-margin path (task
+    052): runs :func:`features.round_detail.derive_map_round_details`
+    once over every eligible map (finished map of a completed match)
+    and resolves each derived seat record to the participating
+    ``team_id`` via the match row, attaching the match date (the as-of
+    key) and the normalized ``map_name``. Round-detail validation runs
+    once over the whole league rather than once per query's as-of pool
+    — the documented whole-league difference of the batched path (real
+    ``data/v1`` has no violating rows).
+
+    Args:
+        matches_df: The materialised ``matches`` table (needs
+            ``match_id``, ``team1_id``, ``team2_id``, ``date``,
+            ``status``).
+        maps_df: The materialised ``maps`` table (needs ``match_id``,
+            ``winner``, ``map_name`` and the full
+            :data:`features.round_detail.REQUIRED_COLUMNS` set).
+
+    Returns:
+        A ``pandas.DataFrame`` with columns ``team_id``, ``match_id``,
+        ``map_index``, ``date``, ``map_name`` (normalized) and
+        ``signed_margin`` — two rows per surviving eligible map (one
+        per seat), in derive output order.
+
+    Raises:
+        KeyError: If a table lacks a required column (propagated from
+            ``utils.asof.require_columns`` / ``features.round_detail``).
+        ValueError: If ``matches_df`` contains duplicate ``match_id``
+            values among the completed rows, or if a surviving eligible
+            map fails ``round_detail``'s validation (propagated from
+            :func:`features.round_detail.derive_map_round_details`).
+    """
+    asof.require_columns(
+        matches_df,
+        (
+            asof.MATCH_ID_COL,
+            asof.TEAM1_ID_COL,
+            asof.TEAM2_ID_COL,
+            asof.DATE_COL,
+            asof.STATUS_COL,
+        ),
+        "matches_df",
+    )
+    asof.require_columns(
+        maps_df,
+        (asof.WINNER_COL, MAP_NAME_COL) + tuple(rd.REQUIRED_COLUMNS),
+        "maps_df",
+    )
+    completed = matches_df[matches_df[asof.STATUS_COL] == asof.COMPLETED_STATUS]
+    if not completed[asof.MATCH_ID_COL].is_unique:
+        raise ValueError(
+            "matches_df contains duplicate match_id values among the "
+            "completed rows; the seat-event join would fan out and "
+            "duplicate map rows"
+        )
+    meta = completed[
+        [
+            asof.MATCH_ID_COL,
+            asof.TEAM1_ID_COL,
+            asof.TEAM2_ID_COL,
+            asof.DATE_COL,
+        ]
+    ]
+    finished = maps_df[maps_df[asof.WINNER_COL].notna()]
+    eligible = finished.merge(meta, on=asof.MATCH_ID_COL, how="inner")
+
+    derived = rd.derive_map_round_details(eligible)
+    records = derived.records
+    if records.empty:
+        return pd.DataFrame(
+            columns=[
+                "team_id",
+                asof.MATCH_ID_COL,
+                asof.MAP_INDEX_COL,
+                asof.DATE_COL,
+                MAP_NAME_COL,
+                "signed_margin",
+            ]
+        )
+    keyed = eligible[
+        [
+            asof.MATCH_ID_COL,
+            asof.MAP_INDEX_COL,
+            asof.DATE_COL,
+            MAP_NAME_COL,
+            asof.TEAM1_ID_COL,
+            asof.TEAM2_ID_COL,
+        ]
+    ]
+    joined = records.merge(
+        keyed, on=[asof.MATCH_ID_COL, asof.MAP_INDEX_COL], how="inner"
+    )
+    is_team1_seat = joined["side"] == rd.TEAM1_SIDE
+    team_id = np.where(
+        is_team1_seat, joined[asof.TEAM1_ID_COL], joined[asof.TEAM2_ID_COL]
+    )
+    normalized = joined[MAP_NAME_COL].map(config.normalize_map_name)
+    return pd.DataFrame(
+        {
+            "team_id": team_id,
+            asof.MATCH_ID_COL: joined[asof.MATCH_ID_COL].to_numpy(),
+            asof.MAP_INDEX_COL: joined[asof.MAP_INDEX_COL].to_numpy(),
+            asof.DATE_COL: joined[asof.DATE_COL].to_numpy(),
+            MAP_NAME_COL: normalized.to_numpy(),
+            "signed_margin": joined["signed_margin"].to_numpy(),
+        }
+    )
+
+
+def batched_signed_margin_diff(
+    rows_df: pd.DataFrame,
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+    k=DEFAULT_MAP_K,
+    overall_k=DEFAULT_OVERALL_K,
+) -> np.ndarray:
+    """Return per-row shrunk mean signed-margin differentials (A minus B).
+
+    The batched sibling of the two :func:`team_map_signed_margin` calls
+    :func:`models._shared.build_feature_vector` makes per row (task
+    052). Seat events are derived once over the whole league via
+    :func:`_league_signed_margin_events` (one
+    ``features.round_detail`` pass instead of one per query), and two
+    families of running totals are recorded over the
+    chronologically-sorted events: per-team ``sum_margin``/``n_maps``
+    (the inner level's inputs) and per-``(team, map_name)``
+    ``sum_margin``/``n_maps`` (the outer level's). Each row's two sides
+    are resolved against those ledgers with
+    ``utils.asof.merge_asof_lookup`` (strict ``<`` per query), and the
+    two-level linear pooled-mean hierarchy is applied vectorized with
+    the exact same arithmetic and operand order as the single-row
+    estimators: the inner level shrinks the team's overall mean margin
+    toward the structural constant :data:`LEAGUE_MEAN_SIGNED_MARGIN`
+    (``0.0`` — no ledger needed for it, unlike an empirically-pooled
+    prior) with ``overall_k``, and the outer level shrinks the
+    map-phase mean toward the inner mean with ``k``. A zero-history
+    side degrades through the hierarchy exactly as the single-row path
+    does, bit-for-bit identical to looping the single-row calls.
+
+    Args:
+        rows_df: The row table; needs ``team1_id``, ``team2_id``,
+            ``map_name`` and ``date`` columns. Row order is preserved
+            in the output.
+        matches_df: The materialised ``matches`` table.
+        maps_df: The materialised ``maps`` table (needs the full
+            ``round_detail`` required column set).
+        k: The outer-level shrinkage strength (see
+            :func:`features._shared._validate_k`); defaults to the fixed
+            :data:`DEFAULT_MAP_K`.
+        overall_k: The inner-level shrinkage strength (see
+            :func:`features._shared._validate_k`); defaults to the fixed
+            :data:`DEFAULT_OVERALL_K`.
+
+    Returns:
+        A ``(n,)`` numpy array of ``float``:
+        ``team_map_signed_margin(team1, map, date, ...).mean`` minus
+        ``team_map_signed_margin(team2, map, date, ...).mean`` per row.
+
+    Raises:
+        KeyError: If a table lacks a required column (propagated from
+            the event builder / as-of helpers).
+        ValueError: If ``k``/``overall_k`` is invalid (see
+            :func:`features._shared._validate_k`), if a surviving
+            eligible map fails ``round_detail``'s validation (see
+            :func:`_league_signed_margin_events`), or if a row date is
+            null/unparseable (propagated from
+            ``utils.asof.parse_date_column``).
+        ConfigError: If a map name is not a string (propagated from
+            :func:`utils.config.normalize_map_name`).
+    """
+    k_value = _validate_k(k)
+    overall_k_value = _validate_k(overall_k)
+
+    events = _league_signed_margin_events(matches_df, maps_df)
+    if events.empty:
+        return np.zeros(len(rows_df), dtype=float)
+    parsed = asof.parse_date_column(events[asof.DATE_COL])
+    events = (
+        events.assign(_parsed=parsed)
+        .sort_values(
+            ["_parsed", asof.MATCH_ID_COL, asof.MAP_INDEX_COL], kind="stable"
+        )
+        .drop(columns=["_parsed"])
+        .reset_index(drop=True)
+    )
+    events["team_n_after"] = events.groupby("team_id").cumcount() + 1
+    events["team_sum_after"] = events.groupby("team_id")["signed_margin"].cumsum()
+    events["map_n_after"] = (
+        events.groupby(["team_id", MAP_NAME_COL]).cumcount() + 1
+    )
+    events["map_sum_after"] = events.groupby(["team_id", MAP_NAME_COL])[
+        "signed_margin"
+    ].cumsum()
+
+    def _side_outer(team_col: str) -> np.ndarray:
+        """Resolve one side's outer shrunk mean for every row.
+
+        Args:
+            team_col: The row-table team id column.
+
+        Returns:
+            A ``(n_rows,)`` float array of the outer-level shrunk means.
+
+        Raises:
+            Nothing (validation propagated from the lookups).
+        """
+        queries_overall = rows_df[[team_col, asof.DATE_COL]].reset_index(drop=True)
+        overall = asof.merge_asof_lookup(
+            events,
+            ("team_id",),
+            asof.DATE_COL,
+            ("team_n_after", "team_sum_after"),
+            queries_overall,
+            (team_col,),
+            asof.DATE_COL,
+        )
+        query_map = rows_df[[team_col, MAP_NAME_COL, asof.DATE_COL]].copy()
+        query_map[MAP_NAME_COL] = query_map[MAP_NAME_COL].map(
+            config.normalize_map_name
+        )
+        query_map = query_map.reset_index(drop=True)
+        per_map = asof.merge_asof_lookup(
+            events,
+            ("team_id", MAP_NAME_COL),
+            asof.DATE_COL,
+            ("map_n_after", "map_sum_after"),
+            query_map,
+            (team_col, MAP_NAME_COL),
+            asof.DATE_COL,
+        )
+        n_o = overall["team_n_after"].to_numpy(dtype=float)
+        sum_o = overall["team_sum_after"].to_numpy(dtype=float)
+        n_m = per_map["map_n_after"].to_numpy(dtype=float)
+        sum_m = per_map["map_sum_after"].to_numpy(dtype=float)
+        n_o = np.where(np.isnan(n_o), 0.0, n_o)
+        sum_o = np.where(np.isnan(sum_o), 0.0, sum_o)
+        n_m = np.where(np.isnan(n_m), 0.0, n_m)
+        sum_m = np.where(np.isnan(sum_m), 0.0, sum_m)
+        # Inner level: shrunk overall mean toward the exact 0.0 prior.
+        inner_mean = (sum_o + overall_k_value * LEAGUE_MEAN_SIGNED_MARGIN) / (
+            n_o + overall_k_value
+        )
+        # Outer level: the map mean shrunk toward the inner mean.
+        return (sum_m + k_value * inner_mean) / (n_m + k_value)
+
+    outer_a = _side_outer(asof.TEAM1_ID_COL)
+    outer_b = _side_outer(asof.TEAM2_ID_COL)
+    return outer_a - outer_b

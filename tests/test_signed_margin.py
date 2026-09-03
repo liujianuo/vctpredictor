@@ -26,6 +26,7 @@ construction, never silently mid-test.
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -817,3 +818,42 @@ def test_real_data_smoke_sane_numbers_and_exact_zero_identity():
         [rd.MATCH_ID_COL, rd.MAP_INDEX_COL]
     )["signed_margin"].sum()
     assert (pair_sums == 0).all()
+
+
+# --------------------------------------------------------------------------
+# batched signed-margin diff parity (task 052)
+# --------------------------------------------------------------------------
+
+
+def test_batched_signed_margin_diff_bit_exact_parity():
+    # The batched path reproduces, element-for-element, the looped
+    # single-row team_map_signed_margin means per row (no tolerance),
+    # across several as-of cutoffs, both seat orientations for T1, and a
+    # wholly unseen side (Z) whose whole hierarchy degrades exactly as
+    # the single-row path degrades it.
+    matches_df, maps_df, query = _core_tables()
+    d0, d1, d2, d3 = _stamp(0), _stamp(1), _stamp(2), _stamp(3)
+    rows_df = pd.DataFrame(
+        [
+            {"team1_id": "T1", "team2_id": "T2", "map_name": "Haven", "date": d0},
+            {"team1_id": "T1", "team2_id": "T2", "map_name": "Haven", "date": d1},
+            {"team1_id": "T1", "team2_id": "T3", "map_name": "Haven", "date": d2},
+            {"team1_id": "T1", "team2_id": "T4", "map_name": "Bind", "date": d3},
+            {"team1_id": "T1", "team2_id": "T4", "map_name": "Bind", "date": query},
+            {"team1_id": "Z", "team2_id": "T1", "map_name": "Haven", "date": query},
+        ]
+    )
+    expected = np.zeros(len(rows_df))
+    for i, row in enumerate(rows_df.itertuples(index=False)):
+        mean_a = sm.team_map_signed_margin(
+            row.team1_id, row.map_name, row.date, matches_df, maps_df,
+            sm.DEFAULT_MAP_K,
+        ).mean
+        mean_b = sm.team_map_signed_margin(
+            row.team2_id, row.map_name, row.date, matches_df, maps_df,
+            sm.DEFAULT_MAP_K,
+        ).mean
+        expected[i] = mean_a - mean_b
+    got = sm.batched_signed_margin_diff(rows_df, matches_df, maps_df)
+    assert got.shape == (len(rows_df),)
+    assert np.array_equal(got, expected)
