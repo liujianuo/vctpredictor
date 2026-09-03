@@ -13,6 +13,7 @@ skip-guarded smoke test repeats a basic sanity assertion at real
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -848,3 +849,146 @@ def test_same_team_name_collision_raises_value_error():
         player_form.team_player_form("A", QUERY, matches, maps, pms)
     assert "m1" in str(excinfo.value)
     assert "Same Team" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------
+# batched form diff parity (task 052)
+# --------------------------------------------------------------------------
+
+
+def _form_parity_fixture():
+    """Build a two-team fixture with names, rosters and a skip-map.
+
+    Teams ``A`` ("Alpha") and ``B`` ("Beta") play four completed
+    single-map matches across four dates. Every map has a two-player
+    ``player_map_stats`` group per side except ``m3`` (a deliberately
+    missing group, exercising the skip-and-count rule), and on ``m2``
+    one ``Alpha`` player has a null ``acs`` (exercising the per-stat
+    null-skip: the rating stat still computes from the same rows).
+    ``A``'s roster changes between maps so the recency weighting sees
+    non-trivial per-map means.
+
+    Returns:
+        A ``(matches_df, maps_df, pms_df, rows_df)`` tuple; ``rows_df``
+        has ``team1_id, team2_id, date`` columns (form features need no
+        map name).
+
+    Raises:
+        Nothing.
+    """
+    matches_rows = [
+        {"match_id": "m1", "date": "2026-01-01T10:00:00", "team1_id": "A",
+         "team2_id": "B", "team1_name": "Alpha", "team2_name": "Beta",
+         "status": "completed"},
+        {"match_id": "m2", "date": "2026-01-03T10:00:00", "team1_id": "B",
+         "team2_id": "A", "team1_name": "Beta", "team2_name": "Alpha",
+         "status": "completed"},
+        {"match_id": "m3", "date": "2026-01-05T10:00:00", "team1_id": "A",
+         "team2_id": "B", "team1_name": "Alpha", "team2_name": "Beta",
+         "status": "completed"},
+        {"match_id": "m4", "date": "2026-01-07T10:00:00", "team1_id": "B",
+         "team2_id": "A", "team1_name": "Beta", "team2_name": "Alpha",
+         "status": "completed"},
+    ]
+    maps_rows = [
+        {"match_id": "m1", "map_index": 0, "map_name": "Haven",
+         "team1_score": 13, "team2_score": 8, "winner": "A"},
+        {"match_id": "m2", "map_index": 0, "map_name": "Haven",
+         "team1_score": 13, "team2_score": 10, "winner": "B"},
+        {"match_id": "m3", "map_index": 0, "map_name": "Bind",
+         "team1_score": 11, "team2_score": 13, "winner": "B"},
+        {"match_id": "m4", "map_index": 0, "map_name": "Haven",
+         "team1_score": 13, "team2_score": 6, "winner": "A"},
+    ]
+    matches_df = _matches_df(matches_rows)
+    maps_df = _maps_df(maps_rows)
+
+    def roster(match, side, players):
+        """Build two player rows for one side of one match.
+
+        Args:
+            match: The match id.
+            side: The side name ("Alpha"/"Beta").
+            players: ``(player_name, acs, rating)`` triples.
+
+        Returns:
+            A list of pms row dicts.
+
+        Raises:
+            Nothing.
+        """
+        out = []
+        for idx, (name, acs, rating) in enumerate(players):
+            out.append(
+                {
+                    "match_id": match,
+                    "map_index": 0,
+                    "player_name": name,
+                    "team_name": side,
+                    "rating": rating,
+                    "acs": acs,
+                }
+            )
+        return out
+
+    pms_rows = []
+    # m1: A roster acs 220/180 rating 1.10/1.05; B roster 200/190 etc.
+    pms_rows += roster("m1", "Alpha", [("a1", 220, 1.10), ("a2", 180, 1.05)])
+    pms_rows += roster("m1", "Beta", [("b1", 200, 1.00), ("b2", 190, 0.98)])
+    # m2: one Alpha player has a null acs -> acs mean over 1 row, rating over 2.
+    pms_rows += roster("m2", "Alpha", [("a3", None, 1.20), ("a1", 210, 1.15)])
+    pms_rows += roster("m2", "Beta", [("b2", 195, 1.02), ("b3", 205, 1.08)])
+    # m3: NO pms rows at all (skip-and-count for both sides).
+    # m4: fresh rosters.
+    pms_rows += roster("m4", "Alpha", [("a5", 230, 1.25), ("a6", 185, 1.00)])
+    pms_rows += roster("m4", "Beta", [("b5", 210, 1.10), ("b6", 175, 0.90)])
+    pms_df = _pms_df(pms_rows)
+
+    rows_df = pd.DataFrame(
+        [
+            {"team1_id": "A", "team2_id": "B", "date": "2026-01-02T10:00:00"},
+            {"team1_id": "A", "team2_id": "B", "date": "2026-01-04T10:00:00"},
+            {"team1_id": "A", "team2_id": "B", "date": "2026-01-06T10:00:00"},
+            {"team1_id": "A", "team2_id": "B", "date": "2026-01-08T10:00:00"},
+            {"team1_id": "Z", "team2_id": "B", "date": "2026-01-08T10:00:00"},
+            {"team1_id": "B", "team2_id": "A", "date": "2026-01-08T10:00:00"},
+        ]
+    )
+    return matches_df, maps_df, pms_df, rows_df
+
+
+def test_batched_form_diff_bit_exact_parity():
+    # The batched form path reproduces, element-for-element, the looped
+    # single-row team_player_form weighted means per row for both
+    # stats (no tolerance), with the window/decay deliberately small
+    # (n=2, decay=0.5) so the rank-then-slice truncation is exercised,
+    # and with the either-side-None -> 0.0 fallback on the unseen-team
+    # row.
+    matches_df, maps_df, pms_df, rows_df = _form_parity_fixture()
+    exp_acs = np.zeros(len(rows_df))
+    exp_rating = np.zeros(len(rows_df))
+    for i, row in enumerate(rows_df.itertuples(index=False)):
+        fa = player_form.team_player_form(
+            row.team1_id, row.date, matches_df, maps_df, pms_df,
+            n=2, decay_rate=0.5,
+        )
+        fb = player_form.team_player_form(
+            row.team2_id, row.date, matches_df, maps_df, pms_df,
+            n=2, decay_rate=0.5,
+        )
+        exp_acs[i] = 0.0 if (fa.acs.mean is None or fb.acs.mean is None) else (
+            fa.acs.mean - fb.acs.mean
+        )
+        exp_rating[i] = (
+            0.0 if (fa.rating.mean is None or fb.rating.mean is None) else (
+                fa.rating.mean - fb.rating.mean
+            )
+        )
+    got_acs, got_rating = player_form.batched_form_diff(
+        rows_df, matches_df, maps_df, pms_df, n=2, decay_rate=0.5
+    )
+    assert np.array_equal(got_acs, exp_acs)
+    assert np.array_equal(got_rating, exp_rating)
+    # The unseen-team row (Z vs B) has no A-side signal: fallback 0.0.
+    assert got_acs[4] == 0.0
+    assert got_rating[4] == 0.0

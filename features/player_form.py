@@ -153,6 +153,7 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from features._shared import (
@@ -556,3 +557,273 @@ def load_player_form_tables(
     maps_df = pd.read_parquet(version_dir / "maps.parquet")
     player_map_stats_df = pd.read_parquet(version_dir / "player_map_stats.parquet")
     return matches_df, maps_df, player_map_stats_df
+
+
+def _qualifying_form_entries(
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+    player_map_stats_df: pd.DataFrame,
+) -> dict[tuple[str, str], tuple[np.ndarray, np.ndarray]]:
+    """Precompute, per ``(team_id, stat)``, the sorted qualifying-map means.
+
+    The rank-then-slice substrate of the batched form path (task 052,
+    decision 1): walks every eligible map (finished map of a completed
+    match) in the *same* chronological order the single-row path sorts
+    a team's as-of maps by (``(date, match_id, map_index)`` —
+    ``features._shared._chronological_maps``'s tuple), and for each map
+    resolves both participating teams through the exact same per-match
+    name-resolution/roster machinery
+    (``features._shared._build_match_name_lookup`` /
+    ``_validated_roster``) the single-row path uses. A map whose
+    ``player_map_stats`` group is absent, or whose validated roster for
+    a side is empty, contributes nothing for that side (the
+    skip-and-count rule); a side's per-map stat mean is the plain
+    unweighted ``dropna().mean()`` over its roster rows — the literal
+    same pandas call on the literal same rows, so the recorded mean is
+    bit-identical to the single-row path's per-map mean. Name-mismatch
+    and side-name-collision validation therefore run once over the whole
+    league here rather than once per query's as-of subset — the
+    documented whole-league difference of the batched path (real
+    ``data/v1`` has zero such rows).
+
+    Args:
+        matches_df: The materialised ``matches`` table (needs
+            ``match_id``, ``team1_id``, ``team2_id``, ``team1_name``,
+            ``team2_name``, ``date``, ``status``).
+        maps_df: The materialised ``maps`` table (needs ``match_id``,
+            ``map_index``, ``winner``).
+        player_map_stats_df: The materialised ``player_map_stats``
+            table (needs ``match_id``, ``map_index``, ``team_name``,
+            ``acs``, ``rating``).
+
+    Returns:
+        A dict keyed by ``(team_id, stat_name)`` (``stat_name`` in
+        ``{"acs", "rating"}``) mapping to a ``(dates_ns, means)`` pair
+        of numpy arrays: the qualifying maps' parsed dates (int64 ns,
+        non-decreasing — the global chronological walk appends per key
+        in order) and their per-map unweighted means (float64),
+        oldest-first. A team with no qualifying maps for a stat is
+        simply absent from the dict.
+
+    Raises:
+        KeyError: If a table lacks a required column (propagated from
+            ``utils.asof.require_columns``).
+        ValueError: If a match's two side names are identical
+            (propagated from :func:`features._shared._build_match_name_lookup`),
+            if a ``player_map_stats`` ``team_name`` matches neither side
+            of its match (propagated from
+            :func:`features._shared._validated_roster`), or if
+            ``matches_df`` contains duplicate ``match_id`` values among
+            the completed rows.
+    """
+    asof.require_columns(
+        matches_df,
+        (
+            asof.MATCH_ID_COL,
+            asof.TEAM1_ID_COL,
+            asof.TEAM2_ID_COL,
+            TEAM1_NAME_COL,
+            TEAM2_NAME_COL,
+            asof.DATE_COL,
+            asof.STATUS_COL,
+        ),
+        "matches_df",
+    )
+    asof.require_columns(maps_df, (asof.MATCH_ID_COL, asof.MAP_INDEX_COL, asof.WINNER_COL), "maps_df")
+    asof.require_columns(
+        player_map_stats_df,
+        (
+            asof.MATCH_ID_COL,
+            asof.MAP_INDEX_COL,
+            TEAM_NAME_COL,
+            ACS_COL,
+            RATING_COL,
+        ),
+        "player_map_stats_df",
+    )
+
+    completed = matches_df[matches_df[asof.STATUS_COL] == asof.COMPLETED_STATUS]
+    if not completed[asof.MATCH_ID_COL].is_unique:
+        raise ValueError(
+            "matches_df contains duplicate match_id values among the "
+            "completed rows; the form-event join would fan out and "
+            "duplicate map rows"
+        )
+    match_names = _build_match_name_lookup(matches_df)
+    match_meta = completed[
+        [
+            asof.MATCH_ID_COL,
+            asof.TEAM1_ID_COL,
+            asof.TEAM2_ID_COL,
+            asof.DATE_COL,
+        ]
+    ]
+    finished = maps_df[maps_df[asof.WINNER_COL].notna()][
+        [asof.MATCH_ID_COL, asof.MAP_INDEX_COL]
+    ]
+    eligible = finished.merge(match_meta, on=asof.MATCH_ID_COL, how="inner")
+    parsed = pd.to_datetime(eligible[asof.DATE_COL])
+    eligible = eligible.assign(_parsed=parsed).sort_values(
+        ["_parsed", asof.MATCH_ID_COL, asof.MAP_INDEX_COL], kind="stable"
+    )
+
+    pms_groups = {
+        (key[0], int(key[1])): group
+        for key, group in player_map_stats_df.groupby(
+            [asof.MATCH_ID_COL, asof.MAP_INDEX_COL], sort=False
+        )
+    }
+
+    # Per (team_id, stat): parallel lists of parsed dates and means,
+    # appended in the global chronological walk so each key's entries
+    # end up oldest-first.
+    entries: dict[tuple[str, str], list] = {}
+    ids_t1 = eligible[asof.TEAM1_ID_COL].to_numpy()
+    ids_t2 = eligible[asof.TEAM2_ID_COL].to_numpy()
+    ids_mid = eligible[asof.MATCH_ID_COL].to_numpy()
+    ids_map = eligible[asof.MAP_INDEX_COL].to_numpy()
+    dates_ns = eligible["_parsed"].astype(np.int64).to_numpy()
+    for position in range(len(eligible)):
+        match_id = ids_mid[position]
+        map_index = int(ids_map[position])
+        date_value = int(dates_ns[position])
+        team1_id = ids_t1[position]
+        team2_id = ids_t2[position]
+        team1_name, team2_name = match_names[match_id]
+        group = pms_groups.get((match_id, map_index))
+        if group is None:
+            continue
+        for team_id, resolved_name in (
+            (team1_id, team1_name),
+            (team2_id, team2_name),
+        ):
+            roster = _validated_roster(
+                group, resolved_name, {team1_name, team2_name}, match_id, map_index
+            )
+            if roster.empty:
+                continue
+            acs_nonnull = roster[ACS_COL].dropna()
+            rating_nonnull = roster[RATING_COL].dropna()
+            if len(acs_nonnull):
+                entries.setdefault((team_id, ACS_COL), [[], []])[0].append(date_value)
+                entries[(team_id, ACS_COL)][1].append(float(acs_nonnull.mean()))
+            if len(rating_nonnull):
+                entries.setdefault((team_id, RATING_COL), [[], []])[0].append(date_value)
+                entries[(team_id, RATING_COL)][1].append(float(rating_nonnull.mean()))
+
+    return {
+        key: (np.asarray(dates, dtype=np.int64), np.asarray(means, dtype=float))
+        for key, (dates, means) in entries.items()
+    }
+
+
+def batched_form_diff(
+    rows_df: pd.DataFrame,
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+    player_map_stats_df: pd.DataFrame,
+    n: int = DEFAULT_FORM_WINDOW,
+    decay_rate: float = DEFAULT_DECAY_RATE,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return per-row recency-weighted ``acs`` and ``rating`` form differentials.
+
+    The batched sibling of the two :func:`team_player_form` calls
+    :func:`models._shared.build_feature_vector` makes per row (task
+    052). It precomputes, once for the whole league, every team's
+    qualifying-map per-stat means via
+    :func:`_qualifying_form_entries` (same per-map ``dropna().mean()``
+    values, same chronological order — the values a window can ever
+    reference are frozen, so no per-query as-of refilter/join is
+    needed). For each row and side, the number of qualifying maps
+    strictly before the row's date (the *rank*) is resolved with a
+    binary search over that side's precomputed date array (the
+    strict-``<`` boundary: maps dated equal to the row's date are
+    excluded exactly as ``maps_as_of`` excludes them), the last ``n``
+    entries before that rank are sliced, and the identical
+    recency-decay weighting (:func:`_recency_weighted`,
+    ``w_i = decay_rate ** i``, most-recent-first) is applied to the
+    literal same means in the literal same order — hence bit-for-bit
+    identical output to looping the single-row calls. The either-side-
+    ``None`` fallback (zero qualifying maps for a side) is applied per
+    stat exactly as the module docstring's missing-value policy
+    describes: a side with no signal makes the whole differential
+    ``0.0`` rather than a partial diff against the other side's real
+    value.
+
+    Args:
+        rows_df: The row table; needs ``team1_id``, ``team2_id`` and
+            ``date`` columns. Row order is preserved in the output.
+        matches_df: The materialised ``matches`` table.
+        maps_df: The materialised ``maps`` table.
+        player_map_stats_df: The materialised ``player_map_stats``
+            table.
+        n: The recency window size (see :func:`_validate_n`).
+        decay_rate: The recency decay rate (see
+            :func:`_validate_decay_rate`).
+
+    Returns:
+        An ``(acs_diff, rating_diff)`` tuple of ``(n_rows,)`` numpy
+        float arrays: per row, the team1-side weighted mean minus the
+        team2-side weighted mean for that stat, ``0.0`` when either
+        side has no qualifying maps (the documented fallback).
+
+    Raises:
+        KeyError: If a table lacks a required column (propagated from
+            :func:`_qualifying_form_entries` / ``utils.asof``).
+        ValueError: If ``n`` or ``decay_rate`` is invalid (see the
+            validate helpers); if a match's two side names are
+            identical or a ``player_map_stats`` ``team_name`` matches
+            neither side (propagated from
+            :func:`_qualifying_form_entries`); or if a row date is
+            null/unparseable (propagated from
+            ``utils.asof.parse_date_column``).
+    """
+    n_value = _validate_n(n)
+    decay = _validate_decay_rate(decay_rate)
+
+    entries = _qualifying_form_entries(matches_df, maps_df, player_map_stats_df)
+    row_dates = asof.parse_date_column(rows_df[asof.DATE_COL]).to_numpy().astype(np.int64)
+
+    def _side_means(team_col: str, stat_col: str) -> np.ndarray:
+        """Resolve one side's per-row weighted mean (NaN = no signal).
+
+        Args:
+            team_col: The row-table team id column
+                (``"team1_id"``/``"team2_id"``).
+            stat_col: The stat column name (``"acs"``/``"rating"``).
+
+        Returns:
+            A ``(n_rows,)`` float array of the side's recency-weighted
+            mean per row, ``NaN`` where the side has zero qualifying
+            maps strictly before that row's date.
+
+        Raises:
+            Nothing.
+        """
+        team_ids = rows_df[team_col].to_numpy()
+        out = np.full(len(rows_df), np.nan)
+        for i in range(len(rows_df)):
+            pair = entries.get((team_ids[i], stat_col))
+            if pair is None:
+                continue
+            dates_ns, means = pair
+            rank = int(np.searchsorted(dates_ns, row_dates[i], side="left"))
+            if rank == 0:
+                continue
+            window = list(means[max(0, rank - n_value):rank])
+            weighted_mean, _per_map, _weights = _recency_weighted(
+                window, n_value, decay
+            )
+            out[i] = weighted_mean
+        return out
+
+    acs_a = _side_means(asof.TEAM1_ID_COL, ACS_COL)
+    acs_b = _side_means(asof.TEAM2_ID_COL, ACS_COL)
+    rating_a = _side_means(asof.TEAM1_ID_COL, RATING_COL)
+    rating_b = _side_means(asof.TEAM2_ID_COL, RATING_COL)
+
+    acs_diff = np.where(np.isnan(acs_a) | np.isnan(acs_b), 0.0, acs_a - acs_b)
+    rating_diff = np.where(
+        np.isnan(rating_a) | np.isnan(rating_b), 0.0, rating_a - rating_b
+    )
+    return acs_diff, rating_diff
