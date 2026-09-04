@@ -261,14 +261,16 @@ DEFAULT_N_SAMPLES = 30
 DEFAULT_SEED = 2026
 DEFAULT_CI_LEVEL = 0.90
 
-# The names this module exposes publicly: the four result dataclasses,
-# the factory that returns the documented 5-arg predict closure (the
-# closure itself is not a module-level name), and the E1 session-holding
-# Predictor wrapper.
+# The names this module exposes publicly: the result dataclasses
+# (including the M39.2 RankedVetoPrediction wrapper), the factory that
+# returns the documented 5-arg predict closure (the closure itself is
+# not a module-level name), and the E1 session-holding Predictor
+# wrapper.
 __all__ = [
     "PerMapPrediction",
     "PredictionResult",
     "Predictor",
+    "RankedVetoPrediction",
     "SeriesPrediction",
     "VetoSensitivity",
     "make_predictor",
@@ -456,12 +458,17 @@ class VetoSensitivity:
 class PredictionResult:
     """The full M39 ``predict()`` result for one queried match.
 
-    The top-level return of the documented public API: the
-    deterministic predicted veto sequence (D2), one
+    The top-level return of the documented public API and, per M39.2,
+    also the per-veto ``result`` inside each
+    :class:`RankedVetoPrediction` entry: the deterministic predicted
+    veto sequence (D2 — the M25 greedy veto from ``predict()``, or a
+    specific enumerated veto from ``top_vetos``), one
     :class:`PerMapPrediction` per played map in play order, the
-    veto-marginalised :class:`SeriesPrediction` (D5), and the
+    veto-marginalised :class:`SeriesPrediction` (D5 — sampled for
+    ``predict()``, exact-M30 for a fixed ``top_vetos`` veto), and the
     structural :class:`VetoSensitivity` summary (D5, from the same M31
-    sampling pass).
+    sampling pass; ``None`` on the exact-enumeration path where no
+    Monte Carlo spread exists — F5).
 
     Attributes:
         predicted_veto: The full deterministic greedy-veto action tuple
@@ -472,13 +479,23 @@ class PredictionResult:
             then the forced ``decider`` map — ``best_of`` entries).
         series: The veto-marginalised series scoreline prediction.
         veto_sensitivity: The structural spread summary across the
-            sampled veto sequences.
+            sampled veto sequences, or ``None`` when no Monte Carlo
+            spread was computed for this result (F5). ``predict()``'s
+            own path always constructs a real (non-``None``)
+            ``VetoSensitivity`` from its M31 call; ``None`` appears
+            only on M39.2's exact-enumeration path — each
+            :class:`RankedVetoPrediction` result is a single fixed
+            veto with no sampled spread, so ``None`` ("not computed")
+            is the honest value rather than a fabricated zero-width
+            band (the same "not computed" convention
+            ``PerMapPrediction.interval_low``/``interval_high``
+            already use for an absent epistemic interval, D4).
     """
 
     predicted_veto: tuple[SimulatedVetoAction, ...]
     per_map: tuple[PerMapPrediction, ...]
     series: SeriesPrediction
-    veto_sensitivity: VetoSensitivity
+    veto_sensitivity: VetoSensitivity | None
 
     def to_dict(self) -> dict[str, object]:
         """Serialize this full prediction result to a JSON-compatible dict.
@@ -492,7 +509,8 @@ class PredictionResult:
         Returns:
             A dict with keys ``"predicted_veto"`` (list of action
             dicts), ``"per_map"`` (list of per-map dicts), ``"series"``
-            (dict) and ``"veto_sensitivity"`` (dict), all plain JSON
+            (dict) and ``"veto_sensitivity"`` (the record's dict, or
+            ``None`` when no spread was computed — F5), all plain JSON
             types.
 
         Raises:
@@ -504,7 +522,67 @@ class PredictionResult:
             ],
             "per_map": [entry.to_dict() for entry in self.per_map],
             "series": self.series.to_dict(),
-            "veto_sensitivity": self.veto_sensitivity.to_dict(),
+            "veto_sensitivity": (
+                None
+                if self.veto_sensitivity is None
+                else self.veto_sensitivity.to_dict()
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class RankedVetoPrediction:
+    """One entry of the M39.2 exact top-veto listing (F4).
+
+    The per-entry result type of :func:`make_top_vetos_fn`'s
+    ``top_vetos`` closure: a single enumerated veto sequence's exact
+    joint ``veto_probability`` (its ``sequence_probability`` from
+    :func:`models.ancestral_veto_sampler.enumerate_veto_sequences` —
+    the product of its six non-decider step probabilities) paired with
+    the full :class:`PredictionResult` for that *specific* fixed veto
+    (its deterministic action sequence as ``predicted_veto``, one
+    temperature-scaled :class:`PerMapPrediction` per played map, and
+    the exact-M30 conditional series scoreline distribution). Because a
+    single fixed veto has no Monte Carlo spread, the entry's
+    ``result.veto_sensitivity`` is always ``None`` (F5) — the reason a
+    separate wrapper type exists rather than overloading
+    :class:`PredictionResult` with a veto-probability field.
+
+    Attributes:
+        veto_probability: The enumerated sequence's joint
+            ``sequence_probability`` — the product of its six
+            non-decider per-step probabilities (the forced decider's
+            ``1.0`` excluded), a ``float`` in ``[0, 1]``.
+        result: The :class:`PredictionResult` for this specific veto:
+            its full 7-action sequence as ``predicted_veto``, one
+            :class:`PerMapPrediction` per played map in play order,
+            and the exact conditional :class:`SeriesPrediction`; its
+            ``veto_sensitivity`` is ``None`` (F5).
+    """
+
+    veto_probability: float
+    result: PredictionResult
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize this ranked veto entry to a JSON-compatible dict.
+
+        Nests the inner result's own ``to_dict`` output under the
+        ``"result"`` key alongside the flat
+        ``"veto_probability"`` float, so a consumer can sort/rank
+        entries by the outer key and read the full prediction under
+        the inner one.
+
+        Returns:
+            A dict with keys ``"veto_probability"`` (float) and
+            ``"result"`` (the nested :meth:`PredictionResult.to_dict`
+            dict), all plain JSON types.
+
+        Raises:
+            Nothing.
+        """
+        return {
+            "veto_probability": self.veto_probability,
+            "result": self.result.to_dict(),
         }
 
 
