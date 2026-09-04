@@ -358,6 +358,15 @@ M39.3 persisted-bootstrap-replicates auto-load.**
   the one-shot and ``--stream`` modes pick up the auto-load for
   free.
 
+  The auto-load is :func:`make_predictor`-only. :func:`make_top_vetos_fn`
+  (the M39.2 F3 factory — same parameter name, annotation and ``None``
+  default, documented back-to-back with :func:`make_predictor`) is
+  deliberately **not** part of D10: it performs no artifact read on any
+  path, so its ``bootstrap_models=None`` still means "no interval"
+  (replicate models consumed, never fitted or persisted here, unchanged
+  since M39.2). A caller moving between the two factories must not
+  assume the same spelling carries the same meaning.
+
 **Probability order.** Every per-map 4-vector and every interval band
 in this module is in :data:`models._shared.OUTCOME_LABELS` order —
 ``("A-regulation", "A-OT", "B-OT", "B-regulation")``; every scoreline
@@ -1450,7 +1459,12 @@ def make_top_vetos_fn(
             intervals are computed over; ``None`` (the default) or an
             empty sequence means ``per_map[i].interval_*`` is
             ``None``. Replicate models are consumed, never fitted or
-            persisted here.
+            persisted here. **M39.3/D10 note:** unlike
+            :func:`make_predictor`, this factory performs **no**
+            artifact auto-load — ``bootstrap_models=None`` here still
+            means "no interval" and never reads
+            ``ordinal_bootstrap_replicates.json`` (the D10 auto-load
+            is :func:`make_predictor`-only).
 
     Returns:
         The 6-argument ``top_vetos(team_a, team_b, best_of, map_pool,
@@ -1797,11 +1811,26 @@ class Predictor:
                 repo convention; default :data:`DEFAULT_SEED`).
             ci_level: The interval/spread level in ``(0, 1)`` (default
                 :data:`DEFAULT_CI_LEVEL`); validated at factory time.
-            bootstrap_models: The optional already-fitted raw ordinal
-                bootstrap replicate models (D4) the per-map epistemic
-                intervals are computed over; ``None`` (the default) or
-                an empty sequence means ``per_map[i].interval_*`` is
-                ``None``. Forwarded unchanged to :func:`make_predictor`.
+            bootstrap_models: The replicate models the per-map epistemic
+                intervals are computed over (D4); forwarded unchanged to
+                :func:`make_predictor`, which applies the M39.3/D10
+                semantics. The **signature default is ``None`` and does
+                not change**, but ``None`` now means "auto-load the
+                persisted ``<output_dir>/<version>/
+                ordinal_bootstrap_replicates.json`` artifact": if that
+                file exists, its ``"replicates"`` entries are
+                deserialized via ``models.ordinal_logit.from_dict`` and
+                used exactly as if the caller had passed the resulting
+                list explicitly; if it does not exist, ``None`` is
+                closed over and every ``per_map[i].interval_*`` is
+                ``None`` (the roadmap's soft missing-artifact case —
+                never a ``FileNotFoundError``). An explicit empty
+                sequence ``()`` **still means "no interval"** — it
+                skips the auto-load entirely and must not be conflated
+                with ``None``. An explicit non-empty sequence still
+                overrides — the auto-load runs only when
+                ``bootstrap_models is None``. Replicate models are
+                consumed, never fitted or persisted here.
 
         Returns:
             Nothing (the loaded state is held on the instance).
