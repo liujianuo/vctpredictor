@@ -13,7 +13,13 @@ many ``predict()`` calls in one process, driven from the CLI's
 listing: :func:`make_top_vetos_fn` returns the ``top_vetos`` closure
 that exhaustively enumerates every possible veto sequence (7! = 5,040)
 and ranks them by exact joint probability, returning
-:class:`RankedVetoPrediction` entries (library-only — see F8). This is
+:class:`RankedVetoPrediction` entries (library-only — see F8). M39.3
+adds the persisted-bootstrap-replicates auto-load (D10): the
+``bootstrap_models=None`` default now auto-loads the per-map replicate
+artifact ``drivers/train_bootstrap_replicates.py`` produces, with an
+``np.allclose`` staleness guard against the base ordinal model — an
+explicit ``()`` remains the no-interval escape hatch and an explicit
+non-empty sequence still overrides. This is
 still a **wiring milestone, not a model**: every underlying
 piece already exists and is reviewed/clean —
 ``models.greedy_veto_simulator`` (M25), ``models.ordinal_logit`` (M20),
@@ -70,15 +76,20 @@ boundary-test change is needed.
   documented, not a bug.)
 - **D4.** The epistemic interval consumes already-fitted replicate
   models: ``make_predictor(..., bootstrap_models=None)`` accepts an
-  optional ``Sequence[OrdinalLogitModel]``; when ``None`` (or empty),
-  ``per_map[i].interval_*`` is ``None`` (no interval), and when
-  provided, each map's interval is
+  optional ``Sequence[OrdinalLogitModel]``; when no replicate models
+  end up backing the call (an explicit empty sequence ``()`` — the
+  escape hatch, or an auto-load that finds no artifact on disk),
+  ``per_map[i].interval_*`` is ``None`` (no interval), and when a
+  sequence is in effect, each map's interval is
   :func:`evaluation.bootstrap_intervals.replicate_matrix_intervals`
   over the replicate models' 4-way predictions. The interval is over
   the **raw ordinal** replicates (M36's definition) while the point
   estimate is temperature-scaled (D3) — the same asymmetry M36 itself
-  records; kept and stated here. Producing/persisting replicate models
-  for real users is the caller's job (or a later milestone); this task
+  records; kept and stated here. Since M39.3, the ``None`` default no
+  longer simply means "no interval": it triggers the auto-load of the
+  persisted ``ordinal_bootstrap_replicates.json`` artifact (D10).
+  Producing/persisting replicate models for real users is
+  ``drivers/train_bootstrap_replicates.py``'s job (M39.3); this task
   only consumes them.
 - **D5.** One M31 call produces both ``series`` and
   ``veto_sensitivity``: ``series`` = ``prediction.probabilities`` (+
@@ -302,6 +313,51 @@ the M39.2 exact top-veto enumeration.**
   milestone may fold this into :class:`Predictor` for single-load
   reuse; that is explicitly deferred, not silently skipped.
 
+**Design decision D10 (recorded here, do not silently change) — the
+M39.3 persisted-bootstrap-replicates auto-load.**
+
+- **D10.** :func:`make_predictor`'s ``bootstrap_models=None`` default
+  changes *meaning*, not signature or default value: ``None`` now
+  means "attempt to auto-load the persisted per-map replicate
+  artifact" — ``<output_dir>/<version>/ordinal_bootstrap_replicates
+  .json``, produced by ``drivers/train_bootstrap_replicates.py`` —
+  while an explicit empty sequence ``()`` remains the documented
+  "no interval" escape hatch and an explicit non-empty sequence still
+  overrides. The auto-load runs **only** when ``bootstrap_models is
+  None`` (never for ``()`` or a caller-supplied sequence). If the
+  artifact exists, each entry of its ``"replicates"`` list is
+  deserialized via ``models.ordinal_logit.from_dict`` and the list is
+  closed over exactly as if the caller had passed it explicitly; if
+  the artifact does **not** exist, ``None`` is closed over and every
+  ``per_map[i].interval_*`` is ``None`` — the roadmap's **soft**
+  missing-artifact case, explicitly not a ``FileNotFoundError``
+  (unlike the three tables / four required artifacts, which keep
+  their existing hard failure). The auto-load path also enforces a
+  **staleness guard** mirroring decision E's temperature/base-model
+  guard exactly: the artifact's ``"base_ordinal_thresholds"``
+  provenance copy is compared via ``np.allclose`` against the
+  already-loaded base ordinal model's ``thresholds``, and a mismatch
+  raises ``ValueError`` ("... was fit against a different
+  ordinal_logit_model.json; re-run train_bootstrap_replicates.py")
+  rather than silently applying replicates fit against a different
+  base model. The guard fires only on the auto-load path — an
+  explicitly caller-supplied ``bootstrap_models`` sequence is never
+  checked against anything (unchanged from today; D4 already
+  documents replicate models as caller-supplied and pre-fitted). For
+  the comparison, ``make_predictor`` performs a small, deliberate,
+  redundant-but-necessary **third** direct load of
+  ``ordinal_logit_model.json`` (the registry factory's internally-
+  loaded base model is not exposed to this function's scope — the
+  same pattern where ``make_predictor`` and the registry factory each
+  load ``player_map_stats_df`` independently already). Because the
+  registry factory above already loaded that artifact successfully,
+  this third load cannot fail with a missing-file error on a path
+  that reached it. :class:`Predictor` and the CLI need no code
+  change: ``Predictor.__init__`` forwards its own ``None`` default
+  unchanged and the CLI never passes ``bootstrap_models``, so both
+  the one-shot and ``--stream`` modes pick up the auto-load for
+  free.
+
 **Probability order.** Every per-map 4-vector and every interval band
 in this module is in :data:`models._shared.OUTCOME_LABELS` order —
 ``("A-regulation", "A-OT", "B-OT", "B-regulation")``; every scoreline
@@ -316,9 +372,16 @@ B's).
 ``conditional_logit_pick_model.json`` for the requested version (i.e.
 ``materialize.py`` and the four training drivers have been run). A
 missing artifact raises ``FileNotFoundError`` unchanged — the standard
-"run the prerequisite first" signal. ``bootstrap_models`` (D4), when
-provided, are caller-supplied already-fitted raw ordinal replicates;
-they are never fitted or persisted here.
+"run the prerequisite first" signal. Since M39.3, the *optional*
+``ordinal_bootstrap_replicates.json`` (produced by
+``drivers/train_bootstrap_replicates.py``) is additionally auto-loaded
+by default (D10) when present — the one **soft**-missing input in this
+module: its absence is silently treated as "no replicate models"
+(``None`` closed over, ``interval_* = None``), while its presence is
+enforced against the base model's thresholds by the D10 staleness
+guard. ``bootstrap_models`` (D4), when explicitly supplied, are
+caller-supplied already-fitted raw ordinal replicates; they are never
+fitted or persisted here.
 
 Exit codes (CLI):
 
@@ -975,12 +1038,24 @@ def make_predictor(
             per-map epistemic bands and the veto-sensitivity bands
             (default :data:`DEFAULT_CI_LEVEL`); validated here at
             factory time.
-        bootstrap_models: The optional already-fitted raw ordinal
-            bootstrap replicate models (D4) the per-map epistemic
-            intervals are computed over; ``None`` (the default) or an
-            empty sequence means ``per_map[i].interval_*`` is
-            ``None``. Replicate models are consumed, never fitted or
-            persisted here.
+        bootstrap_models: The replicate models the per-map epistemic
+            intervals are computed over (D4). The **signature default
+            is ``None`` and does not change** (M39.3/D10), but ``None``
+            now means "auto-load the persisted
+            ``<output_dir>/<version>/ordinal_bootstrap_replicates.json``
+            artifact": if that file exists, its ``"replicates"``
+            entries are deserialized via
+            ``models.ordinal_logit.from_dict`` and used exactly as if
+            the caller had passed the resulting list explicitly; if it
+            does not exist, ``None`` is closed over and every
+            ``per_map[i].interval_*`` is ``None`` (the roadmap's soft
+            missing-artifact case — never a ``FileNotFoundError``).
+            An explicit empty sequence ``()`` **still means "no
+            interval"** — it skips the auto-load entirely and must
+            not be conflated with ``None``. An explicit non-empty
+            sequence still overrides — the auto-load runs only when
+            ``bootstrap_models is None``. Replicate models are
+            consumed, never fitted or persisted here.
 
     Returns:
         The 5-argument ``predict(team_a, team_b, best_of, map_pool,
@@ -1037,6 +1112,57 @@ def make_predictor(
         "ban": conditional_logit_ban.make_veto_step_predictor_fn(ban_model),
         "pick": conditional_logit_pick.make_veto_step_predictor_fn(pick_model),
     }
+
+    # M39.3 (D10): the auto-load default. bootstrap_models=None (the
+    # parameter default, unchanged) now means "attempt to load the
+    # persisted per-map replicate artifact produced by
+    # drivers/train_bootstrap_replicates.py"; an explicit empty
+    # sequence () remains the documented "no interval" escape hatch
+    # and an explicit non-empty sequence still overrides — auto-load
+    # runs only when bootstrap_models is None, never for () or a
+    # caller-supplied sequence. A missing artifact is the roadmap's
+    # *soft* case: None stays closed over (interval_* = None), never
+    # a FileNotFoundError.
+    if bootstrap_models is None:
+        replicate_artifact_path = (
+            output_dir / version / "ordinal_bootstrap_replicates.json"
+        )
+        if replicate_artifact_path.exists():
+            replicate_artifact = json.loads(
+                replicate_artifact_path.read_text(encoding="utf-8")
+            )
+            # D10's staleness guard, mirroring decision E's
+            # temperature/base-model guard exactly: the artifact's
+            # base_ordinal_thresholds provenance copy must
+            # np.allclose-match the base ordinal model actually on
+            # disk, or the persisted replicates were fit against a
+            # different base model and are silently stale. The base
+            # model is deliberately loaded afresh here (a small,
+            # redundant-but-necessary third direct load of the same
+            # artifact — the registry factory's internally-loaded copy
+            # is not exposed to this scope; and since that factory
+            # already loaded it successfully above, this load cannot
+            # fail with a missing-file error on this path).
+            base_model_path = (
+                output_dir / version / "ordinal_logit_model.json"
+            )
+            with open(base_model_path, encoding="utf-8") as handle:
+                base_ordinal_model = ordinal_logit.from_dict(
+                    json.load(handle)
+                )
+            if not np.allclose(
+                replicate_artifact["base_ordinal_thresholds"],
+                base_ordinal_model.thresholds,
+            ):
+                raise ValueError(
+                    "ordinal_bootstrap_replicates.json was fit against "
+                    "a different ordinal_logit_model.json; re-run "
+                    "train_bootstrap_replicates.py"
+                )
+            bootstrap_models = [
+                ordinal_logit.from_dict(entry)
+                for entry in replicate_artifact["replicates"]
+            ]
 
     def predict(
         team_a: str,
