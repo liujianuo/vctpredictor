@@ -897,6 +897,359 @@ def test_ranked_veto_prediction_to_dict_json_serializable():
 
 
 # --------------------------------------------------------------------------
+# plan#9: M39.2 make_top_vetos_fn / top_vetos (exact top-veto listing)
+# --------------------------------------------------------------------------
+
+
+def _top_two_step_stub(
+    acting_team_id, action, remaining_maps, date, matches_df, maps_df
+):
+    """Return a step distribution concentrated on the two first maps.
+
+    The deterministic non-uniform stub predictor for the top_vetos
+    wiring tests: the alphabetically-first remaining map receives
+    ``0.6``, the second ``0.4`` and every other map ``0.0`` (summing
+    to exactly 1 for every remaining-set size the enumeration consults;
+    the decider never reaches a predictor). Under this arm the
+    always-first veto walk is the unique ``0.6**6`` top-ranked sequence
+    and every other feasible first/second pattern has a smaller,
+    hand-computable product, so the ranking and the per-veto result
+    fields are all hand-assertable.
+
+    Args:
+        acting_team_id: The acting team's stable id (ignored).
+        action: The step's action (ignored).
+        remaining_maps: The sorted remaining-maps list the returned
+            distribution aligns to.
+        date: The as-of cutoff (ignored).
+        matches_df: The materialised matches table (ignored).
+        maps_df: The materialised maps table (ignored).
+
+    Returns:
+        A ``list`` of ``len(remaining_maps)`` probabilities: ``0.6``
+        on the first entry, ``0.4`` on the second, ``0.0`` on the
+        rest.
+
+    Raises:
+        Nothing.
+    """
+    n = len(remaining_maps)
+    probs = [0.0] * n
+    probs[0] = 0.6
+    probs[1] = 0.4
+    return probs
+
+
+def _install_top_vetos_wiring(monkeypatch):
+    """Patch make_top_vetos_fn's loaders/model sources into stubs.
+
+    Mirrors :func:`_install_table_and_model_stubs` for the M39.2
+    factory: routes the three input tables to the synthetic league,
+    the Stage-2 registry factory to
+    :func:`_stub_map_model_fn` (the hand-known temperature-scaled
+    4-vector), the Stage-1 artifact loader to ``(None, None)``, the two
+    ``make_veto_step_predictor_fn`` factories to closures returning
+    :func:`_top_two_step_stub` (so the exact enumeration inside
+    ``top_vetos`` consumes a deterministic, table-ignoring arm under
+    both action keys — the real factories are never needed), and the
+    map-win-rate estimator to :func:`_stub_team_map_win_rate` (so the
+    real :func:`_n_games_backing_for_map` backing queries resolve
+    deterministically). No real parquet files or fitted artifacts are
+    needed; the enumeration runs for real over the stubbed predictors
+    (fast — the 5,040-sequence walk costs ~120 memoised stub calls).
+
+    Args:
+        monkeypatch: pytest's built-in monkeypatch fixture.
+
+    Returns:
+        Nothing.
+
+    Raises:
+        Nothing.
+    """
+    _install_table_stubs(monkeypatch)
+    monkeypatch.setitem(
+        pred.evaluate.MODEL_REGISTRY,
+        pred._TEMPERATURE_MAP_MODEL_KEY,
+        lambda output_dir, version: _stub_map_model_fn,
+    )
+    monkeypatch.setattr(
+        pred, "_load_veto_models", lambda output_dir, version: (None, None)
+    )
+    monkeypatch.setattr(
+        pred.conditional_logit_ban,
+        "make_veto_step_predictor_fn",
+        lambda model: _top_two_step_stub,
+    )
+    monkeypatch.setattr(
+        pred.conditional_logit_pick,
+        "make_veto_step_predictor_fn",
+        lambda model: _top_two_step_stub,
+    )
+    monkeypatch.setattr(
+        pred.map_win_rate, "team_map_win_rate", _stub_team_map_win_rate
+    )
+
+
+@pytest.fixture
+def stub_top_vetos_wiring(monkeypatch):
+    """Monkeypatch make_top_vetos_fn's loaders/models into deterministic stubs.
+
+    Thin fixture wrapper over :func:`_install_top_vetos_wiring` so the
+    top_vetos tests can request the deterministic synthetic wiring by
+    name (mirroring the ``stub_predictor_wiring`` fixture's role for
+    the make_predictor tests). All patches are reverted by monkeypatch
+    at test teardown.
+
+    Args:
+        monkeypatch: pytest's built-in monkeypatch fixture.
+
+    Returns:
+        Nothing.
+
+    Raises:
+        Nothing.
+    """
+    _install_top_vetos_wiring(monkeypatch)
+
+
+def test_make_top_vetos_fn_missing_table_raises_file_not_found(tmp_path):
+    # F3 load contract: with no tables under the empty tmp dir (no
+    # stubs) the first table load raises FileNotFoundError unchanged —
+    # the standard "run the prerequisite first" signal, mirroring
+    # test_make_predictor_missing_table_raises_file_not_found.
+    with pytest.raises(FileNotFoundError):
+        pred.make_top_vetos_fn(tmp_path, "v1")
+
+
+def test_make_top_vetos_fn_returns_6_arg_closure_with_documented_defaults(
+    tmp_path, stub_top_vetos_wiring
+):
+    # F3/F6: make_top_vetos_fn returns a callable whose signature is
+    # exactly the documented 6-arg public API — (team_a, team_b,
+    # best_of, map_pool, as_of_date, n) — with n defaulting to
+    # DEFAULT_TOP_N and no n_samples/seed knobs (no M31 sampling on
+    # this path, F6); the factory keywords default to the documented
+    # constants.
+    top_vetos = pred.make_top_vetos_fn("data", "v1")
+    assert callable(top_vetos)
+    parameters = list(inspect.signature(top_vetos).parameters)
+    assert parameters == [
+        "team_a", "team_b", "best_of", "map_pool", "as_of_date", "n"
+    ]
+    assert (
+        inspect.signature(top_vetos).parameters["n"].default
+        == pred.DEFAULT_TOP_N
+    )
+    assert pred.DEFAULT_TOP_N == 10
+    factory = inspect.signature(pred.make_top_vetos_fn)
+    assert factory.parameters["ci_level"].default == DEFAULT_CI_LEVEL
+    assert factory.parameters["bootstrap_models"].default is None
+    assert "n_samples" not in factory.parameters
+    assert "seed" not in factory.parameters
+
+
+def test_top_vetos_synthetic_shapes_wiring_and_ranking(
+    tmp_path, stub_top_vetos_wiring
+):
+    # A full synthetic top_vetos run against the stubbed league with
+    # the top-two stub arm: the returned tuple has length min(n, 5040)
+    # and is sorted descending by veto_probability; every entry's
+    # result has veto_sensitivity None (F5) and a series that sums to 1
+    # and equals an independently-computed
+    # series_probabilities_in_order call over that specific veto's
+    # collapsed per-map win probabilities; every per-map entry's
+    # probabilities/n_games_backing match direct calls; and the first
+    # (unique 0.6**6) entry's full predicted_veto matches the specific
+    # enumerated sequence's actions with the probability field dropped.
+    matches_df, maps_df, _ = _league_tables()
+    as_of_date = "2026-01-01T00:00:00"
+    top_vetos = pred.make_top_vetos_fn("data", "v1", ci_level=0.9)
+    entries = top_vetos("A", "B", "Bo3", _STUB_POOL, as_of_date, n=10)
+
+    assert len(entries) == 10
+    probabilities = [e.veto_probability for e in entries]
+    assert probabilities == sorted(probabilities, reverse=True)
+    assert all(e.result.veto_sensitivity is None for e in entries)
+
+    # The unique top walk: always alphabetically-first over the sorted
+    # pool leaves Sunset as the decider.
+    assert entries[0].veto_probability == pytest.approx(0.6**6)
+    assert [a.map_name for a in entries[0].result.predicted_veto] == [
+        "Ascent", "Bind", "Haven", "Icebox", "Lotus", "Split", "Sunset"
+    ]
+    assert [a.action for a in entries[0].result.predicted_veto] == [
+        "ban", "ban", "pick", "pick", "ban", "ban", "decider"
+    ]
+
+    # Every entry: per-map fields and the exact-M30 series.
+    for entry in entries:
+        played_maps = [
+            a.map_name
+            for a in entry.result.predicted_veto
+            if a.action in ("pick", "decider")
+        ]
+        assert [pm.map_name for pm in entry.result.per_map] == played_maps
+        for pm in entry.result.per_map:
+            # The stub map model is called directly for this map.
+            assert pm.probabilities == _stub_map_model_fn(
+                "A", "B", pm.map_name, as_of_date, matches_df, maps_df
+            )
+            assert sum(pm.probabilities) == pytest.approx(1.0)
+            assert pm.interval_low is None
+            assert pm.interval_high is None
+            assert pm.n_games_backing == pred._n_games_backing_for_map(
+                "A", "B", pm.map_name, as_of_date, matches_df, maps_df
+            )
+        # The exact-M30 series over this veto's collapsed per-map win
+        # probabilities ((0.6, 0.1, 0.1, 0.2) -> A-win 0.7 per played
+        # map under the constant stub map model).
+        expected_series = series_paths.series_probabilities_in_order(
+            [0.7] * len(played_maps), 3
+        )
+        assert entry.result.series.probabilities == pytest.approx(
+            expected_series
+        )
+        assert sum(entry.result.series.probabilities) == pytest.approx(1.0)
+        assert entry.result.series.outcome_order == series_paths.series_outcome_order(3)
+        assert entry.result.series.best_of == 3
+
+    # Cross-check the ranking against an independent enumeration +
+    # stable descending sort: entry i's probability and full action
+    # tuple must match ranked sequence i with probability dropped.
+    enumerated = pred.ancestral_veto_sampler.enumerate_veto_sequences(
+        "A", "B", "Bo3", as_of_date, matches_df, maps_df,
+        {"ban": _top_two_step_stub, "pick": _top_two_step_stub},
+        map_pool=_STUB_POOL,
+    )
+    assert len(enumerated) == 5040
+    ranked = sorted(
+        enumerated,
+        key=lambda seq: seq.sequence_probability,
+        reverse=True,
+    )
+    for entry, seq in zip(entries, ranked[:10]):
+        assert entry.veto_probability == seq.sequence_probability
+        actual = tuple(
+            (a.step_index, a.team, a.action, a.map_name)
+            for a in entry.result.predicted_veto
+        )
+        expected = tuple(
+            (a.step_index, a.team, a.action, a.map_name)
+            for a in seq.actions
+        )
+        assert actual == expected
+
+    # The whole listing round-trips through json.dumps.
+    json.dumps([e.to_dict() for e in entries])
+
+
+def test_top_vetos_n_edge_cases(tmp_path, stub_top_vetos_wiring):
+    # F7: n=1 returns exactly the single best entry; n larger than the
+    # 5,040-sequence total silently returns all 5,040 (documented, not
+    # an error).
+    top_vetos = pred.make_top_vetos_fn("data", "v1")
+    one = top_vetos("A", "B", "Bo3", _STUB_POOL, "2026-01-01T00:00:00", n=1)
+    assert len(one) == 1
+    assert one[0].veto_probability == pytest.approx(0.6**6)
+    all_sequences = top_vetos(
+        "A", "B", "Bo3", _STUB_POOL, "2026-01-01T00:00:00", n=5041
+    )
+    assert len(all_sequences) == 5040
+
+
+def test_top_vetos_rejects_n_lt_1_before_any_enumeration(
+    tmp_path, monkeypatch
+):
+    # F7's fail-fast clause: n=0 and n=-1 raise ValueError before any
+    # enumeration work happens — asserted via a call-counting stub on
+    # the enumerate entry point, which is never invoked for the n<1
+    # cases (the factory itself is otherwise fully stubbed, so a
+    # positive-n call would reach it).
+    _install_top_vetos_wiring(monkeypatch)
+    calls = {"count": 0}
+
+    def counting_enumerate(*args, **kwargs):
+        """Count invocations and fail if reached (n<1 must never call it).
+
+        Args:
+            *args: Positional arguments (unused).
+            **kwargs: Keyword arguments (unused).
+
+        Returns:
+            Nothing (raises instead).
+
+        Raises:
+            AssertionError: Always — reaching the enumerator means the
+                n<1 validation failed to run first.
+        """
+        calls["count"] += 1
+        raise AssertionError(
+            "enumerate_veto_sequences must not be called for n < 1"
+        )
+
+    monkeypatch.setattr(
+        pred.ancestral_veto_sampler,
+        "enumerate_veto_sequences",
+        counting_enumerate,
+    )
+    top_vetos = pred.make_top_vetos_fn("data", "v1")
+    for bad_n in (0, -1):
+        with pytest.raises(ValueError, match="n must be a positive integer"):
+            top_vetos(
+                "A", "B", "Bo3", _STUB_POOL, "2026-01-01T00:00:00", n=bad_n
+            )
+    assert calls["count"] == 0
+
+
+def test_top_vetos_intervals_from_bootstrap_models(tmp_path, monkeypatch):
+    # D4 parity on the top_vetos path: with replicate models supplied
+    # to make_top_vetos_fn, every per-map interval_low/interval_high of
+    # the returned entries is the per-category percentile band over the
+    # hand-known tilted replicate vectors (landed by the duplicated
+    # interval body inside top_vetos), while the point probabilities
+    # stay the temperature-scaled stub vector.
+    tilts = [0.0, 0.02, 0.04]
+    models = [_synthetic_ordinal_model() for _ in tilts]
+    tilts_by_id = {id(model): d for model, d in zip(models, tilts)}
+    monkeypatch.setattr(
+        pred.ordinal_logit,
+        "make_model_fn",
+        _make_model_fn_with_tilts(tilts_by_id),
+    )
+    lo, hi = _expected_interval_bands(tilts, ci_level=0.9)
+    _install_top_vetos_wiring(monkeypatch)
+    top_vetos = pred.make_top_vetos_fn(
+        "data", "v1", ci_level=0.9, bootstrap_models=models
+    )
+    entries = top_vetos("A", "B", "Bo3", _STUB_POOL, "2026-01-01T00:00:00", n=1)
+    assert len(entries) == 1
+    assert len(entries[0].result.per_map) == 3
+    for pm in entries[0].result.per_map:
+        assert pm.probabilities == (0.6, 0.1, 0.1, 0.2)
+        assert pm.interval_low == pytest.approx(lo)
+        assert pm.interval_high == pytest.approx(hi)
+        for low, high in zip(pm.interval_low, pm.interval_high):
+            assert low <= high
+
+
+def test_top_vetos_intervals_none_without_bootstrap_models(
+    tmp_path, stub_top_vetos_wiring
+):
+    # D4 negative path on top_vetos: without bootstrap_models every
+    # per-map interval field is None while the point probabilities and
+    # backing are still populated.
+    top_vetos = pred.make_top_vetos_fn("data", "v1")
+    entries = top_vetos("A", "B", "Bo3", _STUB_POOL, "2026-01-01T00:00:00", n=3)
+    assert len(entries) == 3
+    for entry in entries:
+        for pm in entry.result.per_map:
+            assert pm.interval_low is None
+            assert pm.interval_high is None
+            assert pm.probabilities == (0.6, 0.1, 0.1, 0.2)
+
+
+# --------------------------------------------------------------------------
 # plan#9b: make_predictor factory contract
 # --------------------------------------------------------------------------
 
@@ -1969,3 +2322,71 @@ def test_stream_mode_errors_propagate_uncaught(
         pred.main(["--stream"])
     assert factory_calls["count"] == 1
 
+
+
+# --------------------------------------------------------------------------
+# plan#10: real-v1 top_vetos smoke test (slow + skip-guarded)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    not _real_v1_available(),
+    reason="real v1 tables/artifacts not present",
+)
+def test_real_v1_top_vetos_smoke():
+    # A tiny real-v1 run (n=3, no bootstrap) against the real fitted
+    # ban/pick models and tables for one mid-season Bo3 match: the
+    # exact 5,040-sequence enumeration stays tractable (the F2
+    # memoisation caps real per-step predictor calls at 120), the
+    # returned three entries are finite, sorted descending by
+    # veto_probability, every result carries veto_sensitivity None and
+    # a Bo3 series summing to 1, and the whole listing is
+    # json.dumps-serializable. Wall-clock is measured (the real check
+    # that F2's memoisation works — a non-memoised walk would take
+    # minutes here) and reported in the BUILD status.md note.
+    import time
+
+    matches_df = pred.evaluate.load_matches_table(Path("data"), "v1")
+    row = matches_df[
+        (matches_df["best_of"] == "Bo3")
+        & (matches_df["date"] >= "2026-07-01")
+    ].iloc[0]
+    top_vetos = pred.make_top_vetos_fn("data", "v1", ci_level=0.9)
+    start = time.monotonic()
+    entries = top_vetos(
+        str(row["team1_id"]),
+        str(row["team2_id"]),
+        "Bo3",
+        None,
+        row["date"],
+        n=3,
+    )
+    elapsed = time.monotonic() - start
+
+    assert len(entries) == 3
+    probabilities = [e.veto_probability for e in entries]
+    assert probabilities == sorted(probabilities, reverse=True)
+    for entry in entries:
+        assert 0.0 <= entry.veto_probability <= 1.0
+        result = entry.result
+        assert len(result.predicted_veto) == 7
+        assert [a.action for a in result.predicted_veto] == [
+            "ban", "ban", "pick", "pick", "ban", "ban", "decider"
+        ]
+        assert len(result.per_map) == 3
+        for pm in result.per_map:
+            assert len(pm.probabilities) == 4
+            assert sum(pm.probabilities) == pytest.approx(1.0)
+            assert all(np.isfinite(p) for p in pm.probabilities)
+            assert pm.interval_low is None
+            assert pm.interval_high is None
+            assert pm.n_games_backing >= 0
+        assert result.veto_sensitivity is None
+        assert result.series.best_of == 3
+        assert result.series.outcome_order == series_paths.series_outcome_order(3)
+        assert len(result.series.probabilities) == 4
+        assert sum(result.series.probabilities) == pytest.approx(1.0)
+    # The full listing round-trips through json.dumps.
+    json.dumps([e.to_dict() for e in entries])
+    assert elapsed > 0.0
