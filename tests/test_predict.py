@@ -45,6 +45,7 @@ from drivers.predict import (
     PerMapPrediction,
     PredictionResult,
     Predictor,
+    RankedVetoPrediction,
     SeriesPrediction,
     VetoSensitivity,
 )
@@ -836,6 +837,63 @@ def test_result_dataclasses_to_dict_json_serializable():
     assert len(result_dict["per_map"]) == 2
     assert result_dict["series"]["best_of"] == 3
     assert result_dict["veto_sensitivity"]["mean_band_width"] == 0.075
+
+    # The M39.2 path (F5): a PredictionResult with a None
+    # veto_sensitivity (a single fixed veto has no Monte Carlo spread)
+    # serializes veto_sensitivity as null, not as a fabricated
+    # zero-width band — and the whole dict still round-trips through
+    # json.dumps.
+    no_spread_result = PredictionResult(
+        predicted_veto=_STUB_VETO_ACTIONS,
+        per_map=(per_map,),
+        series=series,
+        veto_sensitivity=None,
+    )
+    no_spread_dict = no_spread_result.to_dict()
+    assert no_spread_dict["veto_sensitivity"] is None
+    assert json.loads(json.dumps(no_spread_dict))["veto_sensitivity"] is None
+
+
+# --------------------------------------------------------------------------
+# plan#6: M39.2 RankedVetoPrediction wrapper (F4) and the F5 None widening
+# --------------------------------------------------------------------------
+
+
+def test_ranked_veto_prediction_to_dict_json_serializable():
+    # F4: RankedVetoPrediction nests its inner PredictionResult's
+    # to_dict under "result" beside the flat "veto_probability" float;
+    # the composed dict round-trips through json.dumps.
+    per_map = PerMapPrediction(
+        map_name="Bind",
+        probabilities=(0.6, 0.1, 0.1, 0.2),
+        interval_low=None,
+        interval_high=None,
+        n_games_backing=7,
+    )
+    result = PredictionResult(
+        predicted_veto=_STUB_VETO_ACTIONS,
+        per_map=(per_map,),
+        series=SeriesPrediction(
+            probabilities=(0.5, 0.3, 0.1, 0.1),
+            outcome_order=series_paths.series_outcome_order(3),
+            best_of=3,
+        ),
+        veto_sensitivity=None,
+    )
+    entry = RankedVetoPrediction(veto_probability=0.25, result=result)
+    entry_dict = entry.to_dict()
+    assert set(entry_dict) == {"veto_probability", "result"}
+    assert entry_dict["veto_probability"] == 0.25
+    assert entry_dict["result"]["predicted_veto"][0] == {
+        "step_index": 0,
+        "team": "A",
+        "action": "ban",
+        "map_name": "Haven",
+    }
+    assert entry_dict["result"]["veto_sensitivity"] is None
+    round_tripped = json.loads(json.dumps(entry_dict))
+    assert round_tripped["veto_probability"] == 0.25
+    assert round_tripped["result"]["per_map"][0]["map_name"] == "Bind"
 
 
 # --------------------------------------------------------------------------
