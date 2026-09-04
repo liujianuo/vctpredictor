@@ -1358,51 +1358,96 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run one predict() call end to end and print the JSON result.
+    """Run one predict() call (or a --stream query stream) end to end.
 
     Logging is configured first so the summary line is visible from the
-    CLI. The ``--map-pool`` string (comma-separated, each part
-    whitespace-stripped) is parsed into a tuple — ``None`` when the
-    flag is absent (D8: the era pool for ``--as-of-date`` is resolved
-    from config), and a malformed pool (an empty part, e.g. a leading/
-    trailing/double comma) raises ``ValueError`` rather than silently
-    changing the pool size. The predictor is built via
-    :func:`make_predictor` — no bootstrap models (``bootstrap_models``
-    is not a CLI flag; intervals are ``None`` from the CLI per D4) —
-    and the 5-argument closure is called once with the query
-    arguments. The full result is printed to stdout as
-    ``json.dumps(result.to_dict(), indent=2, sort_keys=True)`` (the
-    repo-wide artifact formatting), and a one-line summary is logged:
-    the two teams, the series length, the as-of date, the number of
-    played maps, the per-map backing counts, the A-side series win
-    probability (the summed probability of the scorelines with
-    ``a_wins > b_wins``) and the mean veto-sensitivity band width.
+    CLI. Branches on ``args.stream`` (E2):
+
+    - **One-shot mode** (``--stream`` absent — today's behaviour,
+      unchanged): the ``--map-pool`` string (comma-separated, each part
+      whitespace-stripped) is parsed into a tuple — ``None`` when the
+      flag is absent (D8: the era pool for ``--as-of-date`` is resolved
+      from config), and a malformed pool (an empty part, e.g. a leading/
+      trailing/double comma) raises ``ValueError`` rather than silently
+      changing the pool size. The predictor is built via
+      :func:`make_predictor` **directly, not through :class:`Predictor`**
+      (E6 — a one-shot process only ever calls ``predict`` once, so
+      there is nothing to amortise) — no bootstrap models
+      (``bootstrap_models`` is not a CLI flag; intervals are ``None``
+      from the CLI per D4) — and the 5-argument closure is called once
+      with the query arguments. The full result is printed to stdout as
+      ``json.dumps(result.to_dict(), indent=2, sort_keys=True)`` (the
+      repo-wide artifact formatting), and a one-line summary is logged:
+      the two teams, the series length, the as-of date, the number of
+      played maps, the per-map backing counts, the A-side series win
+      probability (the summed probability of the scorelines with
+      ``a_wins > b_wins``) and the mean veto-sensitivity band width.
+
+    - **Stream mode** (``--stream`` given; E4-E6): one
+      :class:`Predictor` is built once (E1 — the materialised tables
+      and fitted artifacts load exactly once for the whole session)
+      with the CLI's ``n_samples``/``seed``/``ci_level`` fixed for the
+      whole stream (no per-query knob overrides — one session, one set
+      of knobs, many queries), and one INFO line is logged once the
+      predictor is ready (version/knobs; no per-query team names since
+      none are known yet). Then each non-blank stdin line is parsed as
+      one JSON query object ``{"team_a": str, "team_b": str, "best_of":
+      str, "as_of_date": str, "map_pool": [str, ...] | null}`` — blank
+      / whitespace-only lines are skipped silently (standard JSONL
+      convention), extra keys are ignored, a present ``"map_pool"``
+      JSON array is converted to a ``tuple`` and an absent/``null``
+      ``"map_pool"`` means ``None`` (D8: the era pool resolves from
+      config). Each query is answered via ``Predictor.predict`` and the
+      result prints as one compact JSON line
+      (``json.dumps(result.to_dict(), sort_keys=True)``, no
+      ``indent=`` — an indented multi-line object would break the
+      one-line-per-result JSONL contract — with ``flush=True`` so a
+      piped consumer sees results incrementally). Returns ``0`` when
+      stdin reaches EOF.
+
+    Stream-mode errors propagate uncaught (E5): a malformed JSON line
+    (``json.JSONDecodeError``), a query object missing a required key
+    (``KeyError``), or any exception ``Predictor.predict`` itself
+    raises aborts the stream — lines already printed stay on stdout,
+    nothing after the failing line is processed. No per-line
+    ``try``/``except``-and-continue.
 
     Args:
         argv: The argument list to parse (see :func:`parse_args`);
             ``None`` means ``sys.argv[1:]``.
 
     Returns:
-        ``0`` always. There is no nonzero exit-code path: the hard
-            failures are raises that propagate to the caller, matching
-            the rest of ``drivers/``'s doctrine.
+        ``0`` always — after the one-shot result prints, or after the
+            ``--stream`` loop reaches stdin EOF. There is no nonzero
+            exit-code path: the hard failures are raises that propagate
+            to the caller, matching the rest of ``drivers/``'s
+            doctrine.
 
     Raises:
         FileNotFoundError: If any of the required tables/artifacts does
             not exist for the requested version (from
-            :func:`make_predictor`) — propagated unchanged as the
-            "run the prerequisite first" signal.
-        ValueError: If ``--map-pool`` is malformed (an empty part), if
-            ``--ci-level`` is out of ``(0, 1)`` or ``--n-samples`` is
-            non-positive (from :func:`make_predictor`), or if the
-            simulator/sampler rejects any query input (a non-7 or
-            duplicate ``--map-pool``, an unsupported ``--best-of`` —
-            though argparse ``choices=`` already constrains it — a
-            bad ``--as-of-date``, degenerate M31 samples) — all
-            propagated from the pipeline.
-        KeyError / TypeError / ConfigError: Propagated from the
-            pipeline (see :func:`make_predictor` / the ``predict``
-            closure docstrings).
+            :func:`make_predictor` in one-shot mode or
+            :class:`Predictor` construction in stream mode) —
+            propagated unchanged as the "run the prerequisite first"
+            signal.
+        ValueError: One-shot mode — a malformed ``--map-pool`` (an
+            empty comma-separated part), an out-of-``(0, 1)``
+            ``--ci-level`` or non-positive ``--n-samples`` (from
+            :func:`make_predictor`), or any simulator/sampler rejection
+            of the query input (a non-7 or duplicate ``--map-pool``, an
+            unsupported ``--best-of`` — though argparse ``choices=``
+            already constrains it — a bad ``--as-of-date``, degenerate
+            M31 samples). Stream mode — the same pipeline rejections
+            propagated per query (E5), plus
+            :class:`json.JSONDecodeError` when a stdin line is not
+            valid JSON.
+        KeyError: Stream mode — a query object missing a required key
+            (``"team_a"``/``"team_b"``/``"best_of"``/``"as_of_date"``),
+            propagated uncaught (E5). Also propagated from the pipeline
+            in both modes (see the ``predict`` closure docstring).
+        TypeError / ConfigError: Propagated from the pipeline (see
+            :func:`make_predictor` / the ``predict`` closure
+            docstrings).
         OSError / TypeError: If the JSON cannot be printed (propagated
             from ``json.dumps``).
     """
@@ -1412,56 +1457,100 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    if args.map_pool is None:
-        map_pool = None
-    else:
-        parts = [part.strip() for part in args.map_pool.split(",")]
-        if any(part == "" for part in parts):
-            raise ValueError(
-                f"--map-pool must be a comma-separated list of map "
-                f"names with no empty entries, got {args.map_pool!r}"
-            )
-        map_pool = tuple(parts)
+    if not args.stream:
+        if args.map_pool is None:
+            map_pool = None
+        else:
+            parts = [part.strip() for part in args.map_pool.split(",")]
+            if any(part == "" for part in parts):
+                raise ValueError(
+                    f"--map-pool must be a comma-separated list of map "
+                    f"names with no empty entries, got {args.map_pool!r}"
+                )
+            map_pool = tuple(parts)
 
-    predictor = make_predictor(
+        predictor = make_predictor(
+            Path(args.output_dir),
+            args.version,
+            n_samples=args.n_samples,
+            seed=args.seed,
+            ci_level=args.ci_level,
+        )
+        result = predictor(
+            args.team_a,
+            args.team_b,
+            args.best_of,
+            map_pool,
+            args.as_of_date,
+        )
+
+        print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+
+        a_side_series_win = sum(
+            probability
+            for probability, (a_wins, b_wins) in zip(
+                result.series.probabilities, result.series.outcome_order
+            )
+            if a_wins > b_wins
+        )
+        logger.info(
+            "predict %s vs %s (%s) as of %s on %d played map(s) "
+            "(%s/%s, n_samples=%d seed=%d ci_level=%.2f): "
+            "per-map n_games_backing=%s, P(A wins series)=%.4f, "
+            "mean veto-sensitivity band width %.6f",
+            args.team_a,
+            args.team_b,
+            args.best_of,
+            args.as_of_date,
+            len(result.per_map),
+            Path(args.output_dir),
+            args.version,
+            args.n_samples,
+            args.seed,
+            args.ci_level,
+            [entry.n_games_backing for entry in result.per_map],
+            a_side_series_win,
+            result.veto_sensitivity.mean_band_width,
+        )
+        return 0
+
+    # E4-E6: the persistent JSONL query-stream mode. One Predictor for
+    # the whole session (E1 — load once, reuse for every query), no
+    # per-query knob overrides.
+    predictor = Predictor(
         Path(args.output_dir),
         args.version,
         n_samples=args.n_samples,
         seed=args.seed,
         ci_level=args.ci_level,
     )
-    result = predictor(
-        args.team_a, args.team_b, args.best_of, map_pool, args.as_of_date
-    )
-
-    print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
-
-    a_side_series_win = sum(
-        probability
-        for probability, (a_wins, b_wins) in zip(
-            result.series.probabilities, result.series.outcome_order
-        )
-        if a_wins > b_wins
-    )
     logger.info(
-        "predict %s vs %s (%s) as of %s on %d played map(s) "
-        "(%s/%s, n_samples=%d seed=%d ci_level=%.2f): "
-        "per-map n_games_backing=%s, P(A wins series)=%.4f, "
-        "mean veto-sensitivity band width %.6f",
-        args.team_a,
-        args.team_b,
-        args.best_of,
-        args.as_of_date,
-        len(result.per_map),
+        "predict stream session ready (%s/%s, n_samples=%d seed=%d "
+        "ci_level=%.2f); answering one JSON query object per stdin "
+        "line",
         Path(args.output_dir),
         args.version,
         args.n_samples,
         args.seed,
         args.ci_level,
-        [entry.n_games_backing for entry in result.per_map],
-        a_side_series_win,
-        result.veto_sensitivity.mean_band_width,
     )
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        if not line:
+            continue
+        query = json.loads(line)
+        if query.get("map_pool") is None:
+            map_pool = None
+        else:
+            map_pool = tuple(query["map_pool"])
+        result = predictor.predict(
+            query["team_a"],
+            query["team_b"],
+            query["best_of"],
+            map_pool,
+            query["as_of_date"],
+        )
+        print(json.dumps(result.to_dict(), sort_keys=True), flush=True)
     return 0
 
 
