@@ -9,7 +9,12 @@ stochastic sibling of ``models/greedy_veto_simulator.py``'s
 :func:`simulate_veto`: structurally the same walk over the same fixed
 action sequences and the same 7-map pool, but at each ``ban``/``pick``
 step it draws from a caller-supplied per-step probability distribution
-instead of taking a deterministic argmin/argmax.
+instead of taking a deterministic argmin/argmax. It also ships an exact
+sibling, :func:`enumerate_veto_sequences` (M39.2): instead of drawing,
+it exhaustively enumerates every possible full sequence
+(``7! = 5,040`` over a 7-map pool) with the same per-step distributions
+and a memoised ``(step_index, remaining-set)`` cache (decisions 9-10),
+for deterministic top-veto ranking by the caller.
 
 Design decisions (recorded here, do not re-derive in later
 milestones):
@@ -167,10 +172,63 @@ milestones):
    turn order, it inherits the same assumption for the same reason
    (every real Bo3/Bo5 veto note observed to date matches strict
    alternation except one documented Bo5 outlier).
+9. **Exact enumeration is the deterministic sibling of the sampler
+   (M39.2), colocated here, not a new module or dataclass set.**
+   :func:`enumerate_veto_sequences` walks the *same* fixed action
+   sequences over the *same* 7-map pool with the *same*
+   ``predictor_fn_by_action`` contract as :func:`sample_veto_sequences`,
+   but instead of drawing one map per step via ``rng.choice`` it
+   exhaustively enumerates every possible full sequence —
+   ``itertools.permutations(pool, k)`` over the ``k`` non-decider
+   steps, exactly ``7! = 5,040`` sequences for every supported
+   ``best_of`` — recording per sequence the product of the
+   probabilities its fixed map choices receive under the memoised step
+   distributions (decision 10). It reuses :data:`ACTION_SEQUENCES`,
+   :data:`VetoStepPredictorFn`, :func:`_validate_step_distribution`,
+   :class:`SampledVetoAction` and :class:`SampledVetoSequence`
+   unchanged — the existing dataclass shapes (``step_index, team,
+   action, map_name, probability`` / ``team_a_id, team_b_id, best_of,
+   date, actions, sequence_probability``) fit an enumerated (not
+   sampled) sequence exactly, so **no new module-level constants or
+   dataclasses are added**. Rationale for colocating rather than a
+   fourth module: a new module would need yet another independent
+   duplicate of :data:`ACTION_SEQUENCES` / :data:`VetoStepPredictorFn`
+   (there are already three: ``greedy_veto_simulator``, this module,
+   and the parser triplicate in ``flat_series_baseline`` /
+   ``series_evaluation`` / ``veto_marginalized_series`` — see decision
+   6's boundary reasoning); the module that already owns these
+   constants is the natural home. Both functions are Stage-1
+   veto-tree walkers over the identical fixed action-sequence
+   structure, differing only in stochastic-draw-with-an-``rng`` vs
+   exhaustive-permutation — a natural sibling, not a scope violation
+   of this module's "ancestral sampler" framing.
+10. **Memoisation is mandatory, not a nice-to-have (M39.2).** A naive
+    walk would recompute each step's predictor distribution once per
+    ``(sequence, step)`` pair — ``5,040 × 6 = 30,240`` predictor
+    calls. But a step's distribution depends only on ``(step_index,
+    remaining-maps set)`` — not on the order the removed maps were
+    removed in — so the same state recurs across the 5,040
+    permutations; the distinct-state count is
+    ``sum(comb(7, d) for d in range(6)) = 1+7+21+35+35+21 = 120``.
+    :func:`enumerate_veto_sequences` therefore memoises each step's
+    validated distribution in a **call-local** dict keyed on
+    ``(step_index, frozenset(remaining))`` — a local cache
+    deliberately, not a module-global, so stale cross-call caching can
+    never leak or serve a later call with a different pool/date —
+    cutting real predictor calls from 30,240 to at most 120 per call,
+    a ~250× reduction. This is a required correctness-preserving
+    performance step per the roadmap's test-suite performance
+    standard (skip it and a real-data enumeration takes minutes, not
+    seconds), not an optional optimisation. Output is **raw and
+    unranked**: results come back in ``itertools.permutations``
+    enumeration order, and sorting/grouping by
+    ``sequence_probability`` is the caller's job (M39.2's driver),
+    mirroring the sampler's raw-samples convention (decision 3).
 """
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -677,3 +735,298 @@ def sample_veto_sequences(
         )
 
     return samples
+
+
+def enumerate_veto_sequences(
+    team_a_id: str,
+    team_b_id: str,
+    best_of: str,
+    date: str,
+    matches_df: pd.DataFrame,
+    maps_df: pd.DataFrame,
+    predictor_fn_by_action: dict[str, VetoStepPredictorFn],
+    map_pool=None,
+) -> list[SampledVetoSequence]:
+    """Exhaustively enumerate every possible full veto sequence (M39.2).
+
+    The deterministic sibling of :func:`sample_veto_sequences`
+    (decision 9): instead of drawing one map per step via an ``rng``,
+    it enumerates every possible full walk of the fixed action sequence
+    for ``best_of`` over the resolved 7-map pool — for a 7-map pool
+    with six non-decider steps and one forced decider that is exactly
+    ``itertools.permutations(pool, 6)``, i.e. ``7! = 5,040`` distinct
+    sequences for every supported ``best_of``. Each sequence carries
+    its exact ``sequence_probability``: the product of the per-step
+    probabilities its fixed map choices receive under the step
+    distributions (the decider's ``1.0`` excluded per decision 3). Turn
+    order, pool resolution, predictor validation and the forced decider
+    are inherited unchanged from :func:`sample_veto_sequences` —
+    alternating strictly by step-index parity (even steps act as
+    ``team_a_id``, odd as ``team_b_id``), and the last remaining map is
+    emitted deterministically as the decider without consulting any
+    predictor.
+
+    The enumeration cost stays tractable only because per-step
+    distributions are memoised within the call (decision 10): a step's
+    distribution depends only on ``(step_index, remaining-maps set)``,
+    of which there are exactly ``sum(comb(7, d) for d in range(6)) =
+    120`` distinct states across the whole 5,040-sequence walk, so the
+    caller-supplied predictor is invoked at most 120 times (a local
+    cache per call — never a module-global, which would leak stale
+    distributions across calls with different pools/dates). Output is
+    raw and unranked in ``itertools.permutations`` enumeration order —
+    sorting/grouping by ``sequence_probability`` is the caller's job
+    (decision 10, mirroring decision 3's raw-samples convention).
+
+    Args:
+        team_a_id: The stable id of the team acting on even steps
+            ("team A"); whichever team the caller passes first.
+        team_b_id: The stable id of the team acting on odd steps
+            ("team B").
+        best_of: The veto format; must be a key of
+            :data:`ACTION_SEQUENCES` (``"Bo1"``, ``"Bo3"`` or
+            ``"Bo5"``).
+        date: The single as-of cutoff passed through to the predictors
+            (e.g. the simulated match's own ISO-8601 timestamp; every
+            predictor is expected to honor the strict ``<`` boundary
+            against it). When ``map_pool`` is ``None``, the cutoff's
+            UTC calendar date also selects the era whose pool is used.
+        matches_df: The materialised ``matches`` table, passed through
+            to every predictor call.
+        maps_df: The materialised ``maps`` table, passed through to
+            every predictor call.
+        predictor_fn_by_action: A dict mapping each non-decider action
+            actually present in ``ACTION_SEQUENCES[best_of]`` to a
+            :data:`VetoStepPredictorFn`-shaped callable. A ``Bo3``/
+            ``Bo5`` sequence needs both ``"ban"`` and ``"pick"`` keys;
+            a ``Bo1`` sequence needs only ``"ban"``. An action-agnostic
+            arm (the M25 greedy step model, the frequency baseline) is
+            supplied under both keys — decision 1's explicit wiring
+            convention. Missing keys raise ``ValueError`` before any
+            enumeration.
+        map_pool: The pool to veto over, as an iterable of map names;
+            ``None`` (the default) resolves the pool from
+            ``config.json`` via ``utils.config.Config.era_as_of`` on
+            ``date``'s calendar date. Every entry (caller-supplied or
+            from the config) is normalized via
+            ``utils.config.normalize_map_name``; duplicates after
+            normalization raise ``ValueError`` (they would collapse in
+            the ``remaining`` set and mis-sync the walk), as would a
+            pool whose size mismatches ``len(ACTION_SEQUENCES[best_of])``.
+
+    Returns:
+        A list of exactly ``len(ACTION_SEQUENCES[best_of])!`` (5,040
+        for every supported ``best_of`` over a 7-map pool)
+        :class:`SampledVetoSequence` objects, each a complete
+        self-contained walk (decider included) with its own exact
+        ``sequence_probability``, in raw ``itertools.permutations``
+        enumeration order — unranked; sorting/grouping is the caller's
+        job. Deterministic: identical inputs reproduce an identical
+        list byte for byte (no RNG anywhere on this path).
+
+    Raises:
+        ValueError: If ``best_of`` is not a key of
+            :data:`ACTION_SEQUENCES` (the message names the invalid
+            value); if ``predictor_fn_by_action`` lacks a key for a
+            non-decider action in ``ACTION_SEQUENCES[best_of]``
+            (naming the missing action); if ``len(map_pool) !=
+            len(ACTION_SEQUENCES[best_of])`` after normalization; if
+            the normalized pool contains duplicates; or if any
+            predictor's returned vector fails validation (propagated
+            from :func:`_validate_step_distribution`, naming the
+            step/arm).
+        ConfigError: If ``map_pool`` is ``None`` and ``config.json``
+            cannot be loaded/validated, if no configured era covers
+            ``date``'s calendar date, or if a map name (caller-supplied
+            pool entry) is not a string (from
+            ``utils.config.load_config`` /
+            ``utils.config.Config.era_as_of`` /
+            ``utils.config.normalize_map_name``, propagated).
+        TypeError: If ``date`` is list-like (propagated from
+            ``utils.asof.parse_query_date``); or if a predictor
+            callable itself raises ``TypeError`` (propagated verbatim —
+            the enumerator does not catch misbehaving predictors, it
+            only validates their return values).
+        KeyError: If ``predictor_fn_by_action`` is a ``dict``-like
+            whose ``[]`` access raises (propagated — after the
+            presence check every required key is present, so this only
+            surfaces for a non-``dict`` mapping with odd lookup
+            semantics).
+    """
+    sequence = ACTION_SEQUENCES.get(best_of)
+    if sequence is None:
+        raise ValueError(
+            f"best_of {best_of!r} is not a supported veto format; "
+            f"expected one of {sorted(ACTION_SEQUENCES)}"
+        )
+
+    if map_pool is None:
+        # Resolve the active era's pool for the query date's calendar
+        # date, mirroring sample_veto_sequences's resolution exactly
+        # (duplicated logic per decision 6, not imported). The date is
+        # validated here with the same parse the predictors will use.
+        query_ts = asof.parse_query_date(date)
+        pool = list(config.load_config().era_as_of(query_ts.date()).map_pool)
+    else:
+        pool = [config.normalize_map_name(name) for name in map_pool]
+
+    if len(pool) != len(sequence):
+        raise ValueError(
+            f"map_pool has {len(pool)} map(s) but a {best_of} veto "
+            f"needs {len(sequence)}; the enumerator only supports the "
+            "7-map-pool sequences in ACTION_SEQUENCES"
+        )
+    if len(set(pool)) != len(pool):
+        duplicates = sorted(
+            name for name in set(pool) if pool.count(name) > 1
+        )
+        raise ValueError(
+            f"map_pool contains duplicate map(s) after normalization: "
+            f"{duplicates}; duplicates would collapse in the remaining "
+            "set and desync the veto walk"
+        )
+
+    required_actions = {action for action in sequence if action != "decider"}
+    missing = sorted(required_actions - set(predictor_fn_by_action))
+    if missing:
+        raise ValueError(
+            f"predictor_fn_by_action is missing a predictor for the "
+            f"required veto action(s) {missing} of a {best_of} veto; "
+            "every non-decider action in the sequence must have a key "
+            "(the decider step is forced and needs no predictor)"
+        )
+
+    # The steps that actually consult a predictor, and the decider's
+    # position. Every supported ACTION_SEQUENCES entry ends with its
+    # single "decider" step and has exactly 6 non-decider steps, so
+    # k == 6 and len(results) == 7P6 == 5040 for every best_of.
+    non_decider_steps = [
+        i for i, action in enumerate(sequence) if action != "decider"
+    ]
+    decider_step_index = len(sequence) - 1
+    k = len(non_decider_steps)
+
+    # Decision 10's call-local memo: one validated distribution per
+    # distinct (step_index, remaining-set) state — 120 states total
+    # across the whole enumeration — never a module-global.
+    distribution_cache: dict[tuple[int, frozenset], dict[str, float]] = {}
+
+    def _distribution_for(
+        step_index: int, remaining: frozenset
+    ) -> dict[str, float]:
+        """Return (and cache) one step's validated distribution.
+
+        Computes the acting team's per-step probability distribution
+        over the given remaining maps by invoking the caller-supplied
+        predictor for ``sequence[step_index]`` and validating/
+        renormalizing its return via
+        :func:`_validate_step_distribution`, keyed into the enclosing
+        call's local :data:`distribution_cache` on ``(step_index,
+        remaining)``. On a cache hit the stored dict is returned
+        without a predictor call (decision 10's memoisation — the
+        whole point of the 120-state bound).
+
+        Args:
+            step_index: The veto-sequence position whose distribution
+                is needed (must be a non-decider step).
+            remaining: The ``frozenset`` of maps still in play at this
+                step; the key half of the memo.
+
+        Returns:
+            A ``dict`` mapping each remaining map name to its validated
+            (renormalized) probability under the step's distribution,
+            summing to 1 within float rounding.
+
+        Raises:
+            ValueError: If the predictor's returned vector fails
+                validation (propagated from
+                :func:`_validate_step_distribution`, naming the
+                step/arm).
+            KeyError: If ``sequence[step_index]``'s action has no
+                ``predictor_fn_by_action`` key (propagated — the
+                presence check at the top of this function already
+                guarantees every required key exists).
+            TypeError: Propagated verbatim from a misbehaving
+                predictor callable.
+        """
+        key = (step_index, remaining)
+        cached = distribution_cache.get(key)
+        if cached is not None:
+            return cached
+        action = sequence[step_index]
+        if step_index % 2 == 0:
+            acting_id = team_a_id
+        else:
+            acting_id = team_b_id
+        sorted_maps = sorted(remaining)
+        probs = predictor_fn_by_action[action](
+            acting_id,
+            action,
+            sorted_maps,
+            date,
+            matches_df,
+            maps_df,
+        )
+        context = (
+            f"{best_of} veto step {step_index} ({action}) by team "
+            f"{acting_id!r} at date {date!r} with "
+            f"{len(sorted_maps)} remaining map(s)"
+        )
+        validated = _validate_step_distribution(probs, len(sorted_maps), context)
+        dist = dict(zip(sorted_maps, (float(v) for v in validated)))
+        distribution_cache[key] = dist
+        return dist
+
+    results: list[SampledVetoSequence] = []
+    for perm in itertools.permutations(pool, k):
+        remaining = set(pool)
+        actions: list[SampledVetoAction] = []
+        sequence_probability = 1.0
+        for step_index, chosen_map in zip(non_decider_steps, perm):
+            action = sequence[step_index]
+            if step_index % 2 == 0:
+                acting_id = team_a_id
+            else:
+                acting_id = team_b_id
+            dist = _distribution_for(step_index, frozenset(remaining))
+            probability = dist[chosen_map]
+            actions.append(
+                SampledVetoAction(
+                    step_index=step_index,
+                    team=acting_id,
+                    action=action,
+                    map_name=chosen_map,
+                    probability=probability,
+                )
+            )
+            sequence_probability *= probability
+            remaining.discard(chosen_map)
+        # Exactly one map is left after the k == 6 choosing steps (the
+        # pool is validated to be a 7-map set above); it is forced as
+        # the decider with probability 1.0 and no predictor call.
+        decider_map = next(iter(remaining))
+        actions.append(
+            SampledVetoAction(
+                step_index=decider_step_index,
+                team=None,
+                action="decider",
+                map_name=decider_map,
+                probability=1.0,
+            )
+        )
+        # non_decider_steps is already ascending and the decider is
+        # already last, but sort defensively so the emitted actions are
+        # guaranteed step-ordered regardless of future sequence shapes.
+        actions.sort(key=lambda a: a.step_index)
+        results.append(
+            SampledVetoSequence(
+                team_a_id=team_a_id,
+                team_b_id=team_b_id,
+                best_of=best_of,
+                date=date,
+                actions=tuple(actions),
+                sequence_probability=sequence_probability,
+            )
+        )
+
+    return results
