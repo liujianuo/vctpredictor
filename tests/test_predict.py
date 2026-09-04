@@ -685,26 +685,25 @@ def stub_predictor_wiring(monkeypatch):
     estimator, the greedy simulator and the M31 veto-marginalized entry
     point with the hand-computable stubs above, and installs call state
     (exposed on the returned dict) so tests can verify the driver
-    called the M31 entry point once per ``predict`` call and passed a
-    freshly reconstructed ``numpy.random.Generator`` to every call
-    (the D6 per-call-RNG mechanism: the recorded identities must
-    differ across calls while identical calls reproduce identical
-    output). The real spread/interval helpers in
-    ``evaluation.veto_conditional_variance`` /
-    ``evaluation.bootstrap_intervals`` run untouched. All patches are
+    called the M31 entry point exactly once per ``predict`` call. The
+    D6 per-call fresh-RNG mechanism (identical calls reproduce
+    identical output) is asserted by the calling tests via a
+    ``numpy.random.default_rng`` call-counting wrapper rather than by
+    object identities, which CPython's allocator can reuse. The real
+    spread/interval helpers in ``evaluation.veto_conditional_variance``
+    / ``evaluation.bootstrap_intervals`` run untouched. All patches are
     reverted by monkeypatch at test teardown.
 
     Args:
         monkeypatch: pytest's built-in monkeypatch fixture.
 
     Returns:
-        A dict of the call state: ``predict_calls`` (int) and
-        ``rng_ids`` (list of the per-call rng object ids).
+        A dict of the call state: ``predict_calls`` (int).
 
     Raises:
         Nothing.
     """
-    call_state = {"predict_calls": 0, "rng_ids": []}
+    call_state = {"predict_calls": 0}
 
     def stub_m31_entry(
         team1_id,
@@ -720,7 +719,6 @@ def stub_predictor_wiring(monkeypatch):
         map_pool=None,
     ):
         call_state["predict_calls"] += 1
-        call_state["rng_ids"].append(id(rng))
         assert callable(map_model_fn)
         assert set(predictor_fn_by_action) == {"ban", "pick"}
         assert isinstance(rng, np.random.Generator)
@@ -909,7 +907,9 @@ def test_make_predictor_missing_model_artifact_raises_file_not_found(
 # --------------------------------------------------------------------------
 
 
-def test_synthetic_predict_shapes_and_wiring(tmp_path, stub_predictor_wiring):
+def test_synthetic_predict_shapes_and_wiring(
+    tmp_path, stub_predictor_wiring, monkeypatch
+):
     # A full synthetic predict() run against the stubbed league: the
     # result carries the full 7-action predicted veto; three per-map
     # entries in play order (Bind, Ascent, Sunset) each with the
@@ -920,9 +920,19 @@ def test_synthetic_predict_shapes_and_wiring(tmp_path, stub_predictor_wiring):
     # (0.465/0.335/0.1/0.1), whose best_of/outcome_order match the
     # canonical Bo3 vocabulary. The M31 entry point was called exactly
     # once. A second identical call reproduces identical output (D6)
-    # while the recorded rng identities differ — the per-call fresh-RNG
-    # mechanism.
+    # and reconstructs a fresh per-call rng (the default_rng call
+    # count is 2) — the per-call fresh-RNG mechanism.
     call_state = stub_predictor_wiring
+    rng_constructs = {"count": 0}
+    real_default_rng = pred.np.random.default_rng
+
+    def counting_default_rng(seed):
+        rng_constructs["count"] += 1
+        return real_default_rng(seed)
+
+    monkeypatch.setattr(
+        pred.np.random, "default_rng", counting_default_rng
+    )
     predictor = pred.make_predictor(
         "data", "v1", n_samples=3, seed=2026, ci_level=0.9
     )
@@ -971,12 +981,13 @@ def test_synthetic_predict_shapes_and_wiring(tmp_path, stub_predictor_wiring):
         [0.465, 0.335, 0.1, 0.1]
     )
 
-    # (D6) A second identical call reproduces identical output but uses
-    # a freshly reconstructed rng (recorded ids differ).
+    # (D6) A second identical call reproduces identical output and
+    # reconstructs a fresh rng (two default_rng constructions for two
+    # calls — object identities are NOT compared, since CPython's
+    # allocator can reuse a freed object's address).
     result2 = predictor("A", "B", "Bo3", _STUB_POOL, "2026-01-01T00:00:00")
     assert call_state["predict_calls"] == 2
-    assert len(call_state["rng_ids"]) == 2
-    assert call_state["rng_ids"][0] != call_state["rng_ids"][1]
+    assert rng_constructs["count"] == 2
     assert result2.to_dict() == result.to_dict()
 
 
