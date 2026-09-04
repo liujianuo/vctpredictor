@@ -9,8 +9,12 @@ fitted artifacts for one dataset version) plus a thin command-line
 wrapper, and the M39.1 persistent layer: the :class:`Predictor` object
 that loads those tables/artifacts once at construction and answers
 many ``predict()`` calls in one process, driven from the CLI's
-``--stream`` JSONL query-stream mode. This is a **wiring milestone,
-not a model**: every underlying
+``--stream`` JSONL query-stream mode. M39.2 adds the exact top-veto
+listing: :func:`make_top_vetos_fn` returns the ``top_vetos`` closure
+that exhaustively enumerates every possible veto sequence (7! = 5,040)
+and ranks them by exact joint probability, returning
+:class:`RankedVetoPrediction` entries (library-only — see F8). This is
+still a **wiring milestone, not a model**: every underlying
 piece already exists and is reviewed/clean —
 ``models.greedy_veto_simulator`` (M25), ``models.ordinal_logit`` (M20),
 ``models.temperature_scaling`` (M24), ``models.ancestral_veto_sampler``
@@ -187,6 +191,117 @@ M39.1 persistent layer.**
   behaviour change (a one-shot process only ever calls ``predict``
   once, so there is nothing to amortise).
 
+**Design decisions F1-F9 (recorded here, do not silently change) —
+the M39.2 exact top-veto enumeration.**
+
+- **F1.** Exact enumeration lives in the **existing** M29 module
+  ``models/ancestral_veto_sampler.py`` as a new sibling function
+  :func:`models.ancestral_veto_sampler.enumerate_veto_sequences`,
+  not a new module. It reuses, unchanged, that module's already-
+  duplicated ``ACTION_SEQUENCES`` / ``VetoStepPredictorFn`` /
+  ``_validate_step_distribution`` and the existing
+  ``SampledVetoAction`` / ``SampledVetoSequence`` dataclasses — their
+  shape already fits an enumerated (not sampled) sequence exactly, so
+  no new dataclasses are needed there. Rationale for colocating: a new
+  module would need a **fourth** independent duplicate of
+  ``ACTION_SEQUENCES``/``VetoStepPredictorFn``; this module already
+  owns them. Both functions are Stage-1 veto-tree walkers over the
+  identical fixed action-sequence structure, differing only in
+  stochastic-draw-with-an-``rng`` vs exhaustive-permutation.
+- **F2.** Enumeration is ``itertools.permutations`` over the pool with
+  a **call-local** memo keyed on ``(step_index, frozenset(remaining))``
+  inside :func:`models.ancestral_veto_sampler.enumerate_veto_sequences`.
+  A naive walk would make 5,040 × 6 = 30,240 per-step predictor
+  calls; because a step's distribution depends only on ``(step_index,
+  remaining-maps set)``, the distinct-state count is
+  ``sum(comb(7, d) for d in range(6)) = 120``, and the memo cuts real
+  calls to at most 120 — a ~250× reduction that is a **required
+  correctness-preserving performance step**, not a nice-to-have (skip
+  it and the real-v1 smoke test takes minutes instead of seconds).
+  ``top_vetos`` sorts the raw 5,040 results itself (F7).
+- **F3.** This module gains a standalone :func:`make_top_vetos_fn`
+  factory; :func:`make_predictor` / :class:`Predictor` are NOT
+  touched. The factory loads its own copy of the three materialised
+  tables, the M24 temperature-scaled ``map_model_fn`` (via
+  :data:`drivers.evaluate.MODEL_REGISTRY`'s
+  ``"ordinal_logit_temperature"`` key) and the ban/pick models (via
+  the existing private :func:`_load_veto_models` helper, called
+  directly) — i.e. the same small loading sequence
+  :func:`make_predictor` already has, duplicated rather than shared,
+  per :func:`_load_veto_models`'s own documented per-driver-loader
+  precedent. Refactoring ``make_predictor`` to extract a shared
+  loader, or adding a ``top_vetos`` method to :class:`Predictor`, is
+  explicitly out of scope (F9). ``n_samples``/``seed`` are **not**
+  parameters of :func:`make_top_vetos_fn` — no M31 sampling happens
+  on this path (F6).
+- **F4.** A new frozen :class:`RankedVetoPrediction` dataclass wraps
+  ``veto_probability`` + a :class:`PredictionResult`, rather than
+  overloading :class:`PredictionResult` with a veto-probability field.
+  A single fixed veto has no Monte Carlo spread, so its
+  ``result.veto_sensitivity`` is ``None`` (F5); the wrapper is why
+  ``PredictionResult`` itself stays un-overloaded.
+- **F5.** :class:`PredictionResult.veto_sensitivity` widens to
+  ``VetoSensitivity | None`` and its ``to_dict()`` serializes
+  ``None`` as JSON ``null``. ``None`` means "no Monte Carlo spread was
+  computed for this result" — the same "not computed" convention
+  ``PerMapPrediction.interval_low``/``interval_high`` already use (D4)
+  — rather than a fabricated zero-width band (which would misleadingly
+  imply spread was computed and confirmed exactly zero).
+  ``predict()``'s own path is unchanged: it always constructs a real
+  (non-``None``) ``VetoSensitivity`` from its M31 call (verified by
+  the unmodified ``veto_sensitivity`` tests), so ``None`` appears only
+  on the exact-enumeration path.
+- **F6.** Per-veto :class:`PredictionResult` construction inside
+  ``top_vetos``'s closure: the sequence's ``actions`` convert to a
+  ``tuple[SimulatedVetoAction, ...]`` via the small helper
+  :func:`_to_simulated_veto_action` (copies ``step_index``/``team``/
+  ``action``/``map_name``, drops the sampler-only ``probability``) —
+  that veto's own sequence, not the M25 greedy one; ``played_maps``
+  are the sequence's ``"pick"``/``"decider"`` actions in ascending
+  step order (identical rule to ``predict()``'s own derivation,
+  duplicated locally); ``per_map`` comes from the closed-over
+  ``map_model_fn`` plus :func:`_n_games_backing_for_map` and (when
+  ``bootstrap_models`` were supplied) the same D4 interval
+  computation ``predict()``'s closure does — a small (~15-line)
+  duplicate written fresh inside ``top_vetos``, not extracted from
+  :func:`make_predictor` (F3); ``series`` is the **exact M30
+  conditional recursion**, not M31 sampling — each played map's
+  four-way vector collapses to ``probabilities[0] +
+  probabilities[1]`` (``OUTCOME_LABELS`` order) and feeds
+  :func:`utils.series_paths.series_probabilities_in_order`; and
+  ``veto_sensitivity`` is ``None`` (F5). The collapse formula is the
+  same one
+  ``evaluation.veto_marginalized_series._collapse_to_binary_a_win``
+  implements, duplicated here rather than imported across that
+  leading-underscore module boundary (the repo's privacy convention).
+  ``best_of_int`` comes from :data:`_BEST_OF_MAP_COUNT`, a plain-dict
+  fourth ``"Bo<N>"``-parsing duplicate that cannot ``KeyError``
+  because the enumeration already validated ``best_of``.
+- **F7.** Ranking and ``n`` handling: ``top_vetos`` sorts the raw
+  5,040 sequences by ``sequence_probability`` descending (Python's
+  stable ``sorted(..., reverse=True)``, so exact ties keep their
+  ``itertools.permutations`` enumeration order — no secondary
+  tie-break key) and takes ``sorted_sequences[:min(n, 5040)]``. ``n``
+  larger than 5,040 silently returns all 5,040 (documented, not an
+  error); ``n < 1`` raises ``ValueError`` before enumeration runs
+  (fail-fast without paying the enumeration cost). The roadmap's
+  "``predicted_veto`` is not assumed to be the top-ranked entry"
+  sentence is a **documentation caution only** — the greedy veto and
+  this listing are computed independently, and no "rank of the greedy
+  veto in this listing" field is computed or added.
+- **F8.** CLI: out of scope. ``top_vetos`` / :func:`make_top_vetos_fn`
+  are library-only, mirroring the "no CLI driver" precedent M25/M29/
+  M30/M31 each recorded; ``parse_args`` / ``main()`` are untouched —
+  no new flag, no ``--stream`` schema change.
+- **F9.** :class:`Predictor` is out of scope. No
+  ``Predictor.top_vetos(...)`` method is added and
+  :func:`make_predictor`'s internals are not refactored to share a
+  loader with :func:`make_top_vetos_fn`. ``top_vetos`` is reached only
+  via the standalone factory, exactly mirroring how ``predict()`` was
+  reached only via :func:`make_predictor` before M39.1. A future
+  milestone may fold this into :class:`Predictor` for single-load
+  reuse; that is explicitly deferred, not silently skipped.
+
 **Probability order.** Every per-map 4-vector and every interval band
 in this module is in :data:`models._shared.OUTCOME_LABELS` order —
 ``("A-regulation", "A-OT", "B-OT", "B-regulation")``; every scoreline
@@ -232,6 +347,7 @@ from evaluation import (
 )
 from features import map_win_rate
 from models import (
+    ancestral_veto_sampler,
     conditional_logit_ban,
     conditional_logit_pick,
     greedy_veto_simulator,
@@ -239,6 +355,7 @@ from models import (
 )
 from models.greedy_veto_simulator import SimulatedVetoAction
 from models.ordinal_logit import OrdinalLogitModel
+from utils import series_paths
 from utils.table_io import DEFAULT_OUTPUT_DIR
 
 logger = logging.getLogger(__name__)
@@ -261,6 +378,21 @@ DEFAULT_N_SAMPLES = 30
 DEFAULT_SEED = 2026
 DEFAULT_CI_LEVEL = 0.90
 
+# The default top-N of the M39.2 exact veto listing (F7): how many
+# highest-probability enumerated veto sequences :func:`make_top_vetos_fn`'s
+# ``top_vetos`` closure returns when the caller does not pass ``n``.
+DEFAULT_TOP_N = 10
+
+# The fixed best_of -> played-map-count lookup of the exact M30 series
+# recursion inside ``top_vetos`` (F6). A plain dict suffices: the
+# enumeration already validated ``best_of`` is one of exactly these
+# three ACTION_SEQUENCES keys before ``top_vetos`` ever reaches this
+# lookup, so the access cannot ``KeyError``. This is a deliberate
+# fourth independent "Bo<N>"-parsing duplicate, tolerated by the
+# existing repo precedent of triplicated ``_parse_best_of`` copies
+# (flagged again as a future housekeeping item, not fixed here).
+_BEST_OF_MAP_COUNT = {"Bo1": 1, "Bo3": 3, "Bo5": 5}
+
 # The names this module exposes publicly: the result dataclasses
 # (including the M39.2 RankedVetoPrediction wrapper), the factory that
 # returns the documented 5-arg predict closure (the closure itself is
@@ -274,6 +406,7 @@ __all__ = [
     "SeriesPrediction",
     "VetoSensitivity",
     "make_predictor",
+    "make_top_vetos_fn",
 ]
 
 
@@ -1111,6 +1244,369 @@ def make_predictor(
         )
 
     return predict
+
+
+def _to_simulated_veto_action(
+    action: ancestral_veto_sampler.SampledVetoAction,
+) -> SimulatedVetoAction:
+    """Convert one enumerated veto action to the simulator's action shape.
+
+    F6's tiny field-copy helper for ``top_vetos``'s per-veto
+    ``predicted_veto`` construction: an enumerated
+    :class:`models.ancestral_veto_sampler.SampledVetoAction` carries
+    the same ``step_index``/``team``/``action``/``map_name`` fields as
+    :class:`models.greedy_veto_simulator.SimulatedVetoAction` (the
+    type :class:`PredictionResult.predicted_veto` requires) plus the
+    sampler-only ``probability`` field the simulator type lacks; this
+    helper copies the four shared fields and drops ``probability``, so
+    the enumeration's richer per-step records satisfy the established
+    result shape without widening it.
+
+    Args:
+        action: One enumerated veto step's
+            :class:`models.ancestral_veto_sampler.SampledVetoAction`
+            record (its ``probability`` is intentionally discarded).
+
+    Returns:
+        A :class:`models.greedy_veto_simulator.SimulatedVetoAction`
+        carrying the same ``step_index``, ``team``, ``action`` and
+        ``map_name`` values.
+
+    Raises:
+        Nothing.
+    """
+    return SimulatedVetoAction(
+        step_index=action.step_index,
+        team=action.team,
+        action=action.action,
+        map_name=action.map_name,
+    )
+
+
+def make_top_vetos_fn(
+    output_dir,
+    version: str,
+    *,
+    ci_level: float = DEFAULT_CI_LEVEL,
+    bootstrap_models: Sequence[OrdinalLogitModel] | None = None,
+):
+    """Build the M39.2 exact top-veto listing closure for one version.
+
+    The F3 factory: loads the three materialised tables
+    (``matches``/``maps``/``player_map_stats``), the M24
+    temperature-scaled ``map_model_fn`` (via
+    ``drivers.evaluate.MODEL_REGISTRY[_TEMPERATURE_MAP_MODEL_KEY]``,
+    staleness guard included), and the fitted M27/M28 ban/pick models
+    (via this module's own :func:`_load_veto_models` helper — called
+    directly, following that helper's documented per-driver-duplication
+    precedent) exactly once, and returns a closure with the documented
+    public signature ``top_vetos(team_a, team_b, best_of, map_pool,
+    as_of_date, n=DEFAULT_TOP_N) -> tuple[RankedVetoPrediction, ...]``.
+    This mirrors the small loading sequence :func:`make_predictor`
+    already has, **duplicated rather than shared** — :func:`make_predictor`'s
+    internals are deliberately not refactored to extract a shared
+    loader (F3/F9; touching it would risk the reviewed-clean E1 "loads
+    once" invariants for no requirement in scope). ``n_samples`` /
+    ``seed`` are **not** parameters: no M31 sampling happens anywhere
+    on this path (F6 — the per-veto series is the exact M30 recursion,
+    so there is nothing to seed).
+
+    Args:
+        output_dir: The parent directory the version subdirectory
+            lives under (e.g. ``Path("data")`` or the string
+            ``"data"``); coerced to a ``Path``.
+        version: The dataset version subdirectory name (e.g. ``"v1"``).
+        ci_level: The interval level in ``(0, 1)`` for the per-map
+            epistemic bands (D4 — default :data:`DEFAULT_CI_LEVEL`);
+            validated here at factory time.
+        bootstrap_models: The optional already-fitted raw ordinal
+            bootstrap replicate models (D4) the per-map epistemic
+            intervals are computed over; ``None`` (the default) or an
+            empty sequence means ``per_map[i].interval_*`` is
+            ``None``. Replicate models are consumed, never fitted or
+            persisted here.
+
+    Returns:
+        The 6-argument ``top_vetos(team_a, team_b, best_of, map_pool,
+        as_of_date, n=DEFAULT_TOP_N) -> tuple[RankedVetoPrediction,
+        ...]`` closure (F3).
+
+    Raises:
+        FileNotFoundError: If any of the required tables/artifacts does
+            not exist for the requested version (i.e. the
+            ``materialize.py`` / training drivers have not been run) —
+            propagated unchanged from the loaders/factories as a clear
+            "run the prerequisite first" signal, exactly as
+            :func:`make_predictor` raises it.
+        ValueError: If ``ci_level`` is not in ``(0, 1)``; if the
+            temperature-scaling artifact was calibrated against a
+            different base ordinal artifact (the staleness guard in
+            the registry factory); or if any artifact dict is malformed
+            (propagated from the ``from_dict`` calls).
+        KeyError: If any artifact dict lacks a required key (propagated
+            from the ``from_dict`` calls).
+        TypeError: If an input type is invalid (propagated from the
+            loaders).
+    """
+    if not (0.0 < ci_level < 1.0):
+        raise ValueError(
+            f"ci_level must be strictly between 0 and 1, got {ci_level}"
+        )
+
+    output_dir = Path(output_dir)
+    matches_df = evaluate.load_matches_table(output_dir, version)
+    maps_df = evaluate.load_maps_table(output_dir, version)
+    player_map_stats_df = evaluate.load_player_map_stats_table(
+        output_dir, version
+    )
+
+    # The production calibrated Stage-2 map model (D3): same registry
+    # factory ``make_predictor`` uses, closed over for the per-map
+    # point probabilities of every enumerated veto's played maps.
+    map_model_fn = evaluate.MODEL_REGISTRY[_TEMPERATURE_MAP_MODEL_KEY](
+        output_dir, version
+    )
+
+    # The fitted Stage-1 predictors the exact enumeration consumes per
+    # step (F2's memoisation keeps real calls <= 120 per top_vetos
+    # call). The decider is forced and needs no predictor key.
+    ban_model, pick_model = _load_veto_models(output_dir, version)
+    predictor_fn_by_action = {
+        "ban": conditional_logit_ban.make_veto_step_predictor_fn(ban_model),
+        "pick": conditional_logit_pick.make_veto_step_predictor_fn(pick_model),
+    }
+
+    def top_vetos(
+        team_a: str,
+        team_b: str,
+        best_of: str,
+        map_pool,
+        as_of_date: str,
+        n: int = DEFAULT_TOP_N,
+    ) -> tuple[RankedVetoPrediction, ...]:
+        """List the top-``n`` veto sequences by exact joint probability.
+
+        The M39.2 public API (F3): for one queried match — two stable
+        ``team_id`` strings, a ``"Bo<N>"`` series length, an optional
+        7-map pool and an as-of date — exhaustively enumerates every
+        possible veto sequence
+        (:func:`models.ancestral_veto_sampler.enumerate_veto_sequences`,
+        exactly ``7! = 5,040`` over a 7-map pool, with the per-step
+        memoisation that keeps real predictor calls at <= 120), ranks
+        them by descending ``sequence_probability``, and returns the
+        top ``min(n, 5040)`` as ``(veto_probability, result)``
+        :class:`RankedVetoPrediction` pairs (F7). Each entry's
+        ``result`` is the :class:`PredictionResult` for that *specific*
+        fixed veto: its full action tuple (with the enumeration's
+        per-step ``probability`` field dropped via
+        :func:`_to_simulated_veto_action`), one temperature-scaled
+        :class:`PerMapPrediction` per played map (the ``pick``/
+        ``decider`` actions in step order, F6 — same per-map body
+        :func:`make_predictor`'s ``predict`` uses, duplicated here
+        fresh rather than extracted, F3), and the **exact M30
+        conditional** :class:`SeriesPrediction` — each played map's
+        four-way vector collapsed to its A-win probability
+        (``probabilities[0] + probabilities[1]``, the
+        :data:`models._shared.OUTCOME_LABELS` order) and fed to
+        :func:`utils.series_paths.series_probabilities_in_order` — with
+        ``veto_sensitivity`` ``None`` (F5: a single fixed veto has no
+        Monte Carlo spread; no M31 sampling happens anywhere on this
+        path).
+
+        Ranking uses Python's stable descending sort
+        (``sorted(..., reverse=True)``): exact probability ties keep
+        their ``itertools.permutations`` enumeration order (F7); no
+        secondary tie-break key is attempted. ``n`` larger than the
+        5,040 total silently returns all 5,040 (documented, not an
+        error); ``n < 1`` raises ``ValueError`` before any enumeration
+        work happens (F7's fail-fast clause). The M25 greedy
+        ``predicted_veto`` of ``predict()`` is *not* assumed to be the
+        top-ranked entry here — the two are computed independently and
+        this listing makes no claim about where (or whether) the greedy
+        veto appears (F7, documented; see the module docstring).
+
+        Args:
+            team_a: The queried team A's stable id (side A of the
+                scoreline vocabulary; the even-step veto actor).
+            team_b: The queried team B's stable id (side B; the
+                odd-step veto actor).
+            best_of: The series length as the ``"Bo<N>"`` string
+                (``"Bo1"``/``"Bo3"``/``"Bo5"``); anything else raises
+                ``ValueError`` from the enumeration.
+            map_pool: The pool to veto over, as an iterable of map
+                names; ``None`` resolves the active era's pool from
+                ``config.json`` for ``as_of_date``'s calendar date
+                (D8). Every supported format requires a 7-map pool, so
+                a pool of any other size or with duplicates raises
+                ``ValueError`` from the enumeration.
+            as_of_date: The as-of cutoff for every feature lookup and
+                the era-pool resolution (e.g. the queried match's own
+                ISO-8601 timestamp; strict ``<``).
+            n: How many top sequences to return; must be a positive
+                integer (default :data:`DEFAULT_TOP_N`). Values larger
+                than the 5,040-sequence total return all 5,040 without
+                error; ``n < 1`` raises ``ValueError`` before any
+                enumeration.
+
+        Returns:
+            A ``tuple`` of ``min(n, 5040)`` :class:`RankedVetoPrediction`
+            entries sorted by descending ``veto_probability`` (stable;
+            ties keep enumeration order), each carrying that specific
+            veto's full :class:`PredictionResult` with
+            ``veto_sensitivity is None`` (F5) and a ``series`` computed
+            by the exact M30 recursion over the veto's played maps.
+            Deterministic: identical arguments reproduce an identical
+            tuple (no RNG anywhere on this path, F6).
+
+        Raises:
+            ValueError: If ``n < 1`` (naming the value, before any
+                enumeration); if ``best_of`` is not a supported veto
+                format; if ``map_pool`` has the wrong size or contains
+                duplicates after normalization; if an as-of map has a
+                null/NaN/tied score (from the per-map model or backing
+                calls — propagated); if ``as_of_date`` is
+                null/unparseable/timezone-aware (from ``utils.asof``);
+                or if any per-step predictor vector fails validation
+                (from the enumeration, naming the step/arm).
+            ConfigError: If ``map_pool`` is ``None`` and no configured
+                era covers ``as_of_date``'s calendar date, or a map
+                name is not a string (from ``utils.config`` —
+                propagated).
+            KeyError / TypeError: Propagated from the feature
+                builders/predictors if a required table column is
+                absent or a callable misbehaves.
+        """
+        if n < 1:
+            raise ValueError(
+                f"n must be a positive integer, got {n}; refusing to "
+                "rank an empty top list"
+            )
+
+        # F2's memoised exact enumeration: all 5,040 raw sequences
+        # (unranked — ranking is this closure's job, F7).
+        enumerated = ancestral_veto_sampler.enumerate_veto_sequences(
+            team_a,
+            team_b,
+            best_of,
+            as_of_date,
+            matches_df,
+            maps_df,
+            predictor_fn_by_action,
+            map_pool=map_pool,
+        )
+
+        # F7: stable descending sort by joint probability; exact ties
+        # keep their itertools.permutations enumeration order.
+        ranked = sorted(
+            enumerated,
+            key=lambda seq: seq.sequence_probability,
+            reverse=True,
+        )
+        top = ranked[: min(n, len(ranked))]
+
+        # F6's exact per-veto result construction. The played-map
+        # count / series vocabulary are fixed per best_of, so they are
+        # derived once for the whole listing.
+        best_of_int = _BEST_OF_MAP_COUNT[best_of]
+        outcome_order = series_paths.series_outcome_order(best_of_int)
+
+        entries: list[RankedVetoPrediction] = []
+        for seq in top:
+            predicted_veto = tuple(
+                _to_simulated_veto_action(action) for action in seq.actions
+            )
+            played_maps = tuple(
+                action.map_name
+                for action in seq.actions
+                if action.action in ("pick", "decider")
+            )
+            per_map_entries: list[PerMapPrediction] = []
+            per_map_win_probs: list[float] = []
+            for map_name in played_maps:
+                probabilities = tuple(
+                    float(p)
+                    for p in map_model_fn(
+                        team_a,
+                        team_b,
+                        map_name,
+                        as_of_date,
+                        matches_df,
+                        maps_df,
+                    )
+                )
+                if bootstrap_models:
+                    # D4, duplicated from make_predictor's predict
+                    # closure: the interval is over the raw ordinal
+                    # replicates' four-way predictions while the point
+                    # estimate above is temperature-scaled (D3).
+                    replicate_rows = [
+                        tuple(
+                            ordinal_logit.make_model_fn(
+                                bootstrap_model, player_map_stats_df
+                            )(
+                                team_a,
+                                team_b,
+                                map_name,
+                                as_of_date,
+                                matches_df,
+                                maps_df,
+                            )
+                        )
+                        for bootstrap_model in bootstrap_models
+                    ]
+                    bands = bootstrap_intervals.replicate_matrix_intervals(
+                        replicate_rows, ci_level=ci_level
+                    )
+                    interval_low = tuple(lo for lo, _hi in bands)
+                    interval_high = tuple(hi for _lo, hi in bands)
+                else:
+                    interval_low = None
+                    interval_high = None
+                per_map_entries.append(
+                    PerMapPrediction(
+                        map_name=map_name,
+                        probabilities=probabilities,
+                        interval_low=interval_low,
+                        interval_high=interval_high,
+                        n_games_backing=_n_games_backing_for_map(
+                            team_a,
+                            team_b,
+                            map_name,
+                            as_of_date,
+                            matches_df,
+                            maps_df,
+                        ),
+                    )
+                )
+                # F6: collapse the four-way vector to a per-map A-win
+                # probability (OUTCOME_LABELS: A-regulation + A-OT).
+                per_map_win_probs.append(probabilities[0] + probabilities[1])
+
+            # F6: the exact M30 conditional recursion (no M31 sampling).
+            series = SeriesPrediction(
+                probabilities=tuple(
+                    series_paths.series_probabilities_in_order(
+                        per_map_win_probs, best_of_int
+                    )
+                ),
+                outcome_order=outcome_order,
+                best_of=best_of_int,
+            )
+            entries.append(
+                RankedVetoPrediction(
+                    veto_probability=seq.sequence_probability,
+                    result=PredictionResult(
+                        predicted_veto=predicted_veto,
+                        per_map=tuple(per_map_entries),
+                        series=series,
+                        veto_sensitivity=None,
+                    ),
+                )
+            )
+
+        return tuple(entries)
+
+    return top_vetos
 
 
 class Predictor:
