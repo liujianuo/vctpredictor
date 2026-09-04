@@ -184,12 +184,14 @@ DEFAULT_N_SAMPLES = 30
 DEFAULT_SEED = 2026
 DEFAULT_CI_LEVEL = 0.90
 
-# The names this module exposes publicly: the four result dataclasses
-# and the factory that returns the documented 5-arg predict closure
-# (the closure itself is not a module-level name).
+# The names this module exposes publicly: the four result dataclasses,
+# the factory that returns the documented 5-arg predict closure (the
+# closure itself is not a module-level name), and the E1 session-holding
+# Predictor wrapper.
 __all__ = [
     "PerMapPrediction",
     "PredictionResult",
+    "Predictor",
     "SeriesPrediction",
     "VetoSensitivity",
     "make_predictor",
@@ -954,6 +956,146 @@ def make_predictor(
         )
 
     return predict
+
+
+class Predictor:
+    """The E1 session-holding wrapper around the M39 ``make_predictor`` factory.
+
+    A thin persistent object for the M39.1 lifecycle milestone: loading
+    the materialised tables and fitted artifacts **once** at
+    construction (delegating to :func:`make_predictor` exactly once and
+    holding the returned 5-arg closure for the object's lifetime) so a
+    process can answer many :meth:`predict` calls without re-loading
+    per call. No prediction semantics change — this is lifecycle
+    plumbing, not modeling: a ``Predictor`` instance's
+    :meth:`predict` call is bitwise identical to calling
+    :func:`make_predictor` once and invoking the returned closure with
+    the same arguments, and the D6 per-call fresh-RNG idempotence
+    (identical arguments reproduce identical output) is inherited
+    unchanged since the wrapped closure is exactly what
+    :func:`make_predictor` already returns. ``make_predictor`` itself
+    is untouched (its body is not refactored or reordered), so its
+    reviewed-clean tests keep passing unmodified.
+
+    ``bootstrap_models`` (D4), when given, are forwarded unchanged to
+    :func:`make_predictor` for the per-map epistemic intervals. The
+    class is the object behind the CLI's persistent ``--stream`` mode:
+    one ``Predictor`` built once per process answers the whole JSONL
+    query stream (E4).
+    """
+
+    def __init__(
+        self,
+        output_dir,
+        version: str,
+        *,
+        n_samples: int = DEFAULT_N_SAMPLES,
+        seed: int = DEFAULT_SEED,
+        ci_level: float = DEFAULT_CI_LEVEL,
+        bootstrap_models: Sequence[OrdinalLogitModel] | None = None,
+    ) -> None:
+        """Construct one Predictor by loading tables/artifacts exactly once.
+
+        E1: calls :func:`make_predictor` exactly once with every
+        keyword forwarded unchanged and stores the returned 5-arg
+        ``predict`` closure privately; every later :meth:`predict` call
+        reuses that loaded state. All validation is delegated to the
+        factory — this wrapper adds none of its own (its constructor
+        raises exactly what :func:`make_predictor` raises at factory
+        time, propagated unchanged).
+
+        Args:
+            output_dir: The parent directory the version subdirectory
+                lives under (e.g. ``Path("data")`` or the string
+                ``"data"``); coerced to a ``Path`` by
+                :func:`make_predictor`.
+            version: The dataset version subdirectory name (e.g.
+                ``"v1"``).
+            n_samples: How many M29 veto walks each :meth:`predict`
+                call samples for the M31 pipeline (D7: default
+                :data:`DEFAULT_N_SAMPLES`). Must be a positive
+                integer; enforced by the factory (propagated
+                ``ValueError``).
+            seed: The per-call ``numpy.random.default_rng`` seed (D7,
+                repo convention; default :data:`DEFAULT_SEED`).
+            ci_level: The interval/spread level in ``(0, 1)`` (default
+                :data:`DEFAULT_CI_LEVEL`); validated at factory time.
+            bootstrap_models: The optional already-fitted raw ordinal
+                bootstrap replicate models (D4) the per-map epistemic
+                intervals are computed over; ``None`` (the default) or
+                an empty sequence means ``per_map[i].interval_*`` is
+                ``None``. Forwarded unchanged to :func:`make_predictor`.
+
+        Returns:
+            Nothing (the loaded state is held on the instance).
+
+        Raises:
+            FileNotFoundError: If any required table/artifact does not
+                exist for the requested version (propagated unchanged
+                from :func:`make_predictor`).
+            ValueError: If ``ci_level`` is not in ``(0, 1)`` or the
+                temperature/base staleness guard fires (propagated
+                unchanged from :func:`make_predictor`).
+            KeyError / TypeError: Propagated unchanged from
+                :func:`make_predictor` for malformed artifacts or
+                invalid input types.
+        """
+        self._predict_fn = make_predictor(
+            output_dir,
+            version,
+            n_samples=n_samples,
+            seed=seed,
+            ci_level=ci_level,
+            bootstrap_models=bootstrap_models,
+        )
+
+    def predict(
+        self,
+        team_a: str,
+        team_b: str,
+        best_of: str,
+        map_pool,
+        as_of_date: str,
+    ) -> PredictionResult:
+        """Predict one match, delegating to the wrapped 5-arg closure.
+
+        E1: calls the privately-held closure that :func:`make_predictor`
+        returned at construction time (loaded once, reused for every
+        call) with the exact arguments passed, and returns its result
+        unmodified. Bitwise identical to calling
+        :func:`make_predictor` once and invoking the returned closure
+        with the same arguments; D6's per-call fresh-RNG idempotence
+        (identical arguments reproduce identical output) is inherited.
+
+        Args:
+            team_a: The queried team A's stable id.
+            team_b: The queried team B's stable id.
+            best_of: The series length as the ``"Bo<N>"`` string
+                (``"Bo1"``/``"Bo3"``/``"Bo5"``).
+            map_pool: The pool to veto over, as an iterable of map
+                names; ``None`` resolves the active era's pool from
+                ``config.json`` for ``as_of_date``'s calendar date
+                (D8). Requires a 7-map pool in every supported format.
+            as_of_date: The as-of cutoff for every feature lookup and
+                the era-pool resolution (strict ``<``).
+
+        Returns:
+            The wrapped closure's :class:`PredictionResult` for the
+            given arguments, unmodified.
+
+        Raises:
+            ValueError: Propagated unchanged from the wrapped closure
+                (invalid ``best_of``, wrong-size/duplicate ``map_pool``,
+                bad ``as_of_date``, degenerate M31 samples, etc.).
+            ConfigError: Propagated unchanged from the wrapped closure
+                (no configured era covers ``as_of_date``'s calendar
+                date when ``map_pool`` is ``None``).
+            KeyError / TypeError: Propagated unchanged from the wrapped
+                closure (missing table column, misbehaving callable).
+        """
+        return self._predict_fn(
+            team_a, team_b, best_of, map_pool, as_of_date
+        )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
