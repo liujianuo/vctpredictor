@@ -144,7 +144,9 @@ M39.1 persistent layer.**
 
 - **E1.** :class:`Predictor` is a thin wrapper over the existing
   :func:`make_predictor` wiring; :func:`make_predictor` is untouched
-  internally. ``Predictor.__init__(output_dir, version, *,
+  internally apart from the M39.4/G2 addition of a fourth step to its
+  returned ``predict`` closure (the top-``top_n`` enumeration).
+  ``Predictor.__init__(output_dir, version, *,
   n_samples=DEFAULT_N_SAMPLES, seed=DEFAULT_SEED,
   ci_level=DEFAULT_CI_LEVEL, bootstrap_models=None)`` calls
   :func:`make_predictor` exactly once, forwarding every keyword
@@ -192,7 +194,9 @@ M39.1 persistent layer.**
   Blank / whitespace-only lines are skipped silently. Extra keys in a
   query object are ignored. There are no per-query knob overrides —
   ``n_samples`` / ``seed`` / ``ci_level`` are fixed for the whole
-  stream from the CLI flags at ``Predictor`` construction time
+  stream from the CLI flags at ``Predictor`` construction time, and
+  ``top_n`` (since M39.4/G7) is fixed for the whole stream from
+  ``args.top_n`` and forwarded per :meth:`Predictor.predict` call
   ("persistent" = one session, one set of knobs, many queries).
 - **E5.** Stream-mode errors propagate; nothing is swallowed. A
   malformed JSON line (``json.JSONDecodeError``), a query object
@@ -212,8 +216,9 @@ M39.1 persistent layer.**
   :func:`make_predictor` directly (not through :class:`Predictor`) —
   this preserves ``test_main_prints_json_result``'s existing
   ``monkeypatch.setattr(pred, "make_predictor", stub)`` with zero
-  behaviour change (a one-shot process only ever calls ``predict``
-  once, so there is nothing to amortise).
+  behaviour change beyond the M39.4/G7 ``top_n=args.top_n`` keyword
+  added to the single ``predict(...)`` call (a one-shot process only
+  ever calls ``predict`` once, so there is nothing to amortise).
 
 **Design decisions F1-F9 (recorded here, do not silently change) —
 the M39.2 exact top-veto enumeration.**
@@ -2141,7 +2146,8 @@ class Predictor:
     (identical arguments reproduce identical output) is inherited
     unchanged since the wrapped closure is exactly what
     :func:`make_predictor` already returns. ``make_predictor`` itself
-    is untouched (its body is not refactored or reordered), so its
+    is not refactored or reordered (beyond the M39.4/G2 fourth step
+    added to its returned ``predict`` closure), so its
     reviewed-clean tests keep passing unmodified.
 
     ``bootstrap_models`` (D4), when given, are forwarded unchanged to
