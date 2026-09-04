@@ -29,7 +29,16 @@ M39.1 persistent layer (``Predictor`` wraps :func:`make_predictor`
 loading exactly once per construction — ``--stream`` CLI mode
 answering a JSONL query stream from stdin with one persistent
 ``Predictor``, its ``parse_args`` mutual-exclusion validation, and the
-stream-mode error propagation); and
+stream-mode error propagation); M39.4 (the top-``top_n`` enumeration
+folded into ``predict()`` — every ``PredictionResult`` widens with a
+``top_vetos`` field whose ranked entries carry ``veto_sensitivity
+None`` (G6) and inherit the D10 auto-load intervals (G5); the
+keyword-only ``top_n`` knob on ``predict``/``Predictor.predict`` with
+its ``top_n < 1`` fail-fast; the ``--top-n`` CLI flag threading
+through both one-shot and ``--stream`` modes; and the shared
+``_build_ranked_veto_entries`` helper keeping
+``make_top_vetos_fn``'s listing equal to ``predict(...).top_vetos``
+for the same query — the task-055 contract preserved); and
 a ``skipif``-guarded real-v1 integration smoke test asserting finite,
 well-formed output. No real fitted artifacts are required by the
 non-smoke tests.
@@ -200,14 +209,20 @@ def _install_table_and_model_stubs(monkeypatch):
     Composes :func:`_install_table_stubs` with stubs for the Stage-2
     registry factory (returns :func:`_stub_map_model_fn`, the
     hand-known temperature-scaled 4-vector closure) and the Stage-1
-    artifact loader (returns ``(None, None)`` — the
-    ``make_veto_step_predictor_fn`` closures over ``None`` are never
-    invoked on the synthetic paths, since the M31 entry point and/or
-    the greedy simulator are stubbed wherever a full ``predict`` run
-    happens). Lets the error-path tests build a working
-    ``make_predictor`` while keeping the *greedy simulator real* so
-    its propagated ``ValueError``s (invalid ``best_of``, wrong-size
-    ``map_pool``) are exercised end to end.
+    artifact loader (returns ``(None, None)``). Callers that only
+    construct the factory (error-path tests, whose real greedy
+    simulator raises before any enumeration) need nothing more; callers
+    that run a **full** ``predict`` must additionally stub the two
+    ``make_veto_step_predictor_fn`` factories — since M39.4/G2
+    ``predict``'s fourth step exhaustively enumerates over the wired
+    ``predictor_fn_by_action`` dict, and the real factories' closures
+    over the ``None`` loader models would crash when invoked (the
+    ``stub_predictor_wiring`` fixture and
+    :func:`_install_top_vetos_wiring` both add the deterministic
+    :func:`_top_two_step_stub` arms). Lets the error-path tests build
+    a working ``make_predictor`` while keeping the *greedy simulator
+    real* so its propagated ``ValueError``s (invalid ``best_of``,
+    wrong-size ``map_pool``) are exercised end to end.
 
     Args:
         monkeypatch: pytest's built-in monkeypatch fixture.
@@ -692,9 +707,13 @@ def stub_predictor_wiring(monkeypatch):
 
     Routes the three input tables to the synthetic league, replaces the
     Stage-2 registry factory (returns :func:`_stub_map_model_fn`), the
-    Stage-1 artifact loader (returns ``(None, None)`` — the
-    ``make_veto_step_predictor_fn`` closures over ``None`` are never
-    called, since the M31 entry point is stubbed), the map-win-rate
+    Stage-1 artifact loader (returns ``(None, None)``), the two
+    ``make_veto_step_predictor_fn`` factories (return
+    :func:`_top_two_step_stub` — since M39.4/G2 predict()'s fourth
+    step exhaustively enumerates over the wired
+    ``predictor_fn_by_action`` dict, so the factories must produce
+    callable arms rather than crash on the ``None`` loader models),
+    the map-win-rate
     estimator, the greedy simulator and the M31 veto-marginalized entry
     point with the hand-computable stubs above, and installs call state
     (exposed on the returned dict) so tests can verify the driver
@@ -752,6 +771,24 @@ def stub_predictor_wiring(monkeypatch):
         pred.veto_marginalized_series,
         "predict_series_outcome_via_veto_marginalization",
         stub_m31_entry,
+    )
+    # M39.4 (G2): predict()'s new fourth step exhaustively enumerates
+    # veto sequences over the make_predictor-wired
+    # predictor_fn_by_action dict, so the two make_veto_step_predictor_fn
+    # factories must be stubbed too — the table-stub loader returns
+    # (None, None) models, which the real factories' closures would
+    # crash on when the enumeration invoked them. The same
+    # deterministic _top_two_step_stub arm the top_vetos wiring uses
+    # keeps every predict() call's top_vetos listing hand-computable.
+    monkeypatch.setattr(
+        pred.conditional_logit_ban,
+        "make_veto_step_predictor_fn",
+        lambda model: _top_two_step_stub,
+    )
+    monkeypatch.setattr(
+        pred.conditional_logit_pick,
+        "make_veto_step_predictor_fn",
+        lambda model: _top_two_step_stub,
     )
     return call_state
 
@@ -823,10 +860,15 @@ def test_result_dataclasses_to_dict_json_serializable():
 
     result_dict = result.to_dict()
     assert set(result_dict) == {
-        "predicted_veto", "per_map", "series", "veto_sensitivity"
+        "predicted_veto", "per_map", "series", "veto_sensitivity",
+        "top_vetos",
     }
     # The nested per-map to_dict round-trips through JSON.
     assert json.loads(json.dumps(result_dict)) == result_dict
+    # M39.4 (G1): top_vetos defaults to () and serializes as [] when
+    # the result carries no ranking.
+    assert result_dict["top_vetos"] == []
+    assert json.loads(json.dumps(result_dict))["top_vetos"] == []
     assert result_dict["predicted_veto"][0] == {
         "step_index": 0,
         "team": "A",
@@ -856,7 +898,50 @@ def test_result_dataclasses_to_dict_json_serializable():
     )
     no_spread_dict = no_spread_result.to_dict()
     assert no_spread_dict["veto_sensitivity"] is None
+    assert no_spread_dict["top_vetos"] == []
     assert json.loads(json.dumps(no_spread_dict))["veto_sensitivity"] is None
+
+
+def test_predict_result_serializes_non_empty_top_vetos():
+    # M39.4 (G1): a PredictionResult carrying a filled top_vetos tuple
+    # serializes each RankedVetoPrediction under the "top_vetos" key,
+    # and each inner ranked result's own "top_vetos" is [] (G1's
+    # recorded consequence — a fixed-veto conditional result carries
+    # no nested ranking — the double-serialization check).
+    per_map = PerMapPrediction(
+        map_name="Bind",
+        probabilities=(0.6, 0.1, 0.1, 0.2),
+        interval_low=None,
+        interval_high=None,
+        n_games_backing=7,
+    )
+    inner = PredictionResult(
+        predicted_veto=_STUB_VETO_ACTIONS,
+        per_map=(per_map,),
+        series=SeriesPrediction(
+            probabilities=(0.5, 0.3, 0.1, 0.1),
+            outcome_order=series_paths.series_outcome_order(3),
+            best_of=3,
+        ),
+        veto_sensitivity=None,
+    )
+    assert inner.top_vetos == ()
+    entry = RankedVetoPrediction(veto_probability=0.25, result=inner)
+    outer = PredictionResult(
+        predicted_veto=_STUB_VETO_ACTIONS,
+        per_map=(per_map,),
+        series=inner.series,
+        veto_sensitivity=None,
+        top_vetos=(entry,),
+    )
+    outer_dict = outer.to_dict()
+    assert isinstance(outer_dict["top_vetos"], list)
+    assert len(outer_dict["top_vetos"]) == 1
+    assert outer_dict["top_vetos"][0]["veto_probability"] == 0.25
+    # The double serialization: the inner ranked result's own
+    # "top_vetos" key is present and empty.
+    assert outer_dict["top_vetos"][0]["result"]["top_vetos"] == []
+    assert json.loads(json.dumps(outer_dict)) == outer_dict
 
 
 # --------------------------------------------------------------------------
@@ -1261,17 +1346,26 @@ def test_top_vetos_intervals_none_without_bootstrap_models(
 
 def test_make_predictor_returns_5_arg_callable(tmp_path, stub_predictor_wiring):
     # make_predictor returns a callable whose signature is exactly the
-    # documented 5-arg public API — (team_a, team_b, best_of, map_pool,
-    # as_of_date) — closing over the (stubbed) tables/models. The
-    # explicit () escape hatch (D10) keeps the factory off the
-    # real-data auto-load path so the test stays hermetic regardless
-    # of whether data/v1/ordinal_bootstrap_replicates.json exists.
+    # documented public API — the five positional args (team_a, team_b,
+    # best_of, map_pool, as_of_date) plus, since M39.4 (G3), the
+    # keyword-only top_n defaulting to DEFAULT_TOP_N — closing over the
+    # (stubbed) tables/models. The explicit () escape hatch (D10)
+    # keeps the factory off the real-data auto-load path so the test
+    # stays hermetic regardless of whether
+    # data/v1/ordinal_bootstrap_replicates.json exists.
     predictor = pred.make_predictor(
         "data", "v1", n_samples=3, bootstrap_models=()
     )
     assert callable(predictor)
-    parameters = list(inspect.signature(predictor).parameters)
-    assert parameters == ["team_a", "team_b", "best_of", "map_pool", "as_of_date"]
+    parameters = inspect.signature(predictor).parameters
+    assert list(parameters) == [
+        "team_a", "team_b", "best_of", "map_pool", "as_of_date",
+        "top_n",
+    ]
+    top_n_param = parameters["top_n"]
+    assert top_n_param.kind == inspect.Parameter.KEYWORD_ONLY
+    assert top_n_param.default == pred.DEFAULT_TOP_N
+    assert pred.DEFAULT_TOP_N == 10
 
 
 def test_make_predictor_defaults_match_documented(tmp_path, stub_predictor_wiring):
@@ -1798,6 +1892,302 @@ def test_make_predictor_explicit_models_override_auto_load(
 
 
 # --------------------------------------------------------------------------
+# plan#4-7/9: M39.4 — top_n folded into predict() (G1-G6)
+# --------------------------------------------------------------------------
+
+
+def test_predict_top_vetos_default_ranking_and_shapes(
+    tmp_path, stub_predictor_wiring
+):
+    # M39.4 (G1/G4/G6): a predict() call with the default top_n
+    # returns exactly min(DEFAULT_TOP_N, 5040) top_vetos entries
+    # sorted by descending veto_probability (stable; ties keep
+    # enumeration order — same rule as top_vetos's own ranking test);
+    # every entry's result has veto_sensitivity None (G6) and an
+    # exact-M30 series over that specific veto's played maps; the
+    # top-level veto_sensitivity stays a real M31 VetoSensitivity; the
+    # greedy predicted_veto is computed independently (F7) and is NOT
+    # assumed to be the top-ranked entry; and the whole result
+    # round-trips through to_dict (each inner ranked result's own
+    # "top_vetos" is [] — G1's double-serialization consequence).
+    matches_df, maps_df, _ = _league_tables()
+    as_of_date = "2026-01-01T00:00:00"
+    predictor = pred.make_predictor(
+        "data", "v1", n_samples=3, seed=2026, ci_level=0.9,
+        bootstrap_models=(),
+    )
+    result = predictor("A", "B", "Bo3", _STUB_POOL, as_of_date)
+
+    assert pred.DEFAULT_TOP_N == 10
+    assert len(result.top_vetos) == 10
+    probabilities = [e.veto_probability for e in result.top_vetos]
+    assert probabilities == sorted(probabilities, reverse=True)
+
+    # G6: the top-level veto_sensitivity is a real M31 summary while
+    # every inner ranked result's is None.
+    assert result.veto_sensitivity is not None
+    assert all(
+        e.result.veto_sensitivity is None for e in result.top_vetos
+    )
+
+    # The unique top walk under the top-two stub arm: always-first
+    # over the sorted pool leaves Sunset as the decider.
+    assert result.top_vetos[0].veto_probability == pytest.approx(0.6**6)
+    assert [
+        a.map_name for a in result.top_vetos[0].result.predicted_veto
+    ] == ["Ascent", "Bind", "Haven", "Icebox", "Lotus", "Split",
+          "Sunset"]
+    # The stub greedy veto's played maps (Bind/Ascent/Sunset) differ
+    # from the top-ranked enumerated veto's — the two are computed
+    # independently.
+    assert [pm.map_name for pm in result.per_map] == [
+        "Bind", "Ascent", "Sunset"
+    ]
+    assert [
+        pm.map_name for pm in result.top_vetos[0].result.per_map
+    ] == ["Haven", "Icebox", "Sunset"]
+
+    # Every entry: per-map fields + the exact-M30 series (the constant
+    # stub map vector (0.6, 0.1, 0.1, 0.2) collapses to an A-win
+    # probability of 0.7 per played map).
+    for entry in result.top_vetos:
+        played_maps = [
+            a.map_name
+            for a in entry.result.predicted_veto
+            if a.action in ("pick", "decider")
+        ]
+        assert [pm.map_name for pm in entry.result.per_map] == played_maps
+        for pm in entry.result.per_map:
+            assert pm.probabilities == (0.6, 0.1, 0.1, 0.2)
+            assert pm.interval_low is None
+            assert pm.interval_high is None
+            assert pm.n_games_backing == pred._n_games_backing_for_map(
+                "A", "B", pm.map_name, as_of_date, matches_df, maps_df
+            )
+        expected_series = series_paths.series_probabilities_in_order(
+            [0.7] * len(played_maps), 3
+        )
+        assert entry.result.series.probabilities == pytest.approx(
+            expected_series
+        )
+        assert (
+            entry.result.series.outcome_order
+            == series_paths.series_outcome_order(3)
+        )
+        assert entry.result.series.best_of == 3
+        # G1: a fixed-veto conditional result carries no nested
+        # ranking.
+        assert entry.result.top_vetos == ()
+
+    # Cross-check the ranking against an independent enumeration +
+    # stable descending sort (mirroring the top_vetos ranking test).
+    enumerated = pred.ancestral_veto_sampler.enumerate_veto_sequences(
+        "A", "B", "Bo3", as_of_date, matches_df, maps_df,
+        {"ban": _top_two_step_stub, "pick": _top_two_step_stub},
+        map_pool=_STUB_POOL,
+    )
+    ranked = sorted(
+        enumerated,
+        key=lambda seq: seq.sequence_probability,
+        reverse=True,
+    )
+    for entry, seq in zip(result.top_vetos, ranked[:10]):
+        assert entry.veto_probability == seq.sequence_probability
+
+    # The whole result round-trips through JSON; the top_vetos list
+    # carries the double-serialized inner results.
+    result_dict = result.to_dict()
+    assert len(result_dict["top_vetos"]) == 10
+    assert all(
+        inner["result"]["top_vetos"] == []
+        for inner in result_dict["top_vetos"]
+    )
+    json.loads(json.dumps(result_dict))
+
+
+def test_predict_top_n_edge_cases(tmp_path, stub_predictor_wiring):
+    # M39.4 (G3): top_n=1 returns exactly the single best entry and
+    # top_n larger than the 5,040-sequence total silently returns all
+    # 5,040 without error (mirroring test_top_vetos_n_edge_cases) —
+    # the enumeration always runs in full; top_n only slices the
+    # returned ranking.
+    predictor = pred.make_predictor(
+        "data", "v1", n_samples=3, bootstrap_models=()
+    )
+    as_of_date = "2026-01-01T00:00:00"
+    one = predictor("A", "B", "Bo3", _STUB_POOL, as_of_date, top_n=1)
+    assert len(one.top_vetos) == 1
+    assert one.top_vetos[0].veto_probability == pytest.approx(0.6**6)
+    # The greedy/M31 fields are still present beside the ranked entry.
+    assert one.veto_sensitivity is not None
+    all_sequences = predictor(
+        "A", "B", "Bo3", _STUB_POOL, as_of_date, top_n=5041
+    )
+    assert len(all_sequences.top_vetos) == 5040
+
+
+def test_predict_rejects_top_n_lt_1_before_any_enumeration(
+    tmp_path, stub_predictor_wiring, monkeypatch
+):
+    # M39.4 (G3/A1): top_n=0 and top_n=-1 raise ValueError before any
+    # enumeration work — asserted via a call-counting stub on the
+    # enumerate entry point, which is never invoked (the fail-fast
+    # sits at the top of predict's body, before even the greedy/M31
+    # work; no top_n=0-means-skip convention exists, so 0 is simply
+    # invalid).
+    calls = {"enumerate": 0}
+
+    def counting_enumerate(*args, **kwargs):
+        """Count invocations and fail if reached (top_n<1 must never call it).
+
+        Args:
+            *args: Positional arguments (unused).
+            **kwargs: Keyword arguments (unused).
+
+        Returns:
+            Nothing (raises instead).
+
+        Raises:
+            AssertionError: Always — reaching the enumerator means the
+                top_n validation failed to run first.
+        """
+        calls["enumerate"] += 1
+        raise AssertionError(
+            "enumerate_veto_sequences must not be called for top_n < 1"
+        )
+
+    monkeypatch.setattr(
+        pred.ancestral_veto_sampler,
+        "enumerate_veto_sequences",
+        counting_enumerate,
+    )
+    predictor = pred.make_predictor(
+        "data", "v1", n_samples=3, bootstrap_models=()
+    )
+    for bad_top_n in (0, -1):
+        with pytest.raises(
+            ValueError, match="top_n must be a positive integer"
+        ):
+            predictor(
+                "A", "B", "Bo3", _STUB_POOL, "2026-01-01T00:00:00",
+                top_n=bad_top_n,
+            )
+    assert calls["enumerate"] == 0
+
+
+def test_predict_top_vetos_intervals_via_auto_load(
+    tmp_path, stub_predictor_wiring, monkeypatch
+):
+    # M39.4 (G5): with a genuine ordinal_bootstrap_replicates.json on
+    # disk (coefficient[0]-encoded tilts) and bootstrap_models not
+    # passed, the D10 auto-load reaches EVERY ranked
+    # RankedVetoPrediction.result.per_map entry — each per-map
+    # interval_low/high is the same per-category percentile band over
+    # the auto-loaded replicate vectors that the greedy top-level
+    # per_map entries carry (every map shares the stub vector, so all
+    # intervals equal lo/hi).
+    tilts = [0.0, 0.02, 0.04]
+    models = [_synthetic_ordinal_model() for _ in tilts]
+    for model, d in zip(models, tilts):
+        model.coefficients[0] = d
+    version_dir = tmp_path / "v1"
+    version_dir.mkdir()
+    (version_dir / "ordinal_logit_model.json").write_text(
+        json.dumps(_ordinal_artifact_dict()), encoding="utf-8"
+    )
+    _write_replicate_artifact(version_dir, models, [-1.0, 0.0, 1.0])
+    monkeypatch.setattr(
+        pred.ordinal_logit,
+        "make_model_fn",
+        _make_model_fn_routing_on_coefficient_zero,
+    )
+    lo, hi = _expected_interval_bands(tilts, ci_level=0.9)
+
+    predictor = pred.make_predictor(
+        tmp_path, "v1", n_samples=3, seed=2026, ci_level=0.9
+    )
+    result = predictor("A", "B", "Bo3", _STUB_POOL, "2026-01-01T00:00:00")
+
+    # The greedy per-map intervals land the auto-loaded bands.
+    for entry in result.per_map:
+        assert entry.interval_low == pytest.approx(lo)
+        assert entry.interval_high == pytest.approx(hi)
+    # Every ranked entry's per-map intervals inherit the same D10
+    # auto-load (G5).
+    assert len(result.top_vetos) == 10
+    for ranked in result.top_vetos:
+        for pm in ranked.result.per_map:
+            assert pm.interval_low == pytest.approx(lo)
+            assert pm.interval_high == pytest.approx(hi)
+            assert pm.probabilities == (0.6, 0.1, 0.1, 0.2)
+
+
+def test_predict_top_vetos_matches_standalone_top_vetos(
+    tmp_path, stub_predictor_wiring
+):
+    # Task-055 contract preserved (roadmap Tests bullet): for the same
+    # query, ci_level and bootstrap_models, make_top_vetos_fn's
+    # top_vetos(n=10) listing equals predict(...).top_vetos entry for
+    # entry by veto_probability and the relevant PredictionResult
+    # fields (predicted_veto, per_map, series; inner top_vetos is ()
+    # on both sides) — the shared _build_ranked_veto_entries helper
+    # (G2) guarantees the two paths build identical entries.
+    as_of_date = "2026-01-01T00:00:00"
+    predictor = pred.make_predictor(
+        "data", "v1", n_samples=3, seed=2026, ci_level=0.9,
+        bootstrap_models=(),
+    )
+    result = predictor("A", "B", "Bo3", _STUB_POOL, as_of_date)
+    top_vetos = pred.make_top_vetos_fn("data", "v1", ci_level=0.9)
+    listing = top_vetos("A", "B", "Bo3", _STUB_POOL, as_of_date, n=10)
+
+    assert len(listing) == len(result.top_vetos) == 10
+    for standalone, folded in zip(listing, result.top_vetos):
+        assert standalone.veto_probability == folded.veto_probability
+        assert (
+            standalone.result.predicted_veto
+            == folded.result.predicted_veto
+        )
+        assert [
+            pm.to_dict() for pm in standalone.result.per_map
+        ] == [pm.to_dict() for pm in folded.result.per_map]
+        assert (
+            standalone.result.series.to_dict()
+            == folded.result.series.to_dict()
+        )
+        assert standalone.result.veto_sensitivity is None
+        assert standalone.result.top_vetos == ()
+        assert folded.result.top_vetos == ()
+
+
+def test_predictor_predict_forwards_top_n(tmp_path, stub_predictor_wiring):
+    # M39.4 (A5): Predictor.predict accepts the keyword-only top_n and
+    # forwards it to the wrapped closure — the widened result's
+    # top_vetos shape matches calling make_predictor(...) directly
+    # with the same top_n (bitwise-equal to_dict), and omitting top_n
+    # uses DEFAULT_TOP_N per call (no top_n at construction time).
+    as_of_date = "2026-01-01T00:00:00"
+    predictor = Predictor(
+        tmp_path, "v1", n_samples=3, seed=2026, ci_level=0.9,
+        bootstrap_models=(),
+    )
+    direct = pred.make_predictor(
+        tmp_path, "v1", n_samples=3, seed=2026, ci_level=0.9,
+        bootstrap_models=(),
+    )
+    small = predictor.predict(
+        "A", "B", "Bo3", _STUB_POOL, as_of_date, top_n=3
+    )
+    assert len(small.top_vetos) == 3
+    direct_small = direct(
+        "A", "B", "Bo3", _STUB_POOL, as_of_date, top_n=3
+    )
+    assert small.to_dict() == direct_small.to_dict()
+    default = predictor.predict("A", "B", "Bo3", _STUB_POOL, as_of_date)
+    assert len(default.top_vetos) == pred.DEFAULT_TOP_N == 10
+
+
+# --------------------------------------------------------------------------
 # plan#10b: D5 veto_sensitivity path (hand-computed spread)
 # --------------------------------------------------------------------------
 
@@ -1990,6 +2380,9 @@ def test_parse_args_defaults():
     assert args.n_samples == DEFAULT_N_SAMPLES
     assert args.seed == DEFAULT_SEED
     assert args.ci_level == DEFAULT_CI_LEVEL
+    # M39.4 (G7): --top-n defaults to DEFAULT_TOP_N.
+    assert args.top_n == pred.DEFAULT_TOP_N
+    assert pred.DEFAULT_TOP_N == 10
 
 
 def test_parse_args_flag_overrides():
@@ -2001,7 +2394,8 @@ def test_parse_args_flag_overrides():
          "--team-a", "A", "--team-b", "B", "--best-of", "Bo5",
          "--map-pool", "Bind,Haven,Split,Ascent,Lotus,Icebox,Sunset",
          "--as-of-date", "2026-01-01T00:00:00",
-         "--n-samples", "2", "--seed", "7", "--ci-level", "0.8"]
+         "--n-samples", "2", "--seed", "7", "--ci-level", "0.8",
+         "--top-n", "3"]
     )
     assert args.version == "v2"
     assert args.output_dir == "out"
@@ -2011,6 +2405,12 @@ def test_parse_args_flag_overrides():
     assert args.n_samples == 2
     assert args.seed == 7
     assert args.ci_level == 0.8
+    assert args.top_n == 3
+    # Non-int --top-n is rejected by argparse (SystemExit).
+    with pytest.raises(SystemExit):
+        pred.parse_args(["--team-a", "A", "--team-b", "B",
+                         "--best-of", "Bo3", "--as-of-date", "d",
+                         "--top-n", "many"])
     with pytest.raises(SystemExit):
         pred.parse_args(["--team-a", "A", "--team-b", "B",
                          "--best-of", "Bo7", "--as-of-date", "d"])
@@ -2032,7 +2432,9 @@ def test_main_rejects_malformed_map_pool():
 
 
 def test_main_prints_json_result(capsys, monkeypatch):
-    # main() builds the predictor, calls predict once and prints the
+    # main() builds the predictor, calls predict once (with
+    # top_n=args.top_n — the M39.4/G7 session-level knob — asserted
+    # inside the stub closure) and prints the
     # JSON-serialized result (indent=2, sorted keys) to stdout with a
     # one-line log summary; exit 0. The predictor factory is stubbed to
     # a canned result so no tables/artifacts are needed.
@@ -2045,7 +2447,10 @@ def test_main_prints_json_result(capsys, monkeypatch):
         ci_level=pred.DEFAULT_CI_LEVEL,
         bootstrap_models=None,
     ):
-        def stub_predict(team_a, team_b, best_of, map_pool, as_of_date):
+        def stub_predict(
+            team_a, team_b, best_of, map_pool, as_of_date, *, top_n=10
+        ):
+            assert top_n == 3
             return PredictionResult(
                 predicted_veto=_STUB_VETO_ACTIONS,
                 per_map=(
@@ -2078,7 +2483,7 @@ def test_main_prints_json_result(capsys, monkeypatch):
     rc = pred.main(
         ["--team-a", "A", "--team-b", "B", "--best-of", "Bo3",
          "--as-of-date", "2026-01-01T00:00:00", "--n-samples", "3",
-         "--seed", "7", "--ci-level", "0.9"]
+         "--seed", "7", "--ci-level", "0.9", "--top-n", "3"]
     )
     assert rc == 0
     captured = capsys.readouterr()
@@ -2088,6 +2493,10 @@ def test_main_prints_json_result(capsys, monkeypatch):
     assert printed["series"]["best_of"] == 3
     assert printed["veto_sensitivity"]["mean_band_width"] == 0.075
     assert printed["predicted_veto"][0]["action"] == "ban"
+    # M39.4 (G7): the one-shot output carries the additive top_vetos
+    # key automatically via to_dict — [] here because the canned stub
+    # result carries no ranking.
+    assert printed["top_vetos"] == []
 
 
 # --------------------------------------------------------------------------
@@ -2252,9 +2661,12 @@ def _canned_prediction_result(n_games_backing: int) -> PredictionResult:
 
 def test_predictor_wraps_make_predictor_single_load(tmp_path, monkeypatch):
     # E1: Predictor.__init__ invokes make_predictor exactly once,
-    # forwarding output_dir/version and every keyword unchanged; each
+    # forwarding output_dir/version and every keyword unchanged (no
+    # top_n at construction — M39.4/G3, A5); each
     # .predict call delegates to the returned closure with the exact
-    # arguments passed and returns its result unmodified. The factory
+    # arguments passed plus the forwarded keyword-only top_n
+    # (defaulting to DEFAULT_TOP_N per call) and returns its result
+    # unmodified. The factory
     # is never re-invoked per call.
     factory_calls = {"count": 0}
     forwarded = {}
@@ -2280,9 +2692,11 @@ def test_predictor_wraps_make_predictor_single_load(tmp_path, monkeypatch):
             bootstrap_models=bootstrap_models,
         )
 
-        def stub_predict(team_a, team_b, best_of, map_pool, as_of_date):
+        def stub_predict(
+            team_a, team_b, best_of, map_pool, as_of_date, *, top_n=10
+        ):
             closure_calls.append(
-                (team_a, team_b, best_of, map_pool, as_of_date)
+                (team_a, team_b, best_of, map_pool, as_of_date, top_n)
             )
             result = _canned_prediction_result(
                 n_games_backing=len(closure_calls)
@@ -2314,9 +2728,9 @@ def test_predictor_wraps_make_predictor_single_load(tmp_path, monkeypatch):
 
     assert factory_calls["count"] == 1
     assert closure_calls == [
-        ("A", "B", "Bo3", _STUB_POOL, "2026-01-01T00:00:00"),
-        ("C", "D", "Bo1", None, "2026-01-02T00:00:00"),
-        ("E", "F", "Bo5", _STUB_POOL, "2026-01-03T00:00:00"),
+        ("A", "B", "Bo3", _STUB_POOL, "2026-01-01T00:00:00", 10),
+        ("C", "D", "Bo1", None, "2026-01-02T00:00:00", 10),
+        ("E", "F", "Bo5", _STUB_POOL, "2026-01-03T00:00:00", 10),
     ]
     # Each .predict return is the stub closure's own result object,
     # unmodified.
@@ -2419,6 +2833,21 @@ def test_predictor_real_wiring_loads_once(tmp_path, monkeypatch):
         "predict_series_outcome_via_veto_marginalization",
         stub_m31_entry,
     )
+    # M39.4 (G2): predict()'s fourth step enumerates over the wired
+    # predictor_fn_by_action dict, so the make_veto_step_predictor_fn
+    # factories must produce the deterministic stub arm (the counting
+    # veto_models loader returns (None, None), which the real
+    # factories' closures would crash on when invoked).
+    monkeypatch.setattr(
+        pred.conditional_logit_ban,
+        "make_veto_step_predictor_fn",
+        lambda model: _top_two_step_stub,
+    )
+    monkeypatch.setattr(
+        pred.conditional_logit_pick,
+        "make_veto_step_predictor_fn",
+        lambda model: _top_two_step_stub,
+    )
 
     predictor = Predictor(tmp_path, "v1", n_samples=3, seed=2026, ci_level=0.9)
     assert counters == {
@@ -2433,8 +2862,14 @@ def test_predictor_real_wiring_loads_once(tmp_path, monkeypatch):
     result_a = predictor.predict(
         "A", "B", "Bo3", _STUB_POOL, "2026-01-01T00:00:00"
     )
+    # The None-pool call keeps an explicit map_pool=None (the M31 stub
+    # tolerates it), but its as-of date must sit inside a configured
+    # config.json era: since M39.4 the predict() enumeration resolves a
+    # None pool against config (as the real greedy simulator always
+    # did), and the synthetic 2026-01-02 predates the first era
+    # (2026-04-01). 2026-04-15 is inside era 2026-s1-bind.
     result_c = predictor.predict(
-        "C", "D", "Bo3", None, "2026-01-02T00:00:00"
+        "C", "D", "Bo3", None, "2026-04-15T00:00:00"
     )
 
     # The loads still happened exactly once; only the per-call M31
@@ -2559,9 +2994,11 @@ def test_main_stream_mode_end_to_end(capsys, monkeypatch):
         assert seed == 7
         assert ci_level == 0.9
 
-        def stub_predict(team_a, team_b, best_of, map_pool, as_of_date):
+        def stub_predict(
+            team_a, team_b, best_of, map_pool, as_of_date, *, top_n=10
+        ):
             call_log.append(
-                (team_a, team_b, best_of, map_pool, as_of_date)
+                (team_a, team_b, best_of, map_pool, as_of_date, top_n)
             )
             # Vary the per-map backing by the queried team_a so each
             # printed line is distinguishable.
@@ -2588,7 +3025,7 @@ def test_main_stream_mode_end_to_end(capsys, monkeypatch):
 
     rc = pred.main(
         ["--stream", "--n-samples", "3", "--seed", "7", "--ci-level",
-         "0.9"]
+         "0.9", "--top-n", "5"]
     )
     assert rc == 0
     captured = capsys.readouterr()
@@ -2601,13 +3038,19 @@ def test_main_stream_mode_end_to_end(capsys, monkeypatch):
     assert [line["per_map"][0]["n_games_backing"] for line in parsed_lines] == [
         10, 20
     ]
+    # M39.4 (G7): the session-level --top-n reaches every per-query
+    # Predictor.predict call (no per-query top_n in the JSON schema),
+    # and every printed line carries the additive top_vetos key.
+    assert [line["top_vetos"] for line in parsed_lines] == [[], []]
     # One predictor build for the whole stream; the queries reached the
-    # closure with the map_pool as tuple / None respectively.
+    # closure with the map_pool as tuple / None respectively and the
+    # session top_n=5 on both.
     assert factory_calls["count"] == 1
     assert call_log[0][3] == tuple(pool)
     assert call_log[1][3] is None
     assert call_log[0][0] == "10"
     assert call_log[1][0] == "20"
+    assert [call[5] for call in call_log] == [5, 5]
 
 
 # --------------------------------------------------------------------------
@@ -2653,7 +3096,9 @@ def test_stream_mode_errors_propagate_uncaught(
     ):
         factory_calls["count"] += 1
 
-        def stub_predict(team_a, team_b, best_of, map_pool, as_of_date):
+        def stub_predict(
+            team_a, team_b, best_of, map_pool, as_of_date, *, top_n=10
+        ):
             return _canned_prediction_result(n_games_backing=1)
 
         return stub_predict
@@ -2731,4 +3176,73 @@ def test_real_v1_top_vetos_smoke():
         assert sum(result.series.probabilities) == pytest.approx(1.0)
     # The full listing round-trips through json.dumps.
     json.dumps([e.to_dict() for e in entries])
+    assert elapsed > 0.0
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    not _real_v1_available(),
+    reason="real v1 tables/artifacts not present",
+)
+def test_real_v1_predict_top_vetos_smoke():
+    # A tiny real-v1 run of the M39.4 fold (n_samples=2, no bootstrap,
+    # default top_n=10) against the real fitted models and tables for
+    # one mid-season Bo3 match: predict() completes (the exact
+    # 5,040-sequence enumeration stays tractable via F2's memoisation
+    # — ~120 real predictor calls — plus ten per-veto result
+    # constructions) and returns a non-empty top_vetos tuple of ten
+    # entries sorted descending by veto_probability, each with
+    # veto_sensitivity None (G6) and None intervals (the () escape
+    # hatch), while the top-level veto_sensitivity stays a real
+    # non-None M31 summary, and the whole widened result is
+    # json.dumps-serializable. Wall-clock is measured (the added
+    # per-call enumeration cost) and reported in the BUILD status.md
+    # note.
+    import time
+
+    matches_df = pred.evaluate.load_matches_table(Path("data"), "v1")
+    row = matches_df[
+        (matches_df["best_of"] == "Bo3")
+        & (matches_df["date"] >= "2026-07-01")
+    ].iloc[0]
+    predictor = pred.make_predictor(
+        "data", "v1", n_samples=2, seed=2026, ci_level=0.9,
+        bootstrap_models=(),
+    )
+    start = time.monotonic()
+    result = predictor(
+        str(row["team1_id"]),
+        str(row["team2_id"]),
+        "Bo3",
+        None,
+        row["date"],
+    )
+    elapsed = time.monotonic() - start
+
+    assert len(result.top_vetos) == 10
+    probabilities = [e.veto_probability for e in result.top_vetos]
+    assert probabilities == sorted(probabilities, reverse=True)
+    assert result.veto_sensitivity is not None
+    for entry in result.top_vetos:
+        assert 0.0 <= entry.veto_probability <= 1.0
+        ranked_result = entry.result
+        assert ranked_result.veto_sensitivity is None
+        assert len(ranked_result.predicted_veto) == 7
+        assert [a.action for a in ranked_result.predicted_veto] == [
+            "ban", "ban", "pick", "pick", "ban", "ban", "decider"
+        ]
+        assert len(ranked_result.per_map) == 3
+        for pm in ranked_result.per_map:
+            assert len(pm.probabilities) == 4
+            assert sum(pm.probabilities) == pytest.approx(1.0)
+            assert all(np.isfinite(p) for p in pm.probabilities)
+            assert pm.interval_low is None
+            assert pm.interval_high is None
+            assert pm.n_games_backing >= 0
+        assert ranked_result.series.best_of == 3
+        assert len(ranked_result.series.probabilities) == 4
+        assert sum(ranked_result.series.probabilities) == pytest.approx(1.0)
+        assert ranked_result.top_vetos == ()
+    # The full widened result round-trips through json.dumps.
+    json.dumps(result.to_dict())
     assert elapsed > 0.0
