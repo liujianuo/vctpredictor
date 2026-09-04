@@ -19,13 +19,19 @@ hand-known replicate 4-vectors); the D5 veto-sensitivity path
 weighted moments over the same M31 sample detail); propagated error
 paths (invalid ``best_of`` / wrong-size ``map_pool`` raise
 ``ValueError`` from the real greedy simulator); a ``main()`` CLI smoke
-test with the predictor stubbed (JSON printed to stdout, exit 0); and
+test with the predictor stubbed (JSON printed to stdout, exit 0); the
+M39.1 persistent layer (``Predictor`` wraps :func:`make_predictor`
+loading exactly once per construction — ``--stream`` CLI mode
+answering a JSONL query stream from stdin with one persistent
+``Predictor``, its ``parse_args`` mutual-exclusion validation, and the
+stream-mode error propagation); and
 a ``skipif``-guarded real-v1 integration smoke test asserting finite,
 well-formed output. No real fitted artifacts are required by the
 non-smoke tests.
 """
 
 import inspect
+import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,6 +44,7 @@ from drivers import predict as pred
 from drivers.predict import (
     PerMapPrediction,
     PredictionResult,
+    Predictor,
     SeriesPrediction,
     VetoSensitivity,
 )
@@ -1432,3 +1439,475 @@ def test_real_v1_predict_smoke():
 
     # The full result round-trips through json.dumps.
     json.dumps(result.to_dict())
+
+
+# --------------------------------------------------------------------------
+# plan#6: Predictor wraps make_predictor (fast, monkeypatched factory)
+# --------------------------------------------------------------------------
+
+
+def _canned_prediction_result(n_games_backing: int) -> PredictionResult:
+    """Build one canned PredictionResult for the stream-mode stubs.
+
+    Constructs a full :class:`PredictionResult` — a single Bind
+    per-map entry whose ``n_games_backing`` is the passed value (the
+    per-line discriminator the stream-mode tests vary by the queried
+    ``team_a``), plus the canned veto/series/sensitivity records —
+    mirroring the construction pattern of
+    ``test_main_prints_json_result``'s inline stub so each printed
+    stream line is a distinguishably different, fully
+    ``json.dumps``-serializable object while the whole canned result
+    stays hand-assertable.
+
+    Args:
+        n_games_backing: The per-map entry's ``n_games_backing``
+            value.
+
+    Returns:
+        A fresh ``PredictionResult`` whose single ``per_map`` entry
+        carries ``n_games_backing`` equal to the argument.
+
+    Raises:
+        Nothing.
+    """
+    return PredictionResult(
+        predicted_veto=_STUB_VETO_ACTIONS,
+        per_map=(
+            PerMapPrediction(
+                map_name="Bind",
+                probabilities=(0.6, 0.1, 0.1, 0.2),
+                interval_low=None,
+                interval_high=None,
+                n_games_backing=n_games_backing,
+            ),
+        ),
+        series=SeriesPrediction(
+            probabilities=(0.5, 0.3, 0.1, 0.1),
+            outcome_order=series_paths.series_outcome_order(3),
+            best_of=3,
+        ),
+        veto_sensitivity=VetoSensitivity(
+            unweighted_band_low=(0.4, 0.3, 0.1, 0.1),
+            unweighted_band_high=(0.6, 0.4, 0.1, 0.1),
+            band_widths=(0.2, 0.1, 0.0, 0.0),
+            mean_band_width=0.075,
+            weighted_mean=(0.5, 0.3, 0.1, 0.1),
+            weighted_variance=(0.01, 0.01, 0.0, 0.0),
+        ),
+    )
+
+
+def test_predictor_wraps_make_predictor_single_load(tmp_path, monkeypatch):
+    # E1: Predictor.__init__ invokes make_predictor exactly once,
+    # forwarding output_dir/version and every keyword unchanged; each
+    # .predict call delegates to the returned closure with the exact
+    # arguments passed and returns its result unmodified. The factory
+    # is never re-invoked per call.
+    factory_calls = {"count": 0}
+    forwarded = {}
+    closure_calls = []
+    returned = []
+
+    def stub_make_predictor(
+        output_dir,
+        version,
+        *,
+        n_samples=pred.DEFAULT_N_SAMPLES,
+        seed=pred.DEFAULT_SEED,
+        ci_level=pred.DEFAULT_CI_LEVEL,
+        bootstrap_models=None,
+    ):
+        factory_calls["count"] += 1
+        forwarded.update(
+            output_dir=output_dir,
+            version=version,
+            n_samples=n_samples,
+            seed=seed,
+            ci_level=ci_level,
+            bootstrap_models=bootstrap_models,
+        )
+
+        def stub_predict(team_a, team_b, best_of, map_pool, as_of_date):
+            closure_calls.append(
+                (team_a, team_b, best_of, map_pool, as_of_date)
+            )
+            result = _canned_prediction_result(
+                n_games_backing=len(closure_calls)
+            )
+            returned.append(result)
+            return result
+
+        return stub_predict
+
+    monkeypatch.setattr(pred, "make_predictor", stub_make_predictor)
+    predictor = Predictor(tmp_path, "v2", n_samples=5, seed=9, ci_level=0.8)
+    assert factory_calls["count"] == 1
+    assert forwarded == {
+        "output_dir": tmp_path,
+        "version": "v2",
+        "n_samples": 5,
+        "seed": 9,
+        "ci_level": 0.8,
+        "bootstrap_models": None,
+    }
+
+    first = predictor.predict(
+        "A", "B", "Bo3", _STUB_POOL, "2026-01-01T00:00:00"
+    )
+    second = predictor.predict("C", "D", "Bo1", None, "2026-01-02T00:00:00")
+    third = predictor.predict(
+        "E", "F", "Bo5", _STUB_POOL, "2026-01-03T00:00:00"
+    )
+
+    assert factory_calls["count"] == 1
+    assert closure_calls == [
+        ("A", "B", "Bo3", _STUB_POOL, "2026-01-01T00:00:00"),
+        ("C", "D", "Bo1", None, "2026-01-02T00:00:00"),
+        ("E", "F", "Bo5", _STUB_POOL, "2026-01-03T00:00:00"),
+    ]
+    # Each .predict return is the stub closure's own result object,
+    # unmodified.
+    assert first is returned[0]
+    assert second is returned[1]
+    assert third is returned[2]
+    assert first.to_dict()["per_map"][0]["n_games_backing"] == 1
+    assert second.to_dict()["per_map"][0]["n_games_backing"] == 2
+
+
+# --------------------------------------------------------------------------
+# plan#7: Predictor real wiring loads once (synthetic league)
+# --------------------------------------------------------------------------
+
+
+def test_predictor_real_wiring_loads_once(tmp_path, monkeypatch):
+    # E1 end to end through the REAL make_predictor wiring (only the
+    # I/O and model sources are stubbed, each wrapped with a call
+    # counter): constructing one Predictor invokes each table loader,
+    # the Stage-2 registry factory and _load_veto_models exactly once;
+    # two .predict calls with different team_a/team_b/as_of_date values
+    # re-run the per-call M31 work (counter reaches 2) without
+    # re-loading anything. Both results are the hand-computable
+    # synthetic values: per-map probabilities (0.6, 0.1, 0.1, 0.2),
+    # backing [7, 4, 3] for the A/B call and [0, 0, 0] for the C/D
+    # call (neither side has stub history), series aggregate
+    # 0.465/0.335/0.1/0.1.
+    matches_df, maps_df, player_map_stats_df = _league_tables()
+    counters = {
+        "matches": 0,
+        "maps": 0,
+        "stats": 0,
+        "registry": 0,
+        "veto_models": 0,
+        "m31": 0,
+    }
+
+    def counting_matches(output_dir, version):
+        counters["matches"] += 1
+        return matches_df
+
+    def counting_maps(output_dir, version):
+        counters["maps"] += 1
+        return maps_df
+
+    def counting_stats(output_dir, version):
+        counters["stats"] += 1
+        return player_map_stats_df
+
+    def counting_registry(output_dir, version):
+        counters["registry"] += 1
+        return _stub_map_model_fn
+
+    def counting_veto_models(output_dir, version):
+        counters["veto_models"] += 1
+        return (None, None)
+
+    def stub_m31_entry(
+        team1_id,
+        team2_id,
+        best_of,
+        date,
+        matches_df,
+        maps_df,
+        map_model_fn,
+        predictor_fn_by_action,
+        n_samples,
+        rng,
+        map_pool=None,
+    ):
+        counters["m31"] += 1
+        assert callable(map_model_fn)
+        assert set(predictor_fn_by_action) == {"ban", "pick"}
+        assert isinstance(rng, np.random.Generator)
+        assert n_samples > 0
+        assert map_pool is None or tuple(map_pool) == tuple(_STUB_POOL)
+        return _stub_prediction(team1_id, team2_id, best_of, date, n_samples)
+
+    monkeypatch.setattr(
+        pred.evaluate, "load_matches_table", counting_matches
+    )
+    monkeypatch.setattr(pred.evaluate, "load_maps_table", counting_maps)
+    monkeypatch.setattr(
+        pred.evaluate, "load_player_map_stats_table", counting_stats
+    )
+    monkeypatch.setitem(
+        pred.evaluate.MODEL_REGISTRY,
+        pred._TEMPERATURE_MAP_MODEL_KEY,
+        counting_registry,
+    )
+    monkeypatch.setattr(pred, "_load_veto_models", counting_veto_models)
+    monkeypatch.setattr(
+        pred.map_win_rate, "team_map_win_rate", _stub_team_map_win_rate
+    )
+    monkeypatch.setattr(
+        pred.greedy_veto_simulator, "simulate_veto", _stub_simulate_veto
+    )
+    monkeypatch.setattr(
+        pred.veto_marginalized_series,
+        "predict_series_outcome_via_veto_marginalization",
+        stub_m31_entry,
+    )
+
+    predictor = Predictor(tmp_path, "v1", n_samples=3, seed=2026, ci_level=0.9)
+    assert counters == {
+        "matches": 1,
+        "maps": 1,
+        "stats": 1,
+        "registry": 1,
+        "veto_models": 1,
+        "m31": 0,
+    }
+
+    result_a = predictor.predict(
+        "A", "B", "Bo3", _STUB_POOL, "2026-01-01T00:00:00"
+    )
+    result_c = predictor.predict(
+        "C", "D", "Bo3", None, "2026-01-02T00:00:00"
+    )
+
+    # The loads still happened exactly once; only the per-call M31
+    # work advanced across the two calls.
+    assert counters == {
+        "matches": 1,
+        "maps": 1,
+        "stats": 1,
+        "registry": 1,
+        "veto_models": 1,
+        "m31": 2,
+    }
+
+    # Hand-computable result shapes for both calls.
+    for result in (result_a, result_c):
+        assert [a.action for a in result.predicted_veto] == [
+            "ban", "ban", "pick", "pick", "ban", "ban", "decider"
+        ]
+        assert [entry.map_name for entry in result.per_map] == [
+            "Bind", "Ascent", "Sunset"
+        ]
+        for entry in result.per_map:
+            assert entry.probabilities == (0.6, 0.1, 0.1, 0.2)
+            assert entry.interval_low is None
+            assert entry.interval_high is None
+        assert result.series.best_of == 3
+        assert result.series.probabilities == pytest.approx(
+            [0.465, 0.335, 0.1, 0.1]
+        )
+    # A/B backing is the hand-known min-games (7/4/3); C/D have no
+    # stub history, so every backing is 0.
+    assert [e.n_games_backing for e in result_a.per_map] == [7, 4, 3]
+    assert [e.n_games_backing for e in result_c.per_map] == [0, 0, 0]
+
+
+# --------------------------------------------------------------------------
+# plan#8: parse_args --stream flag and E3 mutual-exclusion validation
+# --------------------------------------------------------------------------
+
+
+def test_parse_args_stream_flag_alone():
+    # E2/E3: parse_args(["--stream"]) succeeds with no query flags
+    # (the manual post-parse checks pass with all four at None) and
+    # the stream attribute is True.
+    args = pred.parse_args(["--stream"])
+    assert args.stream is True
+    assert args.team_a is None
+    assert args.team_b is None
+    assert args.best_of is None
+    assert args.as_of_date is None
+    assert args.map_pool is None
+    assert args.n_samples == DEFAULT_N_SAMPLES
+    assert args.seed == DEFAULT_SEED
+    assert args.ci_level == DEFAULT_CI_LEVEL
+
+
+@pytest.mark.parametrize(
+    "query_flags",
+    [
+        ["--team-a", "A"],
+        ["--team-b", "B"],
+        ["--best-of", "Bo3"],
+        ["--as-of-date", "2026-01-01T00:00:00"],
+        ["--map-pool", "Bind,Haven,Split,Ascent,Lotus,Icebox,Sunset"],
+    ],
+)
+def test_parse_args_stream_rejects_any_query_flag(query_flags):
+    # E3: --stream is mutually exclusive with each of the five query
+    # flags — any one combined with --stream is a SystemExit from the
+    # manual post-parse check.
+    with pytest.raises(SystemExit):
+        pred.parse_args(["--stream"] + query_flags)
+
+
+@pytest.mark.parametrize(
+    "flag", ["--team-a", "--team-b", "--best-of", "--as-of-date"]
+)
+def test_parse_args_requires_all_four_query_flags_without_stream(flag):
+    # E3 re-confirmation (new assertion, not a modification of
+    # test_parse_args_defaults): without --stream, omitting any one of
+    # the four query flags is a SystemExit from the manual post-parse
+    # required-arg check.
+    full = [
+        "--team-a", "A",
+        "--team-b", "B",
+        "--best-of", "Bo3",
+        "--as-of-date", "2026-01-01T00:00:00",
+    ]
+    index = full.index(flag)
+    del full[index:index + 2]
+    with pytest.raises(SystemExit):
+        pred.parse_args(full)
+
+
+# --------------------------------------------------------------------------
+# plan#9: main() stream mode end-to-end (stubbed)
+# --------------------------------------------------------------------------
+
+
+def test_main_stream_mode_end_to_end(capsys, monkeypatch):
+    # E4-E6: main(["--stream"]) builds the Predictor (via the stubbed
+    # make_predictor — called exactly once), answers a JSONL stdin
+    # stream of one blank line + two valid queries (one with an
+    # explicit map_pool array, one without), and prints exactly two
+    # compact one-line JSON results whose per_map n_games_backing
+    # reflects each query's team_a. The map_pool-bearing query reaches
+    # the stub closure as a tuple; the other reaches it as None.
+    factory_calls = {"count": 0}
+    call_log = []
+
+    def stub_make_predictor(
+        output_dir,
+        version,
+        *,
+        n_samples=pred.DEFAULT_N_SAMPLES,
+        seed=pred.DEFAULT_SEED,
+        ci_level=pred.DEFAULT_CI_LEVEL,
+        bootstrap_models=None,
+    ):
+        factory_calls["count"] += 1
+        assert n_samples == 3
+        assert seed == 7
+        assert ci_level == 0.9
+
+        def stub_predict(team_a, team_b, best_of, map_pool, as_of_date):
+            call_log.append(
+                (team_a, team_b, best_of, map_pool, as_of_date)
+            )
+            # Vary the per-map backing by the queried team_a so each
+            # printed line is distinguishable.
+            return _canned_prediction_result(n_games_backing=int(team_a))
+
+        return stub_predict
+
+    monkeypatch.setattr(pred, "make_predictor", stub_make_predictor)
+    pool = ["Bind", "Haven", "Split", "Ascent", "Lotus", "Icebox",
+            "Sunset"]
+    stdin_text = "\n".join([
+        "",
+        json.dumps({
+            "team_a": "10", "team_b": "B", "best_of": "Bo3",
+            "as_of_date": "2026-01-01T00:00:00", "map_pool": pool,
+        }),
+        json.dumps({
+            "team_a": "20", "team_b": "D", "best_of": "Bo3",
+            "as_of_date": "2026-01-02T00:00:00",
+        }),
+        "",
+    ])
+    monkeypatch.setattr("sys.stdin", io.StringIO(stdin_text))
+
+    rc = pred.main(
+        ["--stream", "--n-samples", "3", "--seed", "7", "--ci-level",
+         "0.9"]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    output_lines = [
+        line for line in captured.out.splitlines() if line.strip()
+    ]
+    # One blank stdin line produced no output; exactly two results.
+    assert len(output_lines) == 2
+    parsed_lines = [json.loads(line) for line in output_lines]
+    assert [line["per_map"][0]["n_games_backing"] for line in parsed_lines] == [
+        10, 20
+    ]
+    # One predictor build for the whole stream; the queries reached the
+    # closure with the map_pool as tuple / None respectively.
+    assert factory_calls["count"] == 1
+    assert call_log[0][3] == tuple(pool)
+    assert call_log[1][3] is None
+    assert call_log[0][0] == "10"
+    assert call_log[1][0] == "20"
+
+
+# --------------------------------------------------------------------------
+# plan#10: stream-mode error propagation (stubbed)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "stdin_text, expected_exception",
+    [
+        # A malformed JSON line aborts the stream with the concrete
+        # json.JSONDecodeError uncaught.
+        ("{not valid json\n", json.JSONDecodeError),
+        # A query object missing the required "team_a" key aborts the
+        # stream with KeyError uncaught.
+        (
+            json.dumps({
+                "team_b": "B", "best_of": "Bo3",
+                "as_of_date": "2026-01-01T00:00:00",
+            })
+            + "\n",
+            KeyError,
+        ),
+    ],
+)
+def test_stream_mode_errors_propagate_uncaught(
+    monkeypatch, stdin_text, expected_exception
+):
+    # E5: neither a malformed JSON line nor a query missing a required
+    # key is swallowed — the exception propagates uncaught out of
+    # main() (after the single Predictor build), terminating the
+    # stream.
+    factory_calls = {"count": 0}
+
+    def stub_make_predictor(
+        output_dir,
+        version,
+        *,
+        n_samples=pred.DEFAULT_N_SAMPLES,
+        seed=pred.DEFAULT_SEED,
+        ci_level=pred.DEFAULT_CI_LEVEL,
+        bootstrap_models=None,
+    ):
+        factory_calls["count"] += 1
+
+        def stub_predict(team_a, team_b, best_of, map_pool, as_of_date):
+            return _canned_prediction_result(n_games_backing=1)
+
+        return stub_predict
+
+    monkeypatch.setattr(pred, "make_predictor", stub_make_predictor)
+    monkeypatch.setattr("sys.stdin", io.StringIO(stdin_text))
+    with pytest.raises(expected_exception):
+        pred.main(["--stream"])
+    assert factory_calls["count"] == 1
+
