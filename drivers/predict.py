@@ -6,7 +6,11 @@ Ships the documented library entry point
 
 (returned by :func:`make_predictor` over the materialised tables and
 fitted artifacts for one dataset version) plus a thin command-line
-wrapper. This is a **wiring milestone, not a model**: every underlying
+wrapper, and the M39.1 persistent layer: the :class:`Predictor` object
+that loads those tables/artifacts once at construction and answers
+many ``predict()`` calls in one process, driven from the CLI's
+``--stream`` JSONL query-stream mode. This is a **wiring milestone,
+not a model**: every underlying
 piece already exists and is reviewed/clean —
 ``models.greedy_veto_simulator`` (M25), ``models.ordinal_logit`` (M20),
 ``models.temperature_scaling`` (M24), ``models.ancestral_veto_sampler``
@@ -109,6 +113,79 @@ boundary-test change is needed.
   **not** loaded (they are training/eval inputs, and the
   bootstrap-interval path takes pre-fitted models per D4 rather than
   refitting).
+
+**Design decisions E1-E6 (recorded here, do not silently change) — the
+M39.1 persistent layer.**
+
+- **E1.** :class:`Predictor` is a thin wrapper over the existing
+  :func:`make_predictor` wiring; :func:`make_predictor` is untouched
+  internally. ``Predictor.__init__(output_dir, version, *,
+  n_samples=DEFAULT_N_SAMPLES, seed=DEFAULT_SEED,
+  ci_level=DEFAULT_CI_LEVEL, bootstrap_models=None)`` calls
+  :func:`make_predictor` exactly once, forwarding every keyword
+  unchanged, and stores the returned 5-arg closure as a private
+  attribute; ``Predictor.predict(team_a, team_b, best_of, map_pool,
+  as_of_date)`` calls that closure and returns its result unmodified.
+  :func:`make_predictor`'s body is not refactored or reordered — zero
+  risk to its reviewed-clean tests. A ``Predictor`` instance's
+  ``.predict(...)`` call is bitwise identical to calling
+  :func:`make_predictor(...)` once and invoking the returned closure
+  with the same arguments; D6's per-call fresh-RNG idempotence is
+  inherited unchanged since the wrapped closure is the same closure
+  :func:`make_predictor` already returns.
+- **E2.** ``--stream`` is an explicit CLI flag, not stdin
+  auto-detection. A new boolean flag ``--stream``
+  (``action="store_true"``, default ``False``) switches ``main()``
+  into persistent JSONL query-stream mode. Auto-detecting "stdin has
+  data" (e.g. ``sys.stdin.isatty()``) was considered and rejected: it
+  is not reliably testable and it silently changes behaviour based on
+  how the process happens to be invoked rather than an explicit,
+  discoverable flag. ``--stream`` is mutually exclusive with
+  ``--team-a`` / ``--team-b`` / ``--best-of`` / ``--as-of-date`` /
+  ``--map-pool`` — all five must be at their defaults (``None``) when
+  ``--stream`` is given.
+- **E3.** Argparse required-arg enforcement moves from
+  ``required=True`` to a manual post-parse check. ``--team-a``,
+  ``--team-b``, ``--best-of``, ``--as-of-date`` change to
+  ``required=False, default=None`` (``--best-of`` keeps its
+  ``choices=["Bo1", "Bo3", "Bo5"]`` constraint, which only fires
+  when a value is actually given); immediately after
+  ``parser.parse_args(argv)`` two manual checks each fire
+  ``parser.error(...)`` (raising ``SystemExit(2)``, matching
+  argparse's own required-arg behaviour): the four query flags are
+  required unless ``--stream`` is given, and ``--stream`` cannot be
+  combined with any of the five query flags.
+- **E4.** Stream query schema and per-line behaviour. One JSON object
+  per stdin line: ``{"team_a": str, "team_b": str, "best_of": str,
+  "as_of_date": str, "map_pool": [str, ...] | null}`` (``map_pool``
+  optional; absent or ``null`` means ``None``, same era-resolution as
+  the one-shot CLI, D8). A present ``map_pool`` JSON array is
+  converted to a ``tuple`` before calling ``Predictor.predict``.
+  Blank / whitespace-only lines are skipped silently. Extra keys in a
+  query object are ignored. There are no per-query knob overrides —
+  ``n_samples`` / ``seed`` / ``ci_level`` are fixed for the whole
+  stream from the CLI flags at ``Predictor`` construction time
+  ("persistent" = one session, one set of knobs, many queries).
+- **E5.** Stream-mode errors propagate; nothing is swallowed. A
+  malformed JSON line (``json.JSONDecodeError``), a query object
+  missing a required key (``KeyError``), or any exception
+  ``Predictor.predict(...)`` itself raises propagates uncaught out of
+  ``main()`` and terminates the stream — lines already printed stay on
+  stdout, nothing after the failing line is processed. No per-line
+  ``try``/``except``-and-continue.
+- **E6.** Stream-mode output format; the one-shot path stays
+  untouched. Each stream result prints as one compact JSON line —
+  ``json.dumps(result.to_dict(), sort_keys=True)``, no ``indent=``
+  (an indented multi-line object would break the one-line-per-result
+  JSONL contract) — via ``print(..., flush=True)`` so a piped
+  consumer sees results incrementally. This differs from the existing
+  one-shot path's pretty-printed ``indent=2`` output, which is
+  unchanged. The one-shot branch of ``main()`` keeps calling
+  :func:`make_predictor` directly (not through :class:`Predictor`) —
+  this preserves ``test_main_prints_json_result``'s existing
+  ``monkeypatch.setattr(pred, "make_predictor", stub)`` with zero
+  behaviour change (a one-shot process only ever calls ``predict``
+  once, so there is nothing to amortise).
 
 **Probability order.** Every per-map 4-vector and every interval band
 in this module is in :data:`models._shared.OUTCOME_LABELS` order —
