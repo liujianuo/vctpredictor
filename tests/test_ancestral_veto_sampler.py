@@ -31,6 +31,7 @@ from models.ancestral_veto_sampler import (
     ACTION_SEQUENCES,
     SampledVetoAction,
     SampledVetoSequence,
+    enumerate_veto_sequences,
     sample_veto_sequences,
 )
 from models.greedy_veto_simulator import (
@@ -322,6 +323,99 @@ def _near_one_hot_stub(acting_team_id, action, remaining_maps, date, matches_df,
     probs = [floor] * n
     probs[list(remaining_maps).index(chosen)] = 1.0 - floor * (n - 1)
     return probs
+
+
+def _top_two_rank_stub(
+    acting_team_id, action, remaining_maps, date, matches_df, maps_df
+):
+    """Return a distribution concentrated on the two alphabetically-first maps.
+
+    The deterministic non-uniform stub arm for the enumeration tests:
+    the alphabetically-first remaining map receives ``0.6``, the
+    second-alphabetical ``0.4`` and every other map ``0.0`` — summing
+    to exactly ``1.0`` for every remaining-set size the enumerator
+    consults (the decider step, the only one with a single map left,
+    never reaches a predictor). Because the mass is a function of the
+    remaining maps' alphabetical rank alone, the ``sequence_probability``
+    of any enumerated veto is a pure product of ``0.6``s (first
+    choices) and ``0.4``s (second choices) that a test can hand-compute
+    from the walk's removal order.
+
+    Args:
+        acting_team_id: The acting team's stable id (ignored).
+        action: The step's action (ignored).
+        remaining_maps: The sorted remaining-maps list the returned
+            distribution aligns to.
+        date: The as-of cutoff (ignored).
+        matches_df: The materialised matches table (ignored).
+        maps_df: The materialised maps table (ignored).
+
+    Returns:
+        A ``list`` of ``len(remaining_maps)`` probabilities: ``0.6``
+        on the first entry, ``0.4`` on the second, ``0.0`` on the
+        rest, summing to exactly ``1.0``.
+
+    Raises:
+        Nothing.
+    """
+    n = len(remaining_maps)
+    probs = [0.0] * n
+    probs[0] = 0.6
+    probs[1] = 0.4
+    return probs
+
+
+def _counting_uniform_stub_factory(call_state):
+    """Build a uniform stub that counts its invocations in a shared dict.
+
+    The counting-wrapper factory for the memoisation test: returns a
+    :data:`_uniform_stub`-behaving closure that increments
+    ``call_state["count"]`` on every invocation before delegating to
+    the uniform distribution. The dict is shared across every call the
+    enumerator makes within one enumeration, so the test can assert the
+    exact total number of predictor invocations (decision 10's 120-state
+    bound).
+
+    Args:
+        call_state: A ``{"count": int}`` dict the returned closure
+            increments on each invocation.
+
+    Returns:
+        The counting uniform stub closure, matching the
+        :data:`VetoStepPredictorFn`-shaped contract
+        ``(acting_team_id, action, remaining_maps, date, matches_df,
+        maps_df) -> Sequence[float]``.
+
+    Raises:
+        Nothing.
+    """
+
+    def counting_stub(
+        acting_team_id, action, remaining_maps, date, matches_df, maps_df
+    ):
+        """Increment the shared counter, then return a uniform distribution.
+
+        Args:
+            acting_team_id: The acting team's stable id (ignored).
+            action: The step's action (ignored).
+            remaining_maps: The sorted remaining-maps list the returned
+                distribution aligns to.
+            date: The as-of cutoff (ignored).
+            matches_df: The materialised matches table (ignored).
+            maps_df: The materialised maps table (ignored).
+
+        Returns:
+            A ``list`` of ``len(remaining_maps)`` equal ``float``
+            probabilities summing to approximately 1.
+
+        Raises:
+            Nothing.
+        """
+        call_state["count"] += 1
+        n = len(remaining_maps)
+        return [1.0 / n] * n
+
+    return counting_stub
 
 
 def _assert_walk_shape(samples):
@@ -866,6 +960,200 @@ def test_real_fitted_conditional_logit_closures_integration():
     for seq in samples:
         assert all(0.0 < a.probability < 1.0 for a in seq.actions[:-1])
         assert seq.sequence_probability < 1.0
+
+
+# --------------------------------------------------------------------------
+# M39.2 (055): enumerate_veto_sequences — exact exhaustive enumeration
+# --------------------------------------------------------------------------
+
+
+def test_enumerate_returns_5040_sequences_all_formats():
+    # Decision 9/10: the exhaustive enumeration returns exactly 7! =
+    # 5,040 full sequences for every supported best_of over the 7-map
+    # pool, each a structurally valid walk whose sequence_probability
+    # under the uniform stub is 1/5040 (every 6-step choice sequence is
+    # equally likely); the 5,040 values sum to 1.0 within float error.
+    matches_df, maps_df = _greedy_league_tables()
+    for best_of in ("Bo1", "Bo3", "Bo5"):
+        sequences = enumerate_veto_sequences(
+            "A", "B", best_of, QUERY_DATE, matches_df, maps_df,
+            {"ban": _uniform_stub, "pick": _uniform_stub},
+            map_pool=POOL,
+        )
+        assert len(sequences) == 5040
+        _assert_walk_shape(sequences)
+        for seq in sequences:
+            assert seq.sequence_probability == pytest.approx(1.0 / 5040.0)
+        assert sum(s.sequence_probability for s in sequences) == pytest.approx(
+            1.0
+        )
+
+
+def test_enumerate_memoises_per_step_distributions():
+    # Decision 10's load-bearing assertion: per-step predictor calls
+    # are memoised within one enumeration call — the stub predictor is
+    # invoked exactly sum(comb(7, d) for d in range(6)) == 120 times
+    # across all 5,040 sequences, never 5,040 * 6 == 30,240, because a
+    # step's distribution depends only on (step_index, remaining set)
+    # and the same state recurs across the permutations.
+    matches_df, maps_df = _greedy_league_tables()
+    for best_of in ("Bo1", "Bo3", "Bo5"):
+        calls = {"count": 0}
+        sequences = enumerate_veto_sequences(
+            "A", "B", best_of, QUERY_DATE, matches_df, maps_df,
+            {
+                "ban": _counting_uniform_stub_factory(calls),
+                "pick": _counting_uniform_stub_factory(calls),
+            },
+            map_pool=POOL,
+        )
+        assert len(sequences) == 5040
+        expected_states = sum(math.comb(7, d) for d in range(6))
+        assert expected_states == 120
+        assert calls["count"] == 120
+
+
+def test_enumerate_deterministic_non_uniform_hand_computed():
+    # Decision 9's exactness under a non-uniform arm: with the
+    # top-two-rank stub (0.6 on the alphabetically-first remaining map,
+    # 0.4 on the second, 0 on the rest), three specific Bo3 walks'
+    # sequence probabilities are hand-computed from their removal order
+    # — always-first: 0.6^6; always-second: 0.4^6; and
+    # first/first/first then second/second/second: 0.6^3 * 0.4^3 — and
+    # every other sequence has probability exactly 0 (it chose a
+    # rank >= 2 map at some step). The 5,040 values still sum to 1.0
+    # (the binomial expansion of (0.6 + 0.4)^6 over the 64 feasible
+    # first/second choice patterns). Asserting each specific product
+    # catches step-index / acting-team / remaining-bookkeeping bugs:
+    # the recorded probability of a step's map must equal that map's
+    # share of the distribution over THAT step's remaining set.
+    matches_df, maps_df = _greedy_league_tables()
+    sequences = enumerate_veto_sequences(
+        "A", "B", "Bo3", QUERY_DATE, matches_df, maps_df,
+        {"ban": _top_two_rank_stub, "pick": _top_two_rank_stub},
+        map_pool=POOL,
+    )
+    assert len(sequences) == 5040
+    by_maps = {
+        tuple(a.map_name for a in seq.actions): seq for seq in sequences
+    }
+    # The always-first walk removes the pool's maps in alphabetical
+    # order and leaves Sunset as the forced decider.
+    always_first = by_maps[
+        ("Abyss", "Ascent", "Haven", "Lotus", "Split", "Summit", "Sunset")
+    ]
+    assert always_first.sequence_probability == pytest.approx(0.6**6)
+    assert [a.team for a in always_first.actions] == [
+        "A", "B", "A", "B", "A", "B", None
+    ]
+    # The always-second walk removes the second-alphabetical map each
+    # step and leaves Abyss as the forced decider.
+    always_second = by_maps[
+        ("Ascent", "Haven", "Lotus", "Split", "Summit", "Sunset", "Abyss")
+    ]
+    assert always_second.sequence_probability == pytest.approx(0.4**6)
+    # First/first/first then second/second/second leaves Lotus as the
+    # decider.
+    mixed = by_maps[
+        ("Abyss", "Ascent", "Haven", "Split", "Summit", "Sunset", "Lotus")
+    ]
+    assert mixed.sequence_probability == pytest.approx((0.6**3) * (0.4**3))
+    # The remaining sequences either chose a rank >= 2 map somewhere
+    # (probability exactly 0) or follow one of the other 61 feasible
+    # first/second choice patterns; the full count distribution is the
+    # binomial expansion: C(6, a) sequences at probability 0.6^a *
+    # 0.4^(6-a) for a first-choices in 6..0, and the remaining 5,040
+    # - 64 = 4,976 at exactly 0. The three hand-checked walks above sit
+    # inside that distribution; asserting the whole shape pins the
+    # enumeration's per-step distribution bookkeeping down tightly.
+    counts = {
+        round(0.6**a * 0.4 ** (6 - a), 15): math.comb(6, a)
+        for a in range(6, -1, -1)
+    }
+    observed = {
+        prob: sum(1 for seq in sequences if round(seq.sequence_probability, 15) == prob)
+        for prob in counts
+    }
+    observed[0.0] = sum(
+        1 for seq in sequences if seq.sequence_probability == 0.0
+    )
+    assert observed == {**counts, 0.0: 5040 - 64}
+    assert sum(seq.sequence_probability for seq in sequences) == pytest.approx(
+        1.0
+    )
+
+
+def test_enumerate_decider_forced_and_excluded_from_product():
+    # Decision 2/3 applied to the enumerated output: in every one of
+    # the 5,040 sequences the decider action is team-less, "decider",
+    # has probability exactly 1.0, is the sole map left after the six
+    # choosing steps, and is excluded from sequence_probability —
+    # verified exactly by re-multiplying the six recorded non-decider
+    # probabilities in step order (same floats, same order -> bit-exact)
+    # for every sequence of every format.
+    matches_df, maps_df = _greedy_league_tables()
+    for best_of in ("Bo1", "Bo3", "Bo5"):
+        sequences = enumerate_veto_sequences(
+            "A", "B", best_of, QUERY_DATE, matches_df, maps_df,
+            {"ban": _uniform_stub, "pick": _uniform_stub},
+            map_pool=POOL,
+        )
+        assert len(sequences) == 5040
+        for seq in sequences:
+            decider = seq.actions[-1]
+            assert decider.step_index == len(seq.actions) - 1
+            assert decider.action == "decider"
+            assert decider.team is None
+            assert decider.probability == 1.0
+            chosen = {a.map_name for a in seq.actions[:-1]}
+            assert len(chosen) == 6
+            assert decider.map_name not in chosen
+            expected = math.prod(a.probability for a in seq.actions[:-1])
+            assert seq.sequence_probability == expected
+
+
+def test_enumerate_missing_predictor_key_raises():
+    # A Bo3 enumeration needs both "ban" and "pick"; supplying only
+    # "ban" must fail loudly naming the missing action before any
+    # enumeration. A Bo1 needs only "ban" — no "pick" key required.
+    matches_df, maps_df = _greedy_league_tables()
+    with pytest.raises(ValueError, match="'pick'"):
+        enumerate_veto_sequences(
+            "A", "B", "Bo3", QUERY_DATE, matches_df, maps_df,
+            {"ban": _uniform_stub}, map_pool=POOL,
+        )
+    sequences = enumerate_veto_sequences(
+        "A", "B", "Bo1", QUERY_DATE, matches_df, maps_df,
+        {"ban": _uniform_stub}, map_pool=POOL,
+    )
+    assert len(sequences) == 5040
+
+
+def test_enumerate_best_of_and_pool_errors_raise():
+    # Mirror sample_veto_sequences's input validation: an unsupported
+    # best_of, a wrong-size map_pool and a duplicate-after-normalization
+    # map_pool each raise ValueError before any enumeration.
+    matches_df, maps_df = _greedy_league_tables()
+    with pytest.raises(ValueError, match="best_of"):
+        enumerate_veto_sequences(
+            "A", "B", "Bo7", QUERY_DATE, matches_df, maps_df,
+            {"ban": _uniform_stub}, map_pool=POOL,
+        )
+    with pytest.raises(ValueError, match="map_pool has 6"):
+        enumerate_veto_sequences(
+            "A", "B", "Bo3", QUERY_DATE, matches_df, maps_df,
+            {"ban": _uniform_stub, "pick": _uniform_stub},
+            map_pool=POOL[:6],
+        )
+    dup_pool = [
+        "Abyss", "ascent", "Ascent", "Haven", "Lotus", "Split", "Summit"
+    ]
+    with pytest.raises(ValueError, match="duplicate"):
+        enumerate_veto_sequences(
+            "A", "B", "Bo3", QUERY_DATE, matches_df, maps_df,
+            {"ban": _uniform_stub, "pick": _uniform_stub},
+            map_pool=dup_pool,
+        )
 
 
 @pytest.mark.skipif(
