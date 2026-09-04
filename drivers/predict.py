@@ -1185,11 +1185,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             touching the process-wide ``sys.argv``.
 
     Returns:
-        An ``argparse.Namespace`` with nine attributes: ``team_a``
-        (``str``, required), ``team_b`` (``str``, required), ``best_of``
-        (``str``, required, one of ``"Bo1"``/``"Bo3"``/``"Bo5"``),
-        ``as_of_date`` (``str``, required), ``map_pool`` (``str`` or
-        ``None``, the optional comma-separated 7-map pool), ``version``
+        An ``argparse.Namespace`` with ten attributes: ``team_a``
+        (``str`` or ``None``, required unless ``--stream`` is given),
+        ``team_b`` (``str`` or ``None``, required unless ``--stream``
+        is given), ``best_of`` (``str`` or ``None``, required unless
+        ``--stream`` is given; one of ``"Bo1"``/``"Bo3"``/``"Bo5"``
+        when a value is present), ``as_of_date`` (``str`` or ``None``,
+        required unless ``--stream`` is given), ``map_pool`` (``str``
+        or ``None``, the optional comma-separated 7-map pool),
+        ``stream`` (``bool``, default ``False`` — switches ``main()``
+        into persistent JSONL query-stream mode, E2), ``version``
         (``str``, default ``"v1"``), ``output_dir`` (``str``, default
         ``"data"``), ``n_samples`` (``int``, default
         :data:`DEFAULT_N_SAMPLES`), ``seed`` (``int``, default
@@ -1197,16 +1202,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         :data:`DEFAULT_CI_LEVEL`).
 
     Raises:
-        SystemExit: On invalid arguments (argparse's standard behavior,
-            e.g. an unknown flag, a missing required argument, or an
-            unknown ``--best-of`` value, which is rejected by the
-            ``choices=`` constraint rather than silently falling back).
+        SystemExit: On invalid arguments (argparse's standard behavior)
+            — an unknown flag, an unknown ``--best-of`` value (rejected
+            by the ``choices=`` constraint, which only fires when a
+            value is actually given), or a post-parse validation
+            failure (E3): any of ``--team-a``/``--team-b``/
+            ``--best-of``/``--as-of-date`` missing while ``--stream``
+            is absent, or ``--stream`` combined with any of those four
+            flags or ``--map-pool``.
     """
     parser = argparse.ArgumentParser(
         description=(
-            "Run the M39 predict() public API for one queried match: "
-            "load the materialised tables and fitted artifacts for a "
-            "dataset version and print the full prediction result "
+            "Run the M39 predict() public API for one queried match, or "
+            "(--stream) answer a JSONL query stream from stdin with "
+            "one persistent Predictor: load the materialised tables "
+            "and fitted artifacts for a dataset version once and print "
+            "each query's full prediction result "
             "(deterministic greedy veto, temperature-scaled per-map "
             "four-way probabilities with n_games_backing, the "
             "veto-marginalised series scoreline distribution, and the "
@@ -1227,20 +1238,42 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--stream",
+        action="store_true",
+        default=False,
+        help=(
+            "persistent JSONL query-stream mode (E4): build one "
+            "Predictor and answer one JSON query object per stdin line "
+            "({\"team_a\", \"team_b\", \"best_of\", \"as_of_date\", "
+            "\"map_pool\"?}), printing one compact JSON result per "
+            "line; mutually exclusive with --team-a/--team-b/--best-of/"
+            "--as-of-date/--map-pool, which must be omitted"
+        ),
+    )
+    parser.add_argument(
         "--team-a",
-        required=True,
-        help="team A's stable team_id (e.g. 397), not its display name",
+        default=None,
+        help=(
+            "team A's stable team_id (e.g. 397), not its display name; "
+            "required unless --stream is given"
+        ),
     )
     parser.add_argument(
         "--team-b",
-        required=True,
-        help="team B's stable team_id (e.g. 6392), not its display name",
+        default=None,
+        help=(
+            "team B's stable team_id (e.g. 6392), not its display name; "
+            "required unless --stream is given"
+        ),
     )
     parser.add_argument(
         "--best-of",
-        required=True,
+        default=None,
         choices=["Bo1", "Bo3", "Bo5"],
-        help="series length (choices: Bo1/Bo3/Bo5)",
+        help=(
+            "series length (choices: Bo1/Bo3/Bo5); required unless "
+            "--stream is given"
+        ),
     )
     parser.add_argument(
         "--map-pool",
@@ -1253,10 +1286,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--as-of-date",
-        required=True,
+        default=None,
         help=(
             "as-of cutoff for every feature lookup (ISO-8601, e.g. "
-            "2026-08-23T12:00:00; strictly-earlier data only)"
+            "2026-08-23T12:00:00; strictly-earlier data only); required "
+            "unless --stream is given"
         ),
     )
     parser.add_argument(
@@ -1294,7 +1328,33 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "percentiles)"
         ),
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    # E3: manual post-parse required-arg enforcement. --stream needs the
+    # four query flags at their None defaults, and the one-shot path
+    # needs all four present; each violation fires parser.error (a
+    # SystemExit(2), matching argparse's own required-arg behaviour).
+    if not args.stream and (
+        args.team_a is None
+        or args.team_b is None
+        or args.best_of is None
+        or args.as_of_date is None
+    ):
+        parser.error(
+            "--team-a, --team-b, --best-of and --as-of-date are required "
+            "unless --stream is given"
+        )
+    if args.stream and (
+        args.team_a is not None
+        or args.team_b is not None
+        or args.best_of is not None
+        or args.as_of_date is not None
+        or args.map_pool is not None
+    ):
+        parser.error(
+            "--stream cannot be combined with --team-a/--team-b/--best-of/"
+            "--as-of-date/--map-pool; supply queries via stdin instead"
+        )
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
