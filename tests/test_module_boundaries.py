@@ -152,6 +152,7 @@ PRESENTATION_MODULES = (
     "__init__.py",
     "contract.py",
     "derived.py",
+    "reshape.py",
 )
 
 # The exact permitted surface presentation/ may import from
