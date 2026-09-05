@@ -333,9 +333,22 @@
     },
     "VetoAction": {
       "type": "object",
-      "description": "One step of a veto sequence.",
+      "description": "One step of a veto sequence. team/team_name are nullable only for the decider step (the last remaining map is forced, so no team acts); the allOf below rejects a null team on a ban or pick step.",
       "required": ["step_index", "team", "team_name", "action", "map_name"],
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": { "action": { "const": "decider" } }
+          },
+          "else": {
+            "properties": {
+              "team": { "type": "string" },
+              "team_name": { "type": "string" }
+            }
+          }
+        }
+      ],
       "properties": {
         "step_index": {
           "type": "integer",
@@ -343,11 +356,11 @@
         },
         "team": {
           "type": ["string", "null"],
-          "description": "The acting team's stable team_id; null means a decider step (no team acts)."
+          "description": "The acting team's stable team_id; null only on the decider step (no team acts), never on a ban/pick step."
         },
         "team_name": {
           "type": ["string", "null"],
-          "description": "The acting team's derived display name (resolved by P3); null means a decider step (no team acts)."
+          "description": "The acting team's derived display name (resolved by P3); null only on the decider step (no team acts), never on a ban/pick step."
         },
         "action": {
           "type": "string",

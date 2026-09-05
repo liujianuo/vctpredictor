@@ -52,7 +52,10 @@ def _make_series(probabilities, best_of, *, outcome_order=None):
         (as a tuple), and ``best_of``.
 
     Raises:
-        Nothing.
+        ValueError: If ``best_of`` is not a valid odd map count when
+            ``outcome_order`` is not supplied — propagated unchanged
+            from :func:`utils.series_paths.series_outcome_order` (via
+            its :func:`series_win_threshold` guard).
     """
     if outcome_order is None:
         outcome_order = series_paths.series_outcome_order(best_of)
@@ -540,6 +543,22 @@ def test_per_map_derived_collapses_match_p2():
     assert reshaped["p_overtime"] == derived.p_overtime(pm)
 
 
+def test_per_map_emits_exactly_seven_keys():
+    # _reshape_per_map emits exactly the seven closed PerMap keys; a
+    # renamed/added/dropped key would fail this set check (mirrors the
+    # RankedVeto seven-key invariant).
+    pm = _make_per_map((0.5, 0.1, 0.1, 0.3))
+    assert set(reshape._reshape_per_map(pm)) == {
+        "map_name",
+        "probabilities",
+        "interval_low",
+        "interval_high",
+        "n_games_backing",
+        "p_a_wins_map",
+        "p_overtime",
+    }
+
+
 def test_favorite_flips_computed_against_overall():
     # One entry flips the favourite (its p_a_wins_series is on the
     # opposite side of 0.5 from the overall), one does not.
@@ -658,6 +677,38 @@ def test_reshaped_core_validates_as_full_artifact():
     )
     result = _make_result(top_vetos=entries)
     core = reshape.reshape_fixture_core(result, "A", "B", _team_names())
+    artifact = _assemble_artifact(core, "Bo3", 3)
+    assert contract.validate_artifact(artifact) is None
+
+
+def test_reshaped_core_with_populated_per_map_validates():
+    # A non-empty per_map (one map with populated intervals and one with
+    # null intervals) round-trips through _reshape_per_map and validates
+    # against the full wire contract in both the overall result and a
+    # ranked entry — so a renamed/added/dropped PerMap key or a
+    # wrong-length interval vector would fail here rather than pass.
+    populated = _make_per_map(
+        (0.5, 0.1, 0.1, 0.3),
+        interval_low=(0.3, 0.0, 0.0, 0.2),
+        interval_high=(0.7, 0.3, 0.3, 0.5),
+        n_games_backing=12,
+    )
+    null_intervals = _make_per_map((0.4, 0.2, 0.2, 0.2), map_name="Haven")
+    entry = _make_ranked_entry(
+        _make_actions("Ascent"),
+        _make_series((0.2, 0.3, 0.3, 0.2), 3),
+        per_map=(populated, null_intervals),
+    )
+    result = _make_result(
+        per_map=(populated, null_intervals),
+        top_vetos=(entry,),
+    )
+    core = reshape.reshape_fixture_core(result, "A", "B", _team_names())
+    assert core["overall"]["per_map"][0]["interval_low"] == [
+        0.3, 0.0, 0.0, 0.2
+    ]
+    assert core["overall"]["per_map"][1]["interval_low"] is None
+    assert core["top_vetos"][0]["per_map"][0]["n_games_backing"] == 12
     artifact = _assemble_artifact(core, "Bo3", 3)
     assert contract.validate_artifact(artifact) is None
 

@@ -437,11 +437,13 @@ def _reshape_ranked_veto(
 def reshape_overall_result(
     result: PredictionResult,
     team_names: Mapping[str, str],
+    overall_p_a_wins_series: float | None = None,
 ) -> contract.OverallResult:
     """Reshape the top-level result to the wire ``OverallResult`` shape.
 
     Fills the six §6 fields: the M31-sampled ``series_probabilities``,
-    the derived ``p_a_wins_series``, the structural spread summary
+    the derived ``p_a_wins_series`` (threaded in from the caller when
+    supplied, otherwise computed here), the structural spread summary
     (guarded per D7 — a null top-level ``veto_sensitivity`` raises
     rather than shipping an invalid null), the greedy veto's played
     maps, the reshaped greedy veto steps, and the greedy veto's 1-based
@@ -452,6 +454,13 @@ def reshape_overall_result(
         result: The top-level
             :class:`drivers.predict.PredictionResult` for the fixture.
         team_names: The ``team_id → display name`` mapping.
+        overall_p_a_wins_series: Optional pre-computed overall
+            :func:`presentation.derived.p_a_wins_series` value. When
+            omitted, it is computed here from ``result.series`` (so
+            this function stays independently callable); when supplied
+            — as :func:`reshape_fixture_core` does — it is reused so
+            the overall sum is evaluated exactly once per fixture
+            rather than twice.
 
     Returns:
         An ``OverallResult`` dict with keys ``series_probabilities``,
@@ -459,10 +468,12 @@ def reshape_overall_result(
         ``greedy_veto``, ``greedy_rank``.
 
     Raises:
-        ValueError: If ``result.veto_sensitivity`` is ``None`` (D7), or
-            if ``result.series`` has non-parallel vectors — the latter
-            propagated unchanged from
-            :func:`presentation.derived.p_a_wins_series`.
+        ValueError: If ``result.veto_sensitivity`` is ``None`` (D7); or,
+            when ``overall_p_a_wins_series`` is omitted, if
+            ``result.series`` has non-parallel vectors — propagated
+            unchanged from
+            :func:`presentation.derived.p_a_wins_series` (which only
+            runs when the value is not threaded in).
         UnknownTeamError: Propagated unchanged from
             :func:`_reshape_veto_actions` for an unresolvable team id
             in the greedy sequence.
@@ -472,6 +483,8 @@ def reshape_overall_result(
             each step's four protocol attributes) for a malformed
             action record.
     """
+    if overall_p_a_wins_series is None:
+        overall_p_a_wins_series = derived.p_a_wins_series(result.series)
     if result.veto_sensitivity is None:
         raise ValueError(
             "top-level result has veto_sensitivity None; the schema "
@@ -480,7 +493,7 @@ def reshape_overall_result(
         )
     return {
         "series_probabilities": list(result.series.probabilities),
-        "p_a_wins_series": derived.p_a_wins_series(result.series),
+        "p_a_wins_series": overall_p_a_wins_series,
         "veto_sensitivity": _reshape_veto_sensitivity(result.veto_sensitivity),
         "per_map": [_reshape_per_map(per_map) for per_map in result.per_map],
         "greedy_veto": _reshape_veto_actions(
@@ -560,7 +573,11 @@ def reshape_fixture_core(
     """Reshape one fixture's prediction into the seven P3-owned wire keys.
 
     The one public entry point P5 calls per fixture. It computes the
-    overall ``p_a_wins_series`` once (for the flip baseline), hoists
+    overall ``p_a_wins_series`` once (via
+    :func:`presentation.derived.p_a_wins_series`) and threads that
+    single value into both :func:`reshape_top_vetos` (as the flip
+    baseline) and :func:`reshape_overall_result` (as the overall
+    field), so the sum is never evaluated twice. It hoists
     ``outcome_order`` from ``result.series.outcome_order`` as a list of
     2-int lists (D8), derives ``scoreline_labels`` from that *same*
     hoisted copy via :func:`presentation.derived.scoreline_labels` (so
@@ -617,7 +634,9 @@ def reshape_fixture_core(
         "scoreline_labels": list(
             derived.scoreline_labels(result.series.outcome_order)
         ),
-        "overall": reshape_overall_result(result, team_names),
+        "overall": reshape_overall_result(
+            result, team_names, overall_p_a_wins_series
+        ),
         "top_vetos": reshape_top_vetos(
             result, overall_p_a_wins_series, team_names
         ),

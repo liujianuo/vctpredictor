@@ -25,7 +25,10 @@ kept in lockstep with the Python side by a drift-guard test
 - the one structurally teamless action is the decider step:
   ``VetoAction.team`` / ``team_name`` accept ``null`` (the keys stay
   required) because the last remaining map is forced rather than
-  chosen, so no team acts (P3's decider-step handling);
+  chosen, so no team acts (P3's decider-step handling); the schema
+  additionally conditions that null on ``action == "decider"`` (a
+  draft-07 ``allOf`` of ``if``/``then``/``else``), so a ``ban`` or
+  ``pick`` step still requires a string team;
 - structurally-constant fields are omitted, not shipped null
   (:class:`RankedVeto` declares neither ``veto_sensitivity`` nor a
   nested ``top_vetos``, and closes ``additionalProperties`` so a
@@ -122,10 +125,13 @@ class VetoAction(TypedDict):
             sequence.
         team: The acting team's stable ``team_id``, or ``None`` for a
             decider step — the last remaining map is forced, not
-            chosen, so no team acts.
+            chosen, so no team acts. ``None`` is legal *only* for a
+            decider step; the schema rejects a null ``team`` on a
+            ``ban``/``pick`` step.
         team_name: The acting team's derived display name (resolved by
             P3, but typed here so P5 never has to change the schema),
-            or ``None`` alongside ``team`` for a decider step.
+            or ``None`` alongside ``team`` for a decider step — legal
+            only there, never on a ``ban``/``pick`` step.
         action: One of ``"ban"``, ``"pick"`` or ``"decider"``.
         map_name: The chosen map's normalized name.
     """

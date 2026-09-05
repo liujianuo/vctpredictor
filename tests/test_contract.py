@@ -573,6 +573,23 @@ def test_veto_action_missing_team_still_rejected():
         contract.validate_artifact(artifact)
 
 
+@pytest.mark.parametrize("action", ["ban", "pick"])
+def test_veto_action_non_decider_null_team_rejected(action):
+    # D4 null is legal only for the decider step: a ban or pick with
+    # team: null / team_name: null is rejected by the VetoAction-level
+    # if/then/else (an acting step must name its acting team).
+    artifact = _maximal_artifact()
+    artifact["fixtures"][0]["top_vetos"][0]["actions"][0] = _veto_action(
+        step_index=0,
+        action=action,
+        team=None,
+        team_name=None,
+        map_name="Ascent",
+    )
+    with pytest.raises(ValidationError):
+        contract.validate_artifact(artifact)
+
+
 def test_veto_action_non_string_non_null_team_rejected():
     # A non-string, non-null team (an int) is rejected — the widened
     # type is ["string", "null"], not a free-for-all.
