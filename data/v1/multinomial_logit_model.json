@@ -1,0 +1,301 @@
+{
+  "coefficient_report": [
+    {
+      "class": "B-regulation",
+      "coefficient": -0.05900628810919954,
+      "feature": "first_blood_diff"
+    },
+    {
+      "class": "B-regulation",
+      "coefficient": -0.05470682659754522,
+      "feature": "days_since_diff"
+    },
+    {
+      "class": "B-regulation",
+      "coefficient": 0.048557561088121586,
+      "feature": "event_stage"
+    },
+    {
+      "class": "B-regulation",
+      "coefficient": -0.03972272031784522,
+      "feature": "elo_differential"
+    },
+    {
+      "class": "B-regulation",
+      "coefficient": -0.038658962793467574,
+      "feature": "attack_side_win_rate_diff"
+    },
+    {
+      "class": "B-regulation",
+      "coefficient": -0.03274676678830659,
+      "feature": "acs_form_diff"
+    },
+    {
+      "class": "A-OT",
+      "coefficient": 0.02552531992099286,
+      "feature": "event_stage"
+    },
+    {
+      "class": "A-OT",
+      "coefficient": 0.023461647321106855,
+      "feature": "map_round_margin_variance"
+    },
+    {
+      "class": "B-regulation",
+      "coefficient": -0.02258007147370751,
+      "feature": "map_win_rate_diff"
+    },
+    {
+      "class": "B-regulation",
+      "coefficient": -0.021696246265195743,
+      "feature": "rating_form_diff"
+    },
+    {
+      "class": "A-OT",
+      "coefficient": -0.021395698695768767,
+      "feature": "h2h_win_rate_centered"
+    },
+    {
+      "class": "B-OT",
+      "coefficient": 0.016770248708524442,
+      "feature": "map_round_margin_variance"
+    },
+    {
+      "class": "B-OT",
+      "coefficient": -0.016598983999096012,
+      "feature": "signed_margin_diff"
+    },
+    {
+      "class": "B-OT",
+      "coefficient": 0.01623502565347207,
+      "feature": "days_since_diff"
+    },
+    {
+      "class": "A-OT",
+      "coefficient": 0.01416961337407987,
+      "feature": "days_since_diff"
+    },
+    {
+      "class": "B-regulation",
+      "coefficient": 0.012547961120291894,
+      "feature": "map_round_margin_variance"
+    },
+    {
+      "class": "B-regulation",
+      "coefficient": -0.01239190269219721,
+      "feature": "signed_margin_diff"
+    },
+    {
+      "class": "B-OT",
+      "coefficient": 0.011529096715569346,
+      "feature": "elo_differential"
+    },
+    {
+      "class": "B-OT",
+      "coefficient": -0.011123089504626153,
+      "feature": "event_stage"
+    },
+    {
+      "class": "A-OT",
+      "coefficient": -0.009052311222483728,
+      "feature": "ot_rate_diff"
+    },
+    {
+      "class": "B-OT",
+      "coefficient": -0.00901697008877296,
+      "feature": "attack_side_win_rate_diff"
+    },
+    {
+      "class": "B-regulation",
+      "coefficient": -0.008864293770740644,
+      "feature": "h2h_win_rate_centered"
+    },
+    {
+      "class": "A-OT",
+      "coefficient": 0.008554127878215516,
+      "feature": "first_blood_diff"
+    },
+    {
+      "class": "B-regulation",
+      "coefficient": -0.008257305964732726,
+      "feature": "ot_rate_diff"
+    },
+    {
+      "class": "B-OT",
+      "coefficient": 0.008144108392237481,
+      "feature": "map_win_rate_diff"
+    },
+    {
+      "class": "A-OT",
+      "coefficient": -0.005730581117868299,
+      "feature": "acs_form_diff"
+    },
+    {
+      "class": "A-OT",
+      "coefficient": -0.0049620903088252,
+      "feature": "rating_form_diff"
+    },
+    {
+      "class": "B-OT",
+      "coefficient": 0.004567279393415162,
+      "feature": "ot_rate_diff"
+    },
+    {
+      "class": "B-OT",
+      "coefficient": 0.004331960118195584,
+      "feature": "acs_form_diff"
+    },
+    {
+      "class": "A-OT",
+      "coefficient": 0.0043210285476779926,
+      "feature": "signed_margin_diff"
+    },
+    {
+      "class": "B-OT",
+      "coefficient": -0.004150837116518616,
+      "feature": "h2h_win_rate_centered"
+    },
+    {
+      "class": "B-OT",
+      "coefficient": -0.0030285815074681238,
+      "feature": "first_blood_diff"
+    },
+    {
+      "class": "A-OT",
+      "coefficient": -0.0019663481425807447,
+      "feature": "map_win_rate_diff"
+    },
+    {
+      "class": "B-OT",
+      "coefficient": 0.000860495881165117,
+      "feature": "rating_form_diff"
+    },
+    {
+      "class": "A-OT",
+      "coefficient": 0.0007505083803732149,
+      "feature": "attack_side_win_rate_diff"
+    },
+    {
+      "class": "A-OT",
+      "coefficient": 3.804862399135021e-05,
+      "feature": "elo_differential"
+    },
+    {
+      "class": "A-OT",
+      "coefficient": 0.0,
+      "feature": "roster_decay_diff"
+    },
+    {
+      "class": "B-OT",
+      "coefficient": 0.0,
+      "feature": "roster_decay_diff"
+    },
+    {
+      "class": "B-regulation",
+      "coefficient": 0.0,
+      "feature": "roster_decay_diff"
+    }
+  ],
+  "coefficients": [
+    [
+      -0.0019663481425807447,
+      3.804862399135021e-05,
+      -0.009052311222483728,
+      0.023461647321106855,
+      -0.005730581117868299,
+      -0.0049620903088252,
+      -0.021395698695768767,
+      0.02552531992099286,
+      0.01416961337407987,
+      0.0,
+      0.0007505083803732149,
+      0.0043210285476779926,
+      0.008554127878215516
+    ],
+    [
+      0.008144108392237481,
+      0.011529096715569346,
+      0.004567279393415162,
+      0.016770248708524442,
+      0.004331960118195584,
+      0.000860495881165117,
+      -0.004150837116518616,
+      -0.011123089504626153,
+      0.01623502565347207,
+      0.0,
+      -0.00901697008877296,
+      -0.016598983999096012,
+      -0.0030285815074681238
+    ],
+    [
+      -0.02258007147370751,
+      -0.03972272031784522,
+      -0.008257305964732726,
+      0.012547961120291894,
+      -0.03274676678830659,
+      -0.021696246265195743,
+      -0.008864293770740644,
+      0.048557561088121586,
+      -0.05470682659754522,
+      0.0,
+      -0.038658962793467574,
+      -0.01239190269219721,
+      -0.05900628810919954
+    ]
+  ],
+  "converged": true,
+  "feature_names": [
+    "map_win_rate_diff",
+    "elo_differential",
+    "ot_rate_diff",
+    "map_round_margin_variance",
+    "acs_form_diff",
+    "rating_form_diff",
+    "h2h_win_rate_centered",
+    "event_stage",
+    "days_since_diff",
+    "roster_decay_diff",
+    "attack_side_win_rate_diff",
+    "signed_margin_diff",
+    "first_blood_diff"
+  ],
+  "final_loss": 1.052108451565311,
+  "intercepts": [
+    -1.7462973197469256,
+    -2.056556888487169,
+    0.11913596101560334
+  ],
+  "l2_lambda": 1.0,
+  "n_iter": 18,
+  "n_train": 209,
+  "standardizer_means": [
+    0.008628135189546268,
+    1.3666294357970186,
+    0.00024598981212656864,
+    7.160137487000774,
+    -1.4487154601522172,
+    -0.006003071746301172,
+    -0.000926678896306525,
+    1.4784688995215312,
+    2.124401913875598,
+    0.0,
+    4.161889633912896e-05,
+    0.062465659197482,
+    0.0020707580243128593
+  ],
+  "standardizer_stds": [
+    0.23646267982917496,
+    71.56305628088471,
+    0.0017622595654643296,
+    4.090851636020698,
+    11.404318829834104,
+    0.09389725307617175,
+    0.016688928658992436,
+    0.4995361965985917,
+    14.024374808066321,
+    1.0,
+    0.06560011455652923,
+    1.840439456291768,
+    0.04081122588299881
+  ]
+}

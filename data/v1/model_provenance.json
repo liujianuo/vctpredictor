@@ -1,0 +1,11 @@
+{
+  "drivers": [
+    "train_ordinal_logit.py",
+    "train_temperature_scaling.py",
+    "train_conditional_logit_ban.py",
+    "train_conditional_logit_pick.py",
+    "train_bootstrap_replicates.py"
+  ],
+  "git_sha": "a7dedddcf3ad85f815654597cfb8b115f49c5e01",
+  "trained_at": "2026-09-05T18:24:00"
+}

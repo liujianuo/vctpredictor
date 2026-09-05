@@ -1,0 +1,62 @@
+{
+  "coefficient_report": [
+    {
+      "coefficient": -0.10354157786323917,
+      "direction": "favors less bannable",
+      "feature": "acting_map_specialization"
+    },
+    {
+      "coefficient": -0.04846148982679533,
+      "direction": "favors less bannable",
+      "feature": "map_round_margin_variance"
+    },
+    {
+      "coefficient": 0.023182688903100993,
+      "direction": "favors more bannable",
+      "feature": "opponent_map_win_rate"
+    },
+    {
+      "coefficient": -0.021982611752716975,
+      "direction": "favors less bannable",
+      "feature": "acting_map_win_rate"
+    },
+    {
+      "coefficient": 0.000809099575395764,
+      "direction": "favors more bannable",
+      "feature": "map_ot_rate"
+    }
+  ],
+  "coefficients": [
+    -0.021982611752716975,
+    0.023182688903100993,
+    -0.10354157786323917,
+    -0.04846148982679533,
+    0.000809099575395764
+  ],
+  "converged": true,
+  "feature_names": [
+    "acting_map_win_rate",
+    "opponent_map_win_rate",
+    "acting_map_specialization",
+    "map_round_margin_variance",
+    "map_ot_rate"
+  ],
+  "final_loss": 1.3763261957491983,
+  "l2_lambda": 1.0,
+  "n_iter": 41,
+  "n_train": 320,
+  "standardizer_means": [
+    0.5030889007195806,
+    0.5117993172835671,
+    -0.0011448948246631332,
+    7.024202209194439,
+    0.11882062215485202
+  ],
+  "standardizer_stds": [
+    0.1896018403751009,
+    0.1882794120920605,
+    0.04025381620194747,
+    4.490689943762225,
+    0.0792558396325188
+  ]
+}

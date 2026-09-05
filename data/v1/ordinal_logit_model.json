@@ -1,0 +1,139 @@
+{
+  "coefficient_report": [
+    {
+      "coefficient": 0.06056481949104358,
+      "direction": "favors A",
+      "feature": "first_blood_diff"
+    },
+    {
+      "coefficient": -0.05610550910260625,
+      "direction": "favors B",
+      "feature": "event_stage"
+    },
+    {
+      "coefficient": 0.04715578966588456,
+      "direction": "favors A",
+      "feature": "days_since_diff"
+    },
+    {
+      "coefficient": 0.04398581444933732,
+      "direction": "favors A",
+      "feature": "attack_side_win_rate_diff"
+    },
+    {
+      "coefficient": 0.033335646241816355,
+      "direction": "favors A",
+      "feature": "elo_differential"
+    },
+    {
+      "coefficient": 0.032633607276732444,
+      "direction": "favors A",
+      "feature": "acs_form_diff"
+    },
+    {
+      "coefficient": -0.030801137816606143,
+      "direction": "favors B",
+      "feature": "map_round_margin_variance"
+    },
+    {
+      "coefficient": 0.02184550285352461,
+      "direction": "favors A",
+      "feature": "rating_form_diff"
+    },
+    {
+      "coefficient": 0.019781066645467436,
+      "direction": "favors A",
+      "feature": "h2h_win_rate_centered"
+    },
+    {
+      "coefficient": 0.018337362440696905,
+      "direction": "favors A",
+      "feature": "map_win_rate_diff"
+    },
+    {
+      "coefficient": 0.01675536017032825,
+      "direction": "favors A",
+      "feature": "signed_margin_diff"
+    },
+    {
+      "coefficient": 0.007354980684633923,
+      "direction": "favors A",
+      "feature": "ot_rate_diff"
+    },
+    {
+      "coefficient": 0.0,
+      "direction": "favors neither",
+      "feature": "roster_decay_diff"
+    }
+  ],
+  "coefficients": [
+    0.018337362440696905,
+    0.033335646241816355,
+    0.007354980684633923,
+    -0.030801137816606143,
+    0.032633607276732444,
+    0.02184550285352461,
+    0.019781066645467436,
+    -0.05610550910260625,
+    0.04715578966588456,
+    0.0,
+    0.04398581444933732,
+    0.01675536017032825,
+    0.06056481949104358
+  ],
+  "converged": true,
+  "feature_names": [
+    "map_win_rate_diff",
+    "elo_differential",
+    "ot_rate_diff",
+    "map_round_margin_variance",
+    "acs_form_diff",
+    "rating_form_diff",
+    "h2h_win_rate_centered",
+    "event_stage",
+    "days_since_diff",
+    "roster_decay_diff",
+    "attack_side_win_rate_diff",
+    "signed_margin_diff",
+    "first_blood_diff"
+  ],
+  "final_loss": 1.0524950711159775,
+  "l2_lambda": 1.0,
+  "n_iter": 94,
+  "n_train": 209,
+  "standardizer_means": [
+    0.008628135189546268,
+    1.3666294357970186,
+    0.00024598981212656864,
+    7.160137487000774,
+    -1.4487154601522172,
+    -0.006003071746301172,
+    -0.000926678896306525,
+    1.4784688995215312,
+    2.124401913875598,
+    0.0,
+    4.161889633912896e-05,
+    0.062465659197482,
+    0.0020707580243128593
+  ],
+  "standardizer_stds": [
+    0.23646267982917496,
+    71.56305628088471,
+    0.0017622595654643296,
+    4.090851636020698,
+    11.404318829834104,
+    0.09389725307617175,
+    0.016688928658992436,
+    0.4995361965985917,
+    14.024374808066321,
+    1.0,
+    0.06560011455652923,
+    1.840439456291768,
+    0.04081122588299881
+  ],
+  "thresholds": [
+    -0.36417565404164365,
+    -0.06734818198492576,
+    0.14788067119268933
+  ]
+}
