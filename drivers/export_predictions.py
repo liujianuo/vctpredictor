@@ -108,7 +108,7 @@ mirroring the rest of ``drivers/``'s raise-for-invariant-break
 doctrine.
 
 **Observability (P6).** Three diagnostics, all emitted as log lines and
-never written into the artifact (§8, decision E):
+never written into the artifact (§8):
 
 - **Timing.** ``main()`` times the run end to end and the single
   ``Predictor`` construction; :func:`export_fixtures` times each
@@ -121,18 +121,18 @@ never written into the artifact (§8, decision E):
   out-of-band with ``cProfile`` against the unmodified
   ``drivers/predict.py`` (decision E forbids editing it) — no
   profiling code or flag ships here.
-- **Null-interval counting** (:func:`count_null_interval_maps`, D4):
+- **Null-interval counting** (:func:`count_null_interval_maps`, D19):
   counts a fixture's overall ``per_map`` entries whose
   ``interval_low`` and ``interval_high`` are both ``None``. Reported
   at WARNING (naming ``train_bootstrap_replicates.py`` as the fix)
-  when the count is nonzero, else INFO (D4).
-- **Coverage diagnostic** (:func:`coverage_diagnostic`, D5): the §8
+  when the count is nonzero, else INFO (D19).
+- **Coverage diagnostic** (:func:`coverage_diagnostic`, D20): the §8
   reconciliation gap between the coverage-weighted average of the
   ranked entries' ``p_a_wins_series`` and the overall value, logged at
   INFO per fixture and never displayed or exported. No threshold
-  constant exists (D6) — a human reads the line.
+  constant exists (D21) — a human reads the line.
 
-**Design decisions D1–D18 (recorded here, do not silently change).**
+**Design decisions D1–D22 (recorded here, do not silently change).**
 
 - **D1.** Two modules, not one: this module owns the export;
   ``drivers/model_provenance.py`` owns the sidecar's filename, keys,
@@ -199,6 +199,21 @@ never written into the artifact (§8, decision E):
   (``--git-sha`` → current ``HEAD``, ``--trained-at`` → naive-UTC now,
   ``--drivers`` → the five training drivers); P22 passes all three
   explicitly.
+- **D19.** Null-interval counting runs over a fixture's *overall*
+  ``per_map`` only (never the ranked entries): a record is counted
+  when both ``interval_low`` and ``interval_high`` are ``None``,
+  reported at WARNING (naming ``train_bootstrap_replicates.py``)
+  when the count is nonzero, else INFO.
+- **D20.** The §8 coverage diagnostic (:func:`coverage_diagnostic`)
+  computes ``mass``, ``weighted``, ``overall`` and ``gap`` over the
+  ranked entries; zero ``mass`` returns ``None`` (never a
+  ``ZeroDivisionError``, never a fabricated ``0.0`` gap).
+- **D21.** No gap-threshold constant exists: the diagnostic is logged
+  for a human to read, not compared against a programmatic limit.
+- **D22.** The summary line is extended append-only: the five
+  pre-existing fields keep their text and order, with
+  ``null_interval_maps``, ``predict_seconds`` and ``elapsed_seconds``
+  appended after ``dataset_version``.
 """
 
 from __future__ import annotations
@@ -654,17 +669,17 @@ def build_fixture(
 
 
 def count_null_interval_maps(per_map: Sequence[contract.PerMap]) -> int:
-    """Count the ``per_map`` entries whose intervals are both ``None`` (D4).
+    """Count the ``per_map`` entries whose intervals are both ``None`` (D19).
 
     §4.3's soft-missing case — the replicate artifact was never trained
     — shows up as per-map records carrying null intervals. This counts
     exactly those records over the fixture's *overall* ``per_map``
-    only (D4): the ranked entries inherit the same closed-over
+    only (D19): the ranked entries inherit the same closed-over
     bootstrap models (G5), so counting them too would multiply the
     same fact by ``top_n`` without adding information. A record is
     counted only when **both** ``interval_low`` and ``interval_high``
     are ``None``; a record with one band populated and the other
-    ``None`` is malformed data and is *not* counted here (the D4 rule
+    ``None`` is malformed data and is *not* counted here (the D19 rule
     is strictly both-null).
 
     Args:
@@ -694,21 +709,21 @@ def count_null_interval_maps(per_map: Sequence[contract.PerMap]) -> int:
 
 @dataclass(frozen=True)
 class CoverageDiagnostic:
-    """The §8 reconciliation numbers for one fixture (D5/D6).
+    """The §8 reconciliation numbers for one fixture (D20/D21).
 
     Computed by :func:`coverage_diagnostic` over the reshaped
     :class:`presentation.contract.Fixture` dict: the coverage-weighted
     average of the ranked entries' ``p_a_wins_series`` compared
     against the fixture's overall value. Diagnostic only — it never
     enters the artifact and is never displayed (§8), and there is no
-    gap-threshold constant (D6).
+    gap-threshold constant (D21).
 
     Attributes:
         mass: The summed ``veto_probability`` over the fixture's
             ``top_vetos`` listing — recomputed inside
             :func:`coverage_diagnostic` from the same entries it
             weights, so the diagnostic is self-contained. Equals
-            ``fixture["coverage_mass"]`` by construction (D5).
+            ``fixture["coverage_mass"]`` by construction (D20).
         weighted: The coverage-weighted average of the ranked
             entries' ``p_a_wins_series`` —
             ``Σ (veto_probability × p_a_wins_series) / mass``.
@@ -726,10 +741,12 @@ class CoverageDiagnostic:
     gap: float
 
 
-def coverage_diagnostic(fixture) -> CoverageDiagnostic | None:
-    """Compute the §8 coverage diagnostic for one fixture (D5).
+def coverage_diagnostic(
+    fixture: contract.Fixture,
+) -> CoverageDiagnostic | None:
+    """Compute the §8 coverage diagnostic for one fixture (D20).
 
-    Implements D5's formula exactly, over the already-reshaped
+    Implements D20's formula exactly, over the already-reshaped
     :class:`presentation.contract.Fixture` dict:
 
     .. code-block:: text
@@ -1181,14 +1198,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     the model version is read softly (D17), the fixture loop runs
     (:func:`export_fixtures`, which times each fixture's ``predict``
     and ``build_fixture``), the P6 diagnostic pass runs over the
-    returned fixtures (:func:`count_null_interval_maps` for the D4
+    returned fixtures (:func:`count_null_interval_maps` for the D19
     null-interval tally and :func:`coverage_diagnostic` for the §8
-    gap, one INFO line per fixture), the D4 null-interval verdict is
+    gap, one INFO line per fixture), the D19 null-interval verdict is
     logged (WARNING naming ``train_bootstrap_replicates.py`` when any
     null intervals are present, else INFO), D14's threshold abort is
     applied, the artifact is assembled (:func:`build_artifact`) and
     written (:func:`write_artifact`), and one INFO summary line is
-    logged — extended, per D7, with ``null_interval_maps``,
+    logged — extended, per D22, with ``null_interval_maps``,
     ``predict_seconds`` and ``elapsed_seconds`` appended after the
     existing fields.
 
