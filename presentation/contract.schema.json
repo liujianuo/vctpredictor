@@ -342,12 +342,12 @@
           "description": "0-based position in the veto sequence."
         },
         "team": {
-          "type": "string",
-          "description": "The acting team's stable team_id."
+          "type": ["string", "null"],
+          "description": "The acting team's stable team_id; null means a decider step (no team acts)."
         },
         "team_name": {
-          "type": "string",
-          "description": "The acting team's derived display name (resolved by P3)."
+          "type": ["string", "null"],
+          "description": "The acting team's derived display name (resolved by P3); null means a decider step (no team acts)."
         },
         "action": {
           "type": "string",

@@ -22,6 +22,10 @@ kept in lockstep with the Python side by a drift-guard test
 - null means "not computed", never zero (``interval_low`` /
   ``interval_high`` / ``greedy_rank`` accept ``null``, and the
   validator never substitutes zeros for it);
+- the one structurally teamless action is the decider step:
+  ``VetoAction.team`` / ``team_name`` accept ``null`` (the keys stay
+  required) because the last remaining map is forced rather than
+  chosen, so no team acts (P3's decider-step handling);
 - structurally-constant fields are omitted, not shipped null
   (:class:`RankedVeto` declares neither ``veto_sensitivity`` nor a
   nested ``top_vetos``, and closes ``additionalProperties`` so a
@@ -116,16 +120,19 @@ class VetoAction(TypedDict):
     Attributes:
         step_index: The 0-based position of this action in the veto
             sequence.
-        team: The acting team's stable ``team_id``.
+        team: The acting team's stable ``team_id``, or ``None`` for a
+            decider step — the last remaining map is forced, not
+            chosen, so no team acts.
         team_name: The acting team's derived display name (resolved by
-            P3, but typed here so P5 never has to change the schema).
+            P3, but typed here so P5 never has to change the schema),
+            or ``None`` alongside ``team`` for a decider step.
         action: One of ``"ban"``, ``"pick"`` or ``"decider"``.
         map_name: The chosen map's normalized name.
     """
 
     step_index: int
-    team: str
-    team_name: str
+    team: str | None
+    team_name: str | None
     action: Literal["ban", "pick", "decider"]
     map_name: str
 

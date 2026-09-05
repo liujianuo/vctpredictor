@@ -547,3 +547,36 @@ def test_wire_types_match_schema_field_sets():
             f"{sorted(wire_type.__required_keys__)} drift from schema "
             f"{definition_name} required {sorted(required)}"
         )
+
+
+def test_veto_action_null_team_validates():
+    # D4: a decider step may carry team: null / team_name: null (the
+    # keys stay required); the widened ["string", "null"] type accepts
+    # it, so a structurally teamless decider no longer fails.
+    artifact = _maximal_artifact()
+    artifact["fixtures"][0]["top_vetos"][0]["actions"][6] = _veto_action(
+        step_index=6,
+        action="decider",
+        team=None,
+        team_name=None,
+        map_name="Sunset",
+    )
+    assert contract.validate_artifact(artifact) is None
+
+
+def test_veto_action_missing_team_still_rejected():
+    # D4 widened the value type, not the key: a veto action missing the
+    # "team" key is still rejected (team stays in required).
+    artifact = _maximal_artifact()
+    del artifact["fixtures"][0]["top_vetos"][0]["actions"][0]["team"]
+    with pytest.raises(ValidationError, match="'team' is a required property"):
+        contract.validate_artifact(artifact)
+
+
+def test_veto_action_non_string_non_null_team_rejected():
+    # A non-string, non-null team (an int) is rejected — the widened
+    # type is ["string", "null"], not a free-for-all.
+    artifact = _maximal_artifact()
+    artifact["fixtures"][0]["top_vetos"][0]["actions"][0]["team"] = 5
+    with pytest.raises(ValidationError):
+        contract.validate_artifact(artifact)
