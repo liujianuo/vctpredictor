@@ -184,7 +184,10 @@ class MapLeverage(TypedDict):
             entries that do not play this map.
         swing: ``p_a_given_played - p_a_given_not``.
         flips_favorite: Whether the attributed map flips which side is
-            favoured.
+            favoured — a within-map comparison: whether
+            ``p_a_given_played`` and ``p_a_given_not`` sit on strictly
+            opposite sides of ``0.5`` (the against-overall comparison
+            is P2's per-entry ``favorite_flips`` on ``RankedVeto``).
         n_vetos_backing: How many top-N entries played this map.
     """
 

@@ -75,6 +75,16 @@ call :func:`compute_map_leverage` with an empty filesystem present.
   spell an import of the lower packages, never name the veto-simulator
   action class, and refer to those layers descriptively (the boundary
   test raw-substring-scans this file).
+- **D13.** ``flips_favorite`` is the *within-map* flip: whether
+  ``p_a_given_played`` and ``p_a_given_not`` sit on strictly opposite
+  sides of ``0.5``, computed by reusing P2's
+  :func:`presentation.derived.favorite_flips` predicate (A2, so the
+  exactly-``0.5``-never-flips rule lives in one place). It does **not**
+  compare either branch against the overall ``p_a_wins_series`` — that
+  against-overall reading belongs to P2's per-entry ``favorite_flips``
+  on the ranked listing — because D3's signature deliberately excludes
+  the overall result and the two numbers this row owns are the only
+  ones in scope.
 
 **The four §5.4 correctness constraints and how each is honoured.**
 
@@ -264,7 +274,11 @@ def compute_map_leverage(
         A ``list`` of :class:`presentation.contract.MapLeverage` dicts
         (possibly empty), one per non-degenerate map, sorted descending
         by ``abs(swing) * p_played`` with ``map_name`` ascending as the
-        tie-break.
+        tie-break. For each row, ``flips_favorite`` is the *within-map*
+        flip: it compares ``p_a_given_played`` against
+        ``p_a_given_not`` on opposite sides of ``0.5`` (the
+        against-overall comparison is P2's per-entry ``favorite_flips``,
+        not this field).
 
     Raises:
         Nothing of its own: an empty listing, or a listing whose total

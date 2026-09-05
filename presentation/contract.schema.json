@@ -441,7 +441,10 @@
         "p_a_given_played": { "type": "number" },
         "p_a_given_not": { "type": "number" },
         "swing": { "type": "number" },
-        "flips_favorite": { "type": "boolean" },
+        "flips_favorite": {
+          "type": "boolean",
+          "description": "Within-map flip: whether p_a_given_played and p_a_given_not sit on strictly opposite sides of 0.5; the against-overall comparison belongs to the per-entry favorite_flips on RankedVeto."
+        },
         "n_vetos_backing": {
           "type": "integer",
           "description": "How many top-N entries played this map."

@@ -361,6 +361,31 @@ def test_always_played_and_never_played_maps_emit_nothing():
     assert "Haven" in names
 
 
+def test_all_map_names_includes_bans_and_union_across_entries():
+    # D6/A5: _all_map_names must return the deduplicated, first-
+    # appearance-order union of every action's map_name across ALL
+    # entries, bans included — so "AlwaysBanned" (banned in every
+    # entry, never a pick/decider) is still enumerable and can be
+    # explicitly skipped as degenerate rather than silently missing.
+    entry_a = _make_entry(
+        ["Ascent", "Bind"], ["AlwaysBanned", "Banned1"], 0.6
+    )
+    entry_b = _make_entry(
+        ["Lotus", "Haven"], ["AlwaysBanned", "Banned2"], 0.4
+    )
+    names = leverage._all_map_names((entry_a, entry_b))
+    assert names == [
+        "AlwaysBanned",
+        "Banned1",
+        "Ascent",
+        "Bind",
+        "Banned2",
+        "Lotus",
+        "Haven",
+    ]
+    assert "AlwaysBanned" in names
+
+
 def test_below_minimum_backing_map_still_emitted():
     # §13 case 4: a map played in exactly 1 of 10 entries is emitted
     # with n_vetos_backing == 1 and a small p_played (D10: P4 does not
@@ -419,6 +444,34 @@ def test_ranking_by_abs_swing_times_p_played():
     assert abs(big["swing"]) > abs(moderate["swing"])
     names = [row["map_name"] for row in output]
     assert names.index("Moderate") < names.index("Big")
+
+
+def test_negative_swing_map_ranks_first():
+    # D9 pins the abs() in the ranking key: "NegMap" favours side B
+    # (p_a_given_played 0.1 vs p_a_given_not 0.7 -> swing -0.6) and is
+    # played in 3 of 5 equal-weight entries (p_played 0.6), so
+    # |swing| * p_played = 0.36; "PosMap" has a small positive swing
+    # (0.5 vs 0.3 -> +0.2, p_played 0.2 -> 0.04). A signed sort turns
+    # NegMap's product positive (last) and PosMap's negative (first),
+    # so asserting NegMap is output[0] fails if abs() is dropped.
+    entries = (
+        _make_entry(["NegMap"], [], 0.1),
+        _make_entry(["NegMap"], [], 0.1),
+        _make_entry(["NegMap"], [], 0.1),
+        _make_entry(["PosMap"], [], 0.5),
+        _make_entry(["Filler"], [], 0.9),
+    )
+    output = leverage.compute_map_leverage(entries)
+    neg = _by_name(output)["NegMap"]
+    pos = _by_name(output)["PosMap"]
+    assert neg["swing"] == pytest.approx(-0.6)
+    assert neg["swing"] < 0
+    assert pos["swing"] == pytest.approx(0.2)
+    assert pos["swing"] > 0
+    assert abs(neg["swing"]) * neg["p_played"] > (
+        pos["swing"] * pos["p_played"]
+    )
+    assert output[0]["map_name"] == "NegMap"
 
 
 def test_tie_break_map_name_ascending():
