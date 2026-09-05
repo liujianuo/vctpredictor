@@ -87,6 +87,22 @@ present (D10). ``model_provenance.json`` is read softly (D17) via
 ``--version`` flag verbatim; ``model_version`` is the sidecar's
 ``git_sha`` (or ``"unstamped"``), never the export's own ``HEAD``.
 
+**Future-fixture limitation (read before running).** ``predict()``
+currently resolves ``event_stage`` by an exact ``(team_a, team_b,
+as_of)`` match lookup against ``matches.parquet`` (via
+``models/_shared._match_id_for``): it requires **exactly one**
+``matches`` row whose ``(team1_id, team2_id, date)`` equals the
+queried pair and the run's as-of date. D8 shares one ``as_of`` across
+every fixture in a run, and every match in the corpus has a distinct
+timestamp, so **at most one distinct team pair can be exported per
+run** — only fixtures already present in ``matches.parquet`` at
+exactly the run's as-of date can be predicted. The shipped
+``fixtures.json`` is therefore a **shape template**, not a runnable
+example: invoking the driver on it with default flags fails every
+record and aborts (D14). The underlying blocker is a modelling
+decision in ``models/`` (see the presentation roadmap's "Notes and
+deferrals") and is out of scope for this driver.
+
 **Exit codes.** ``0`` — always. The hard failures are raises instead,
 mirroring the rest of ``drivers/``'s raise-for-invariant-break
 doctrine.
@@ -357,6 +373,26 @@ def parse_fixture_record(record) -> FixtureSpec:
     )
 
     def _fail(message: str) -> InvalidFixtureError:
+        """Build a prefixed :class:`InvalidFixtureError` for one record.
+
+        Returns (rather than raises) the exception object, so the
+        caller can ``raise _fail(...)`` and the message carries the
+        record's ``match_id`` whenever it was readable. The prefix is
+        ``fixture <match_id>`` in that case and ``fixture record``
+        otherwise; ``match_id`` is the enclosing function's local, so
+        the prefix reflects whatever was parsed from this record.
+
+        Args:
+            message: The record-specific failure description (already
+                human-readable, e.g. "missing required key(s)").
+
+        Returns:
+            An :class:`InvalidFixtureError` with the prefixed message,
+            ready to be raised by the caller.
+
+        Raises:
+            Nothing.
+        """
         if match_id is not None:
             return InvalidFixtureError(f"fixture {match_id!r}: {message}")
         return InvalidFixtureError(f"fixture record: {message}")
@@ -846,7 +882,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_FIXTURES_PATH,
         help=(
             "path to the hand-maintained fixtures.json fixture list "
-            f"(default: {DEFAULT_FIXTURES_PATH})"
+            f"(default: {DEFAULT_FIXTURES_PATH}); note: only fixtures "
+            "already present in matches.parquet at exactly the run's "
+            "as-of date can be predicted — the shipped fixtures.json is "
+            "a shape template, not a runnable example"
         ),
     )
     parser.add_argument(

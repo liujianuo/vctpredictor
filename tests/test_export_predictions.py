@@ -377,7 +377,7 @@ class _StubPredictor:
         self._index = 0
 
     def __call__(self, output_dir, version, *, n_samples, seed, ci_level,
-                 bootstrap_models=None):
+                 **kwargs):
         """Record one construction and return this instance.
 
         Args:
@@ -386,7 +386,9 @@ class _StubPredictor:
             n_samples: The ``--n-samples`` knob.
             seed: The ``--seed`` knob.
             ci_level: The ``--ci-level`` knob.
-            bootstrap_models: Unused (the export never passes it).
+            **kwargs: Any additional construction keyword arguments
+                (e.g. ``bootstrap_models``), recorded verbatim so tests
+                can assert they were *not* passed by the export (D10).
 
         Returns:
             ``self``, so the constructed "predictor" is this stub.
@@ -401,6 +403,7 @@ class _StubPredictor:
                 "n_samples": n_samples,
                 "seed": seed,
                 "ci_level": ci_level,
+                **kwargs,
             }
         )
         return self
@@ -1002,9 +1005,10 @@ def _good_record(match_id="1"):
 
 
 def test_main_end_to_end_writes_and_records_calls(tmp_path, monkeypatch):
-    # One Predictor construction, one predict per kept fixture with
-    # map_pool=None / the shared as-of / the --top-n value; artifact
-    # validates and carries generated_at == --as-of-date.
+    # One Predictor construction (with bootstrap_models never passed —
+    # D10), one predict per kept fixture with map_pool=None / the
+    # shared as-of / the --top-n value; artifact validates and carries
+    # generated_at == --as-of-date.
     stub = _StubPredictor(results=[_make_result(), _make_result()])
     _run_export_main(
         tmp_path,
@@ -1025,6 +1029,7 @@ def test_main_end_to_end_writes_and_records_calls(tmp_path, monkeypatch):
     assert ctor["n_samples"] == 5
     assert ctor["seed"] == 99
     assert ctor["ci_level"] == pytest.approx(0.8)
+    assert "bootstrap_models" not in ctor
     assert len(stub.calls) == 2
     for team_a, team_b, best_of, map_pool, as_of_date, top_n in stub.calls:
         assert (team_a, team_b, best_of) == ("A", "B", "Bo3")
@@ -1128,9 +1133,17 @@ def test_export_fixtures_excludes_unknown_team_and_logs(caplog):
     assert any("MISSING" in record.message for record in caplog.records)
 
 
-def test_export_fixtures_predict_valueerror_excluded():
-    # A ValueError out of predict is excluded and counted (D13).
-    stub = _StubPredictor(results=[_make_result()], error=ValueError("boom"))
+@pytest.mark.parametrize(
+    "error_type",
+    [ValueError, KeyError, ep.ConfigError],
+    ids=["ValueError", "KeyError", "ConfigError"],
+)
+def test_export_fixtures_predict_per_fixture_error_excluded(error_type):
+    # Each PER_FIXTURE_ERRORS member out of predict is excluded and
+    # counted (D13).
+    stub = _StubPredictor(
+        results=[_make_result()], error=error_type("boom")
+    )
     fixtures, failures, _present = ep.export_fixtures(
         stub,
         [_make_spec("1")],
@@ -1182,6 +1195,42 @@ def test_main_abort_writes_nothing_and_keeps_existing(tmp_path, monkeypatch):
         _run_export_main(tmp_path, monkeypatch, records, argv, stub)
     assert artifact_path.read_bytes() == b"previous bytes\n"
     assert list((tmp_path / "v1").glob("*.tmp")) == []
+
+
+def test_main_invalid_records_count_toward_failure_fraction(
+    tmp_path, monkeypatch
+):
+    # D14: invalid records (D2/D3 violations) count toward the failure
+    # fraction. One valid + two invalid records = 3 attempted, 2
+    # failed, 2/3 > 0.5, so the run aborts and writes nothing.
+    stub = _StubPredictor(results=[_make_result()])
+    records = [
+        _good_record("1"),
+        # Missing team_a_id -> invalid (D2).
+        {
+            "match_id": "2",
+            "event": "E",
+            "scheduled_at": "2026-09-13T10:00:00",
+            "best_of": "Bo3",
+            "team_b_id": "B",
+        },
+        # Unknown best_of -> invalid (D3).
+        {
+            "match_id": "3",
+            "event": "E",
+            "scheduled_at": "2026-09-13T10:00:00",
+            "best_of": "Bo7",
+            "team_a_id": "A",
+            "team_b_id": "B",
+        },
+    ]
+    argv = [
+        "--as-of-date", "2026-09-01T00:00:00",
+        "--max-failure-fraction", "0.5",
+    ]
+    with pytest.raises(ep.ExportAbortedError):
+        _run_export_main(tmp_path, monkeypatch, records, argv, stub)
+    assert not (tmp_path / "v1" / "predictions.json").exists()
 
 
 def test_main_all_past_fixtures_writes_empty_artifact(tmp_path, monkeypatch):
@@ -1464,7 +1513,13 @@ def test_real_v1_export_smoke(tmp_path):
     # The only test binding the schema to the shipped dataclasses: copy
     # the three tables, the four model artifacts and (when present) the
     # replicates + sidecar into tmp_path/v1, then run the real export
-    # against two real team ids with reduced knobs.
+    # with reduced knobs. The team pair is DELIBERATELY repeated across
+    # the two records: predict() resolves event_stage by an exact
+    # (team_a, team_b, as_of) matches-row lookup (finding 1), so only
+    # fixtures matching the as-of row can be predicted — a second,
+    # different pair would fail and abort the run. The assertions below
+    # therefore pin that the two exported records differ only in their
+    # identity keys (match_id/event/scheduled_at).
     v1_dir = tmp_path / "v1"
     v1_dir.mkdir()
     for table in ("matches", "maps", "player_map_stats"):
@@ -1527,5 +1582,19 @@ def test_real_v1_export_smoke(tmp_path):
     artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
     contract.validate_artifact(artifact)
     assert json.loads(json.dumps(artifact)) == artifact
-    assert len(artifact["fixtures"]) == 2
+    fixtures = artifact["fixtures"]
+    assert len(fixtures) == 2
+    first, second = fixtures
+    assert first["match_id"] == "999901"
+    assert second["match_id"] == "999902"
+    assert first["event"] == "Smoke Event 1"
+    assert second["event"] == "Smoke Event 2"
+    assert first["scheduled_at"] == "2026-09-13T10:00:00"
+    assert second["scheduled_at"] == "2026-09-14T10:00:00"
+    # The two records are otherwise identical — the same team pair was
+    # predicted twice (see the comment above; finding 1).
+    identity_keys = {"match_id", "event", "scheduled_at"}
+    assert {k: v for k, v in first.items() if k not in identity_keys} == {
+        k: v for k, v in second.items() if k not in identity_keys
+    }
     assert artifact["model_version"]
