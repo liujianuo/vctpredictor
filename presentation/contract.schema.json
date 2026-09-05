@@ -60,7 +60,7 @@
     },
     "Fixture": {
       "type": "object",
-      "description": "One upcoming fixture's self-contained prediction record (§6; self-contained so a future per-fixture-file split is mechanical).",
+      "description": "One upcoming fixture's self-contained prediction record (§6; self-contained so a future per-fixture-file split is mechanical). The allOf below pins series_probabilities — both the overall result's and every ranked veto's — to length best_of_int + 1 (2, 4, 6 for Bo1, Bo3, Bo5).",
       "required": [
         "match_id",
         "event",
@@ -79,6 +79,65 @@
         "narrative"
       ],
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "best_of_int": { "const": 1 } } },
+          "then": {
+            "properties": {
+              "overall": {
+                "properties": {
+                  "series_probabilities": { "minItems": 2, "maxItems": 2 }
+                }
+              },
+              "top_vetos": {
+                "items": {
+                  "properties": {
+                    "series_probabilities": { "minItems": 2, "maxItems": 2 }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "best_of_int": { "const": 3 } } },
+          "then": {
+            "properties": {
+              "overall": {
+                "properties": {
+                  "series_probabilities": { "minItems": 4, "maxItems": 4 }
+                }
+              },
+              "top_vetos": {
+                "items": {
+                  "properties": {
+                    "series_probabilities": { "minItems": 4, "maxItems": 4 }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "best_of_int": { "const": 5 } } },
+          "then": {
+            "properties": {
+              "overall": {
+                "properties": {
+                  "series_probabilities": { "minItems": 6, "maxItems": 6 }
+                }
+              },
+              "top_vetos": {
+                "items": {
+                  "properties": {
+                    "series_probabilities": { "minItems": 6, "maxItems": 6 }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
       "properties": {
         "match_id": { "type": "string" },
         "event": { "type": "string" },
@@ -109,7 +168,7 @@
         },
         "scoreline_labels": {
           "type": "array",
-          "description": "Derived display labels, parallel to outcome_order (same length).",
+          "description": "Derived display labels, parallel to outcome_order (same length; enforced by validate_artifact in Python, since draft-07 JSON Schema cannot express cross-field length parity).",
           "items": { "type": "string" }
         },
         "overall": { "$ref": "#/definitions/OverallResult" },
@@ -156,7 +215,7 @@
       "properties": {
         "series_probabilities": {
           "type": "array",
-          "description": "The best_of + 1 scoreline probabilities in outcome_order order (M31 sampled).",
+          "description": "The best_of + 1 scoreline probabilities in outcome_order order (M31 sampled); length best_of_int + 1, enforced by the Fixture-level allOf.",
           "items": { "type": "number" }
         },
         "p_a_wins_series": {
@@ -256,7 +315,7 @@
         },
         "series_probabilities": {
           "type": "array",
-          "description": "The exact M30 recursion scoreline distribution.",
+          "description": "The exact M30 recursion scoreline distribution; length best_of_int + 1, enforced by the Fixture-level allOf.",
           "items": { "type": "number" }
         },
         "p_a_wins_series": {

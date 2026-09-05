@@ -141,11 +141,15 @@ EVALUATION_MODULES = (
 
 # The modules that live under presentation/ (the new top-level DAG node
 # of roadmap P1 — the wire data contract plus, in later milestones, the
-# derived-quantity/reshaping/leverage libraries). Update this constant
-# list whenever a module is added to or removed from presentation/ so
-# the test's coverage stays legible and does not silently grow or
-# shrink with the filesystem.
+# derived-quantity/reshaping/leverage libraries). __init__.py is listed
+# deliberately: it is docstring-only today (so it passes trivially), but
+# scanning it means a future re-export surface in it is caught by the
+# drivers-edge test below instead of silently skipped. Update this
+# constant list whenever a module is added to or removed from
+# presentation/ so the test's coverage stays legible and does not
+# silently grow or shrink with the filesystem.
 PRESENTATION_MODULES = (
+    "__init__.py",
     "contract.py",
 )
 
@@ -323,21 +327,69 @@ def test_evaluation_module_imports_only_features_models_and_utils():
         )
 
 
+def _folded_from_imports(source):
+    """Yield each complete ``from ... import ...`` statement, folded onto
+    one line.
+
+    Walks a module's source lines and, when a ``from ... import``
+    statement opens parentheses that do not close on the same physical
+    line (or ends with an explicit backslash continuation), keeps
+    consuming continuation lines until the statement is complete, then
+    yields it as a single whitespace-joined string with any
+    continuation backslashes removed. Statements that fit on one
+    physical line are yielded unchanged. This prevents a parenthesized
+    multi-line import from being mis-parsed as an empty name list by
+    :func:`_imported_names`.
+
+    Args:
+        source: The raw module source text.
+
+    Yields:
+        The complete text of each ``from ... import`` statement, one
+        per statement, with parentheses balanced, continuation
+        backslashes removed, and continuation lines joined by single
+        spaces.
+
+    Raises:
+        Nothing — lines that neither begin nor continue a ``from ...
+        import`` statement are skipped, and an unterminated statement
+        at end-of-file is simply not yielded.
+    """
+    lines = source.splitlines()
+    buffer = None
+    depth = 0
+    for line in lines:
+        stripped = line.strip()
+        if buffer is None:
+            if not (stripped.startswith("from ") and " import " in stripped):
+                continue
+            buffer = [stripped.rstrip("\\")]
+        else:
+            buffer.append(stripped.rstrip("\\"))
+        depth += stripped.count("(") - stripped.count(")")
+        if depth > 0 or stripped.endswith("\\"):
+            continue
+        yield " ".join(buffer)
+        buffer = None
+        depth = 0
+
+
 def _imported_names(from_import_line):
-    """Extract the bare imported names from a ``from X import ...`` line.
+    """Extract the bare imported names from a folded ``from X import``
+    statement.
 
     Parses the text after the ``import`` keyword, strips any wrapping
     parentheses, splits on commas, and drops any ``name as alias``
-    renaming (returning the local ``name``) so callers can check each
-    name's membership against an allowed-surface set. Assumes the
-    statement is a single physical source line — the repo convention
-    for these presentation-module imports; a parenthesized multi-line
-    ``from ... import`` would need the caller to first fold the
-    continuation lines.
+    renaming (keeping the name imported from the module, which is what
+    the allowed-surface check compares) so callers can test each name's
+    membership. The statement is expected to already be folded onto one
+    logical line by :func:`_folded_from_imports`, so a parenthesized
+    multi-line import is passed whole.
 
     Args:
         from_import_line: A stripped source line beginning with
-            ``from <module> import``.
+            ``from <module> import`` (already folded across any
+            parenthesized continuation lines).
 
     Returns:
         A ``frozenset`` of the imported name strings, in no particular
@@ -363,7 +415,9 @@ def test_presentation_module_imports_only_allowed_drivers_predict_names():
     # edge: ``from drivers.predict import <allowed surface>``. Any other
     # ``from drivers.*`` import, any whole-module ``import drivers`` /
     # ``import drivers.predict`` (then reaching into privates), or any
-    # name outside the allowed surface is a boundary violation.
+    # name outside the allowed surface is a boundary violation. Imports
+    # are folded first (via _folded_from_imports) so a parenthesized
+    # multi-line from-import is checked name-by-name rather than skipped.
     for module in PRESENTATION_MODULES:
         source = Path("presentation", module).read_text(encoding="utf-8")
         assert "import drivers" not in source, (
@@ -371,20 +425,47 @@ def test_presentation_module_imports_only_allowed_drivers_predict_names():
             "the only permitted drivers edge is a from-import of the "
             "allowed predict.py surface"
         )
-        for line in source.splitlines():
-            stripped = line.strip()
-            if not stripped.startswith(("from drivers.", "from drivers ")):
+        for statement in _folded_from_imports(source):
+            if not statement.startswith("from drivers"):
                 continue
-            assert stripped.startswith("from drivers.predict import "), (
+            assert statement.startswith("from drivers.predict import "), (
                 f"presentation/{module} has a drivers import other than "
-                f"from drivers.predict: {stripped!r}"
+                f"from drivers.predict: {statement!r}"
             )
-            for name in _imported_names(stripped):
+            for name in _imported_names(statement):
                 assert name in ALLOWED_PRESENTATION_DRIVERS_IMPORT_NAMES, (
                     f"presentation/{module} imports {name!r} from "
                     "drivers.predict, which is not in the allowed "
                     "presentation surface"
                 )
+
+
+def test_parenthesized_drivers_import_is_folded_and_fully_checked():
+    # Regression: the old per-line scan parsed ``from drivers.predict
+    # import (`` as an empty name set and skipped the continuation lines,
+    # so a private name imported via a parenthesized multi-line
+    # from-import passed with no assertion ever running. Folding must
+    # reunite the statement so every imported name is surfaced to the
+    # membership check below.
+    source = (
+        "from drivers.predict import (\n"
+        "    PredictionResult,\n"
+        "    _private_helper,\n"
+        ")\n"
+    )
+    folded = list(_folded_from_imports(source))
+    assert folded == [
+        "from drivers.predict import ( PredictionResult, _private_helper, )"
+    ]
+    imported = set()
+    for statement in folded:
+        assert statement.startswith("from drivers.predict import ")
+        imported |= _imported_names(statement)
+    assert imported == {"PredictionResult", "_private_helper"}
+    assert not imported <= ALLOWED_PRESENTATION_DRIVERS_IMPORT_NAMES, (
+        "the private helper must be surfaced so the boundary check "
+        "rejects it rather than silently skipping it"
+    )
 
 
 def test_no_presentation_module_imports_features_or_models():

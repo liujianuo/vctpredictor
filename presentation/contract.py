@@ -25,7 +25,14 @@ kept in lockstep with the Python side by a drift-guard test
 - structurally-constant fields are omitted, not shipped null
   (:class:`RankedVeto` declares neither ``veto_sensitivity`` nor a
   nested ``top_vetos``, and closes ``additionalProperties`` so a
-  reshaping bug that accidentally re-includes either fails validation).
+  reshaping bug that accidentally re-includes either fails validation);
+- ``series_probabilities`` vectors are exactly ``best_of_int + 1``
+  long (2/4/6 for Bo1/Bo3/Bo5) on both the overall result and every
+  ranked veto — enforced in the schema by a Fixture-level ``allOf``
+  of ``if``/``then`` clauses keyed on ``best_of_int``;
+- ``scoreline_labels`` is exactly parallel to ``outcome_order`` (same
+  length) — enforced by :func:`validate_artifact` in Python, because
+  draft-07 JSON Schema cannot express cross-field length parity.
 
 Module placement (per the Conventions ruling in
 ``presentation_roadmap.md``): ``presentation/`` is a new top-level DAG
@@ -45,12 +52,14 @@ commit onward.
 
 from __future__ import annotations
 
+import copy
 import json
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal, TypedDict
 
 import jsonschema
+from jsonschema.exceptions import ValidationError
 
 # The checked-in schema, colocated with this module and resolved
 # relative to __file__ so loading never depends on the process CWD.
@@ -203,7 +212,8 @@ class OverallResult(TypedDict):
 
     Attributes:
         series_probabilities: The ``best_of + 1`` scoreline
-            probabilities in ``outcome_order`` order (M31 sampled).
+            probabilities in ``outcome_order`` order (M31 sampled) —
+            length ``best_of_int + 1``, enforced by the schema.
         p_a_wins_series: Derived — the summed probability of every
             scoreline where A wins more maps than B.
         veto_sensitivity: The structural spread summary (a real object
@@ -240,7 +250,8 @@ class RankedVeto(TypedDict):
         actions: The 7 veto steps in step order (always exactly 7).
         per_map: This veto's played maps, in play order.
         series_probabilities: The exact M30 recursion scoreline
-            distribution.
+            distribution — length ``best_of_int + 1``, enforced by the
+            schema.
         p_a_wins_series: Derived — the summed probability of every
             scoreline where A wins more maps than B.
         favorite_flips: Derived — whether this entry's
@@ -273,7 +284,8 @@ class Fixture(TypedDict):
         outcome_order: The ``best_of + 1`` terminal ``(a_wins,
             b_wins)`` scorelines, hoisted once per fixture (§4.5).
         scoreline_labels: Derived display labels parallel to
-            ``outcome_order``.
+            ``outcome_order`` (same length — enforced by
+            :func:`validate_artifact`, not expressible in JSON Schema).
         overall: The top-level result.
         top_vetos: The top-N ranked veto listing.
         coverage_mass: Derived — the summed ``veto_probability`` over
@@ -346,18 +358,20 @@ WIRE_TYPE_DEFINITIONS: dict[type, str] = {
 
 
 @lru_cache(maxsize=1)
-def load_schema() -> dict:
-    """Load and parse the checked-in JSON Schema once.
+def _load_schema_once() -> dict:
+    """Read and parse the checked-in JSON Schema exactly once.
 
     Reads :data:`_SCHEMA_PATH` (``presentation/contract.schema.json``,
     resolved relative to this module's own file so the load never
-    depends on the process working directory), parses it as JSON, and
-    caches the result so every subsequent call in the process returns
-    the same parsed dict without re-reading the file.
+    depends on the process working directory) and parses it as JSON,
+    memoized via :func:`functools.lru_cache` so the file is read and
+    parsed only on the first call in the process.
 
     Returns:
-        The parsed JSON Schema as a nested ``dict`` (a draft-07 schema
-        whose root is a ``$ref`` into its own ``definitions``).
+        The raw parsed JSON Schema as a nested ``dict`` (a draft-07
+        schema whose root is a ``$ref`` into its own ``definitions``).
+        This is the shared cached copy; callers that must not mutate it
+        go through :func:`load_schema`, which returns a deep copy.
 
     Raises:
         FileNotFoundError: If ``contract.schema.json`` is missing next
@@ -370,16 +384,80 @@ def load_schema() -> dict:
     return json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
 
 
+def load_schema() -> dict:
+    """Load the checked-in JSON Schema, returning an independent copy.
+
+    Reads and parses the schema once per process (via the cached
+    :func:`_load_schema_once`) and returns a :func:`copy.deepcopy` of
+    the cached dict, so a caller may freely mutate the returned schema
+    (for example, to build a test variant) without corrupting the
+    shared copy used by :func:`validate_artifact` or any other caller.
+
+    Returns:
+        A fresh deep copy of the parsed JSON Schema as a nested
+        ``dict`` (a draft-07 schema whose root is a ``$ref`` into its
+        own ``definitions``).
+
+    Raises:
+        FileNotFoundError: If ``contract.schema.json`` is missing next
+            to this module — propagated unchanged from the file read.
+        json.JSONDecodeError: If ``contract.schema.json`` is not valid
+            JSON — propagated unchanged from :func:`json.loads`.
+        OSError: If the file exists but cannot be read (e.g. a
+            permission error) — propagated unchanged from the read.
+    """
+    return copy.deepcopy(_load_schema_once())
+
+
+def _check_scoreline_label_parity(artifact: dict) -> None:
+    """Reject any fixture whose scoreline_labels is not parallel to
+    its outcome_order.
+
+    draft-07 JSON Schema cannot express "array A and array B have the
+    same length", so this cross-field parity is checked here in Python
+    after :func:`jsonschema.validate` has already confirmed the
+    individual fields are well-formed. §6 says the frontend indexes
+    ``scoreline_labels`` positionally against the hoisted
+    ``outcome_order``, so a length mismatch would silently mislabel
+    scorelines.
+
+    Args:
+        artifact: An artifact dict that has already passed schema
+            validation (so ``fixtures`` is present and each fixture has
+            both ``scoreline_labels`` and ``outcome_order``).
+
+    Returns:
+        None when every fixture's two lists have the same length.
+
+    Raises:
+        jsonschema.exceptions.ValidationError: On the first fixture
+            whose ``scoreline_labels`` length differs from its
+            ``outcome_order`` length, with a message naming the
+            fixture and the two lengths.
+    """
+    for fixture in artifact.get("fixtures", []):
+        labels = fixture["scoreline_labels"]
+        order = fixture["outcome_order"]
+        if len(labels) != len(order):
+            raise ValidationError(
+                f"scoreline_labels has {len(labels)} entries but "
+                f"outcome_order has {len(order)} for fixture "
+                f"{fixture.get('match_id')!r}; the frontend indexes "
+                "them positionally, so they must be the same length"
+            )
+
+
 def validate_artifact(artifact: dict) -> None:
     """Validate a presentation artifact dict against the wire schema.
 
-    Loads the schema once (via :func:`load_schema`, whose result is
-    cached), then validates ``artifact`` against it with
-    :func:`jsonschema.validate`. Validation is **fail-fast**: the first
-    schema violation raises immediately, and no attempt is made to
-    aggregate multiple violations into a report (the simplest behavior,
-    and sufficient until a concrete need for multi-error reports
-    exists).
+    Loads the schema once (via :func:`load_schema`, which returns a
+    fresh copy each call), validates ``artifact`` against it with
+    :func:`jsonschema.validate`, then applies the one cross-field rule
+    JSON Schema cannot express — ``scoreline_labels`` must be the same
+    length as ``outcome_order`` — via
+    :func:`_check_scoreline_label_parity`. Validation is **fail-fast**:
+    the first schema violation raises immediately, and no attempt is
+    made to aggregate multiple violations into a report.
 
     Args:
         artifact: The candidate artifact dict to validate (the
@@ -391,12 +469,19 @@ def validate_artifact(artifact: dict) -> None:
     Raises:
         jsonschema.exceptions.ValidationError: On the first schema
             violation (e.g. a missing required field, a wrong enum
-            value, a probability shipped as a string, a
-            length-!=4 probability vector, or an unexpected
+            value, a probability shipped as a string, a length-!=4
+            probability vector, a wrong-length
+            ``series_probabilities``, or an unexpected
             ``veto_sensitivity``/``top_vetos`` key on a
             ``RankedVeto``) — propagated unchanged from
             :func:`jsonschema.validate`, so callers get the library's
-            descriptive message with the failing path.
+            descriptive message with the failing path; also raised by
+            :func:`_check_scoreline_label_parity` when a fixture's
+            ``scoreline_labels`` and ``outcome_order`` lengths differ.
+        jsonschema.exceptions.SchemaError: If the checked-in schema
+            itself is malformed (jsonschema validates the schema on
+            every call) — propagated unchanged from
+            :func:`jsonschema.validate`.
         FileNotFoundError: If the schema file cannot be found on the
             first load — propagated from :func:`load_schema`.
         json.JSONDecodeError: If the schema file is not valid JSON —
@@ -405,3 +490,4 @@ def validate_artifact(artifact: dict) -> None:
             :func:`load_schema`.
     """
     jsonschema.validate(artifact, load_schema())
+    _check_scoreline_label_parity(artifact)

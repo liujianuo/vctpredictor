@@ -317,6 +317,37 @@ def _maximal_artifact():
     }
 
 
+def _artifact_for_best_of(best_of, best_of_int):
+    """Build a valid artifact for an arbitrary bo format with one top veto.
+
+    Args:
+        best_of: One of ``"Bo1"``, ``"Bo3"`` or ``"Bo5"`` — the
+            fixture's bo label.
+        best_of_int: The matching map count (``1``, ``3`` or ``5``).
+
+    Returns:
+        An ``Artifact`` dict whose single fixture uses the given bo
+        format, with ``outcome_order``, ``scoreline_labels``, the
+        overall ``series_probabilities`` and the single ranked veto's
+        ``series_probabilities`` all at the correct ``best_of_int + 1``
+        length (so the artifact is valid for that bo format).
+
+    Raises:
+        Nothing.
+    """
+    scorelines = [[best_of_int - b, b] for b in range(best_of_int + 1)]
+    artifact = _minimal_artifact()
+    fixture = artifact["fixtures"][0]
+    fixture["best_of"] = best_of
+    fixture["best_of_int"] = best_of_int
+    fixture["outcome_order"] = scorelines
+    fixture["scoreline_labels"] = [f"{a}-{b}" for a, b in scorelines]
+    fixture["overall"]["series_probabilities"] = [0.1] * (best_of_int + 1)
+    fixture["top_vetos"] = [_ranked_veto(rank=1)]
+    fixture["top_vetos"][0]["series_probabilities"] = [0.1] * (best_of_int + 1)
+    return artifact
+
+
 def test_minimal_artifact_validates():
     # The minimal artifact (null intervals, empty lists, empty
     # narrative, stub metrics) is valid, and validate_artifact returns
@@ -408,6 +439,54 @@ def test_enum_out_of_set_rejected(field, bad):
     else:
         artifact["fixtures"][0][field] = bad
     with pytest.raises(ValidationError):
+        contract.validate_artifact(artifact)
+
+
+@pytest.mark.parametrize(
+    ("best_of", "best_of_int", "expected"),
+    [("Bo1", 1, 2), ("Bo3", 3, 4), ("Bo5", 5, 6)],
+)
+def test_series_probabilities_correct_length_validates(
+    best_of, best_of_int, expected
+):
+    # Both the overall and the ranked-veto series_probabilities must be
+    # exactly best_of_int + 1 long; a correct-length artifact validates
+    # for all three bo formats (the if/then mapping is right, not just
+    # for Bo3).
+    artifact = _artifact_for_best_of(best_of, best_of_int)
+    assert contract.validate_artifact(artifact) is None
+
+
+@pytest.mark.parametrize(
+    ("best_of", "best_of_int", "expected"),
+    [("Bo1", 1, 2), ("Bo3", 3, 4), ("Bo5", 5, 6)],
+)
+@pytest.mark.parametrize("location", ["overall", "top_vetos"])
+@pytest.mark.parametrize("delta", [-1, 1])
+def test_series_probabilities_wrong_length_rejected(
+    best_of, best_of_int, expected, location, delta
+):
+    # A series_probabilities vector one entry too short or too long is
+    # rejected, in both the overall result and the ranked-veto entry,
+    # for all three bo formats.
+    artifact = _artifact_for_best_of(best_of, best_of_int)
+    bad = [0.1] * (expected + delta)
+    if location == "overall":
+        artifact["fixtures"][0]["overall"]["series_probabilities"] = bad
+    else:
+        artifact["fixtures"][0]["top_vetos"][0]["series_probabilities"] = bad
+    with pytest.raises(ValidationError):
+        contract.validate_artifact(artifact)
+
+
+def test_scoreline_labels_outcome_order_length_mismatch_rejected():
+    # scoreline_labels must parallel outcome_order; JSON Schema cannot
+    # express cross-field length parity, so validate_artifact checks it
+    # in Python after schema validation. A mismatch (one label dropped)
+    # is rejected with a clear error naming the field.
+    artifact = _minimal_artifact()
+    artifact["fixtures"][0]["scoreline_labels"] = ["2-0", "2-1", "1-2"]
+    with pytest.raises(ValidationError, match="scoreline_labels"):
         contract.validate_artifact(artifact)
 
 
