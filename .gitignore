@@ -18,8 +18,18 @@ presentation_roadmap.md
 # local cache (SQLite DB files)
 cache/
 
-# materialised dataset output (Parquet + report.json, a build artifact)
-data/
+# materialised dataset output (Parquet tables, report.json and the
+# eval/diagnostic reports) stays ignored — CI regenerates it. The
+# fitted model artifacts, the bootstrap replicates, decision I's
+# model_provenance.json sidecar and the exported predictions.json are
+# committed (presentation roadmap P5/P23), so they are negated back in.
+data/*
+!data/*/
+data/*/*
+!data/*/*_model.json
+!data/*/ordinal_bootstrap_replicates.json
+!data/*/model_provenance.json
+!data/*/predictions.json
 
 # python artifacts
 __pycache__/

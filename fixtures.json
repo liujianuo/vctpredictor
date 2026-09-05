@@ -1,0 +1,36 @@
+{
+  "fixtures": [
+    {
+      "match_id": "901001",
+      "event": "VCT 2026 EMEA — Stage 3",
+      "scheduled_at": "2026-09-13T10:00:00",
+      "best_of": "Bo3",
+      "team_a_id": "397",
+      "team_b_id": "2593"
+    },
+    {
+      "match_id": "901002",
+      "event": "VCT 2026 EMEA — Stage 3",
+      "scheduled_at": "2026-09-13T13:00:00",
+      "best_of": "Bo3",
+      "team_a_id": "474",
+      "team_b_id": "6392"
+    },
+    {
+      "match_id": "901003",
+      "event": "VCT 2026 EMEA — Stage 3",
+      "scheduled_at": "2026-09-14T10:00:00",
+      "best_of": "Bo5",
+      "team_a_id": "2059",
+      "team_b_id": "1001"
+    },
+    {
+      "match_id": "901004",
+      "event": "VCT 2026 EMEA — Stage 3",
+      "scheduled_at": "2026-09-14T13:00:00",
+      "best_of": "Bo3",
+      "team_a_id": "397",
+      "team_b_id": "474"
+    }
+  ]
+}

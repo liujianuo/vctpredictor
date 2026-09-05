@@ -1,0 +1,20 @@
+{
+  "fixtures": [
+    {
+      "match_id": "512345",
+      "event": "VCT 2026 Pacific — Stage 2",
+      "scheduled_at": "2026-09-13T10:00:00",
+      "best_of": "Bo3",
+      "team_a_id": "100001",
+      "team_b_id": "100002"
+    },
+    {
+      "match_id": "512346",
+      "event": "VCT 2026 Pacific — Stage 2",
+      "scheduled_at": "2026-09-14T10:00:00",
+      "best_of": "Bo5",
+      "team_a_id": "100003",
+      "team_b_id": "100004"
+    }
+  ]
+}
