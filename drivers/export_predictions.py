@@ -132,7 +132,7 @@ never written into the artifact (§8):
   INFO per fixture and never displayed or exported. No threshold
   constant exists (D21) — a human reads the line.
 
-**Design decisions D1–D22 (recorded here, do not silently change).**
+**Design decisions D1–D24 (recorded here, do not silently change).**
 
 - **D1.** Two modules, not one: this module owns the export;
   ``drivers/model_provenance.py`` owns the sidecar's filename, keys,
@@ -214,6 +214,17 @@ never written into the artifact (§8):
   pre-existing fields keep their text and order, with
   ``null_interval_maps``, ``predict_seconds`` and ``elapsed_seconds``
   appended after ``dataset_version``.
+- **D23.** The driver's timing boundaries (P6): ``main()`` times the
+  run end to end and the single ``Predictor`` construction;
+  :func:`export_fixtures` times each fixture's ``predict()`` call and
+  its ``build_fixture`` assembly (one INFO line per successful fixture
+  plus an aggregate line). The M31 sampling, ranked-entry construction
+  and ``n_games_backing`` feature lookups all happen inside one
+  ``predict()`` call, so they are not timed separately here.
+- **D24.** Timing tests assert structure only: that the log lines
+  exist, are emitted the right number of times, and carry parseable
+  non-negative numbers. No test asserts a wall-clock duration, a
+  threshold, or an ordering of durations.
 """
 
 from __future__ import annotations

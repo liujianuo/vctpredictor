@@ -1,13 +1,13 @@
 """Tests for the P6 export observability diagnostics.
 
 Owns exactly P6's three diagnostics: :func:`count_null_interval_maps`
-(D4's null-interval tally), :func:`coverage_diagnostic` (D5's §8
-reconciliation gap), and the driver's timing log lines (D3). The
+(D19's null-interval tally), :func:`coverage_diagnostic` (D20's §8
+reconciliation gap), and the driver's timing log lines (D23). The
 null-interval verdict and the extended summary line are exercised
 through :func:`drivers.export_predictions.main` with a stubbed
 ``Predictor``.
 
-**D11 rule.** No test asserts a wall-clock duration, a threshold, or an
+**D24 rule.** No test asserts a wall-clock duration, a threshold, or an
 ordering of durations. Timing tests assert only that the log lines
 exist, are emitted the right number of times, and carry parseable
 non-negative numbers. The measured run is a one-off BUILD activity, not
@@ -74,7 +74,7 @@ def _fixture(entries, overall, *, match_id="1"):
     Populates only the keys the coverage diagnostic reads — ``top_vetos``
     (each entry carrying ``veto_probability`` and ``p_a_wins_series``),
     ``overall.p_a_wins_series``, ``match_id`` — plus ``coverage_mass``
-    (the summed veto probability, which D5 says equals the diagnostic's
+    (the summed veto probability, which D20 says equals the diagnostic's
     recomputed ``mass`` by construction).
 
     Args:
@@ -504,7 +504,7 @@ def _key_paths_with(obj, names):
 
 
 # --------------------------------------------------------------------------
-# count_null_interval_maps (D4)
+# count_null_interval_maps (D19)
 # --------------------------------------------------------------------------
 
 
@@ -531,7 +531,7 @@ def test_count_null_interval_maps_empty():
 
 
 def test_count_null_interval_maps_partial_band_not_counted():
-    # D4 is strictly both-null: a low-set/high-None entry is not a null
+    # D19 is strictly both-null: a low-set/high-None entry is not a null
     # interval, so it is not counted.
     mixed = [
         _per_map(False),
@@ -541,7 +541,7 @@ def test_count_null_interval_maps_partial_band_not_counted():
 
 
 # --------------------------------------------------------------------------
-# coverage_diagnostic (D5)
+# coverage_diagnostic (D20)
 # --------------------------------------------------------------------------
 
 
@@ -602,7 +602,7 @@ def test_coverage_diagnostic_single_entry_gap():
 
 
 def test_coverage_diagnostic_mass_matches_coverage_mass_key():
-    # D5: the recomputed mass equals fixture["coverage_mass"] by
+    # D20: the recomputed mass equals fixture["coverage_mass"] by
     # construction (asserted, not read from the key).
     fixture = _fixture(
         [
@@ -616,13 +616,13 @@ def test_coverage_diagnostic_mass_matches_coverage_mass_key():
 
 
 # --------------------------------------------------------------------------
-# Timing log lines (D3/D11)
+# Timing log lines (D23/D24)
 # --------------------------------------------------------------------------
 
 
 def test_timing_lines_present_and_parseable(tmp_path, monkeypatch, caplog):
     # One construction line, one per-fixture line per success, one
-    # aggregate line; every number parses as a float >= 0.0 (D11).
+    # aggregate line; every number parses as a float >= 0.0 (D24).
     stub = _StubPredictor(results=[_make_result(), _make_result()])
     with caplog.at_level(logging.INFO):
         _run_export_main(
@@ -669,7 +669,7 @@ def test_timing_lines_present_and_parseable(tmp_path, monkeypatch, caplog):
 
 
 # --------------------------------------------------------------------------
-# Null-interval verdict (D4)
+# Null-interval verdict (D19)
 # --------------------------------------------------------------------------
 
 
@@ -756,7 +756,7 @@ def test_null_interval_mixed_count(tmp_path, monkeypatch, caplog):
 
 
 # --------------------------------------------------------------------------
-# Coverage diagnostic logging (D5)
+# Coverage diagnostic logging (D20)
 # --------------------------------------------------------------------------
 
 
@@ -765,7 +765,7 @@ def test_coverage_diagnostic_logged_and_never_exported(
 ):
     # A non-zero-mass fixture logs one INFO line naming its match_id;
     # the written artifact carries no gap/weighted/coverage_diagnostic
-    # key anywhere (D5: diagnostic only, never in the artifact).
+    # key anywhere (D20: diagnostic only, never in the artifact).
     result = _make_result(top_vetos=(_make_ranked_entry(0.4),))
     stub = _StubPredictor(results=[result])
     with caplog.at_level(logging.INFO):
@@ -811,14 +811,14 @@ def test_coverage_diagnostic_zero_mass_logs_skipped(
 
 
 # --------------------------------------------------------------------------
-# Summary line (D7)
+# Summary line (D22)
 # --------------------------------------------------------------------------
 
 
 def test_summary_line_appends_fields_without_reordering(
     tmp_path, monkeypatch, caplog
 ):
-    # The appended D7 fields are present and the pre-existing fields
+    # The appended D22 fields are present and the pre-existing fields
     # still precede them in their original order.
     stub = _StubPredictor(results=[_make_result()])
     with caplog.at_level(logging.INFO):
