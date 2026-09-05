@@ -107,6 +107,31 @@ deferrals") and is out of scope for this driver.
 mirroring the rest of ``drivers/``'s raise-for-invariant-break
 doctrine.
 
+**Observability (P6).** Three diagnostics, all emitted as log lines and
+never written into the artifact (§8, decision E):
+
+- **Timing.** ``main()`` times the run end to end and the single
+  ``Predictor`` construction; :func:`export_fixtures` times each
+  fixture's ``predict()`` call and its ``build_fixture`` assembly and
+  logs one INFO line per successful fixture plus an aggregate line.
+  These are the driver's own honest boundaries: the M31 sampling, the
+  ranked-entry construction and the ``n_games_backing`` feature
+  lookups all happen *inside one* ``predict()`` call, so the driver
+  cannot time them separately. That inner split is measured
+  out-of-band with ``cProfile`` against the unmodified
+  ``drivers/predict.py`` (decision E forbids editing it) — no
+  profiling code or flag ships here.
+- **Null-interval counting** (:func:`count_null_interval_maps`, D4):
+  counts a fixture's overall ``per_map`` entries whose
+  ``interval_low`` and ``interval_high`` are both ``None``. Reported
+  at WARNING (naming ``train_bootstrap_replicates.py`` as the fix)
+  when the count is nonzero, else INFO (D4).
+- **Coverage diagnostic** (:func:`coverage_diagnostic`, D5): the §8
+  reconciliation gap between the coverage-weighted average of the
+  ranked entries' ``p_a_wins_series`` and the overall value, logged at
+  INFO per fixture and never displayed or exported. No threshold
+  constant exists (D6) — a human reads the line.
+
 **Design decisions D1–D18 (recorded here, do not silently change).**
 
 - **D1.** Two modules, not one: this module owns the export;
@@ -184,6 +209,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -627,6 +653,140 @@ def build_fixture(
     }
 
 
+def count_null_interval_maps(per_map: Sequence[contract.PerMap]) -> int:
+    """Count the ``per_map`` entries whose intervals are both ``None`` (D4).
+
+    §4.3's soft-missing case — the replicate artifact was never trained
+    — shows up as per-map records carrying null intervals. This counts
+    exactly those records over the fixture's *overall* ``per_map``
+    only (D4): the ranked entries inherit the same closed-over
+    bootstrap models (G5), so counting them too would multiply the
+    same fact by ``top_n`` without adding information. A record is
+    counted only when **both** ``interval_low`` and ``interval_high``
+    are ``None``; a record with one band populated and the other
+    ``None`` is malformed data and is *not* counted here (the D4 rule
+    is strictly both-null).
+
+    Args:
+        per_map: The reshaped :class:`presentation.contract.PerMap`
+            entries of one fixture's overall result
+            (``fixture["overall"]["per_map"]``).
+
+    Returns:
+        The ``int`` count of entries where ``interval_low`` and
+        ``interval_high`` are both ``None`` (``0`` for an empty
+        sequence).
+
+    Raises:
+        KeyError: If an entry lacks the ``interval_low`` or
+            ``interval_high`` key — propagated unchanged from the
+            subscript, signalling a malformed fixture.
+        TypeError: If an entry is not a subscriptable mapping (e.g. a
+            non-dict object) — propagated unchanged from the
+            subscript.
+    """
+    return sum(
+        1
+        for entry in per_map
+        if entry["interval_low"] is None and entry["interval_high"] is None
+    )
+
+
+@dataclass(frozen=True)
+class CoverageDiagnostic:
+    """The §8 reconciliation numbers for one fixture (D5/D6).
+
+    Computed by :func:`coverage_diagnostic` over the reshaped
+    :class:`presentation.contract.Fixture` dict: the coverage-weighted
+    average of the ranked entries' ``p_a_wins_series`` compared
+    against the fixture's overall value. Diagnostic only — it never
+    enters the artifact and is never displayed (§8), and there is no
+    gap-threshold constant (D6).
+
+    Attributes:
+        mass: The summed ``veto_probability`` over the fixture's
+            ``top_vetos`` listing — recomputed inside
+            :func:`coverage_diagnostic` from the same entries it
+            weights, so the diagnostic is self-contained. Equals
+            ``fixture["coverage_mass"]`` by construction (D5).
+        weighted: The coverage-weighted average of the ranked
+            entries' ``p_a_wins_series`` —
+            ``Σ (veto_probability × p_a_wins_series) / mass``.
+        overall: The fixture's overall ``p_a_wins_series``
+            (``fixture["overall"]["p_a_wins_series"]``), the baseline
+            the weighted average is compared against.
+        gap: ``weighted - overall`` — a large gap at high ``mass``
+            indicates a real inconsistency between the sampled M31
+            and exact M30 paths (§8).
+    """
+
+    mass: float
+    weighted: float
+    overall: float
+    gap: float
+
+
+def coverage_diagnostic(fixture) -> CoverageDiagnostic | None:
+    """Compute the §8 coverage diagnostic for one fixture (D5).
+
+    Implements D5's formula exactly, over the already-reshaped
+    :class:`presentation.contract.Fixture` dict:
+
+    .. code-block:: text
+
+        mass     = Σ_i entry_i.veto_probability
+        weighted = ( Σ_i entry_i.veto_probability × entry_i.p_a_wins_series
+                   ) / mass
+        gap      = weighted − overall.p_a_wins_series
+
+    ``mass`` is recomputed from the same ranked entries it weights (so
+    the helper is self-contained); by construction it equals
+    ``fixture["coverage_mass"]``, and tests assert that equality rather
+    than reading the key. When ``mass == 0.0`` (an empty listing, or
+    an all-zero-probability listing) the helper returns ``None`` and
+    the caller logs a single INFO noting the fixture had no coverage —
+    never a ``ZeroDivisionError`` and never a fabricated ``0.0`` gap.
+    The result is diagnostic only: it is never displayed and never
+    exported (§8).
+
+    Args:
+        fixture: The reshaped :class:`presentation.contract.Fixture`
+            dict (one entry of the artifact's ``fixtures`` list),
+            carrying ``top_vetos`` (each with ``veto_probability`` and
+            ``p_a_wins_series``) and ``overall.p_a_wins_series``.
+
+    Returns:
+        A :class:`CoverageDiagnostic` with the computed ``mass``,
+        ``weighted``, ``overall`` and ``gap``, or ``None`` when the
+        summed mass is ``0.0``.
+
+    Raises:
+        KeyError: If a ranked entry lacks ``veto_probability`` or
+            ``p_a_wins_series``, or the fixture lacks
+            ``overall.p_a_wins_series`` / ``top_vetos`` — propagated
+            unchanged from the subscript, signalling a malformed
+            fixture.
+        TypeError: If a ranked entry is not a mapping or the summed
+            probability is not numeric — propagated unchanged from the
+            subscript / ``float`` conversion.
+    """
+    entries = fixture["top_vetos"]
+    mass = sum(float(entry["veto_probability"]) for entry in entries)
+    if mass == 0.0:
+        return None
+    weighted = sum(
+        float(entry["veto_probability"]) * float(entry["p_a_wins_series"])
+        for entry in entries
+    ) / mass
+    overall = float(fixture["overall"]["p_a_wins_series"])
+    return CoverageDiagnostic(
+        mass=mass,
+        weighted=weighted,
+        overall=overall,
+        gap=weighted - overall,
+    )
+
+
 def export_fixtures(
     predictor,
     specs: Sequence[FixtureSpec],
@@ -634,6 +794,7 @@ def export_fixtures(
     *,
     as_of_iso: str,
     top_n: int,
+    timings: dict[str, float] | None = None,
 ) -> tuple[list[contract.Fixture], int, bool]:
     """Run the per-fixture predict → derive → reshape → assemble loop.
 
@@ -648,8 +809,23 @@ def export_fixtures(
     ``try/except PER_FIXTURE_ERRORS`` wraps each iteration, logging at
     ERROR with the match id and the exception, incrementing the failure
     count and continuing (D13); ``TypeError``/``AttributeError`` and
-    everything else propagate. No timing instrumentation lives here
-    (P6's job).
+    everything else propagate.
+
+    **Timing (P6, log-only).** Inside the ``try``, the
+    ``predictor.predict(...)`` call and the :func:`build_fixture` call
+    are each timed separately with :func:`time.perf_counter`; after a
+    successful append one INFO line is logged per fixture
+    (``"fixture %s predicted in %.2fs, assembled in %.2fs"``) and both
+    totals accumulate into local floats. At the end one aggregate INFO
+    line reports the totals over *successful* fixtures
+    (``"predicted %d fixture(s) in %.1fs total (mean %.1fs/fixture),
+    assembled in %.1fs total"``), guarding the mean against a zero
+    count. A failed fixture logs nothing extra — its existing ERROR
+    line already names it (a partial duration for a failed prediction
+    is noise). The return tuple and signature are otherwise unchanged;
+    the totals are exposed only through the optional ``timings``
+    out-dict (populated when not ``None``) so ``main()`` can put
+    ``predict_seconds`` on the summary line.
 
     Args:
         predictor: The single :class:`drivers.predict.Predictor`
@@ -661,6 +837,12 @@ def export_fixtures(
             call (D8; keyword-only).
         top_n: The ``--top-n`` knob forwarded to every ``predict`` call
             (keyword-only).
+        timings: An optional mutable out-dict (keyword-only) that, when
+            not ``None``, is populated with ``predict_seconds`` and
+            ``assemble_seconds`` — the accumulated wall seconds over
+            successful fixtures — so ``main()`` can read them without a
+            return-type change. ``None`` (the default) means the totals
+            are only logged, not returned.
 
     Returns:
         A ``(fixtures, failures, intervals_present)`` tuple: the
@@ -678,6 +860,8 @@ def export_fixtures(
     fixtures: list[contract.Fixture] = []
     failures = 0
     intervals_present = False
+    predict_seconds = 0.0
+    assemble_seconds = 0.0
     for spec in specs:
         try:
             if (
@@ -693,6 +877,7 @@ def export_fixtures(
                     f"team_id(s) {missing} have no display name in the "
                     "matches table"
                 )
+            predict_started = time.perf_counter()
             result = predictor.predict(
                 spec.team_a_id,
                 spec.team_b_id,
@@ -701,13 +886,43 @@ def export_fixtures(
                 as_of_iso,
                 top_n=top_n,
             )
+            predict_elapsed = time.perf_counter() - predict_started
+            assemble_started = time.perf_counter()
             fixture = build_fixture(result, spec, team_names)
+            assemble_elapsed = time.perf_counter() - assemble_started
+            predict_seconds += predict_elapsed
+            assemble_seconds += assemble_elapsed
             if derived.intervals_present(result.per_map):
                 intervals_present = True
             fixtures.append(fixture)
+            logger.info(
+                "fixture %s predicted in %.2fs, assembled in %.2fs",
+                spec.match_id,
+                predict_elapsed,
+                assemble_elapsed,
+            )
         except PER_FIXTURE_ERRORS as exc:
             failures += 1
             logger.error("excluding fixture %s: %s", spec.match_id, exc)
+    if fixtures:
+        logger.info(
+            "predicted %d fixture(s) in %.1fs total (mean %.1fs/fixture), "
+            "assembled in %.1fs total",
+            len(fixtures),
+            predict_seconds,
+            predict_seconds / len(fixtures),
+            assemble_seconds,
+        )
+    else:
+        logger.info(
+            "predicted 0 fixture(s) in %.1fs total, "
+            "assembled in %.1fs total",
+            predict_seconds,
+            assemble_seconds,
+        )
+    if timings is not None:
+        timings["predict_seconds"] = predict_seconds
+        timings["assemble_seconds"] = assemble_seconds
     return fixtures, failures, intervals_present
 
 
@@ -964,9 +1179,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     **unconditionally** (D13's fatal path — no ``try`` around it, so
     the D10/temperature guards fire on every run, even an empty one),
     the model version is read softly (D17), the fixture loop runs
-    (:func:`export_fixtures`), D14's threshold abort is applied, the
-    artifact is assembled (:func:`build_artifact`) and written
-    (:func:`write_artifact`), and one INFO summary line is logged.
+    (:func:`export_fixtures`, which times each fixture's ``predict``
+    and ``build_fixture``), the P6 diagnostic pass runs over the
+    returned fixtures (:func:`count_null_interval_maps` for the D4
+    null-interval tally and :func:`coverage_diagnostic` for the §8
+    gap, one INFO line per fixture), the D4 null-interval verdict is
+    logged (WARNING naming ``train_bootstrap_replicates.py`` when any
+    null intervals are present, else INFO), D14's threshold abort is
+    applied, the artifact is assembled (:func:`build_artifact`) and
+    written (:func:`write_artifact`), and one INFO summary line is
+    logged — extended, per D7, with ``null_interval_maps``,
+    ``predict_seconds`` and ``elapsed_seconds`` appended after the
+    existing fields.
+
+    **Timing (P6).** A run-level :func:`time.perf_counter` starts
+    immediately after ``logging.basicConfig`` (so the ``elapsed``
+    figure covers everything the process does, including flag
+    validation), and the single ``Predictor`` construction is timed and
+    logged (``"predictor constructed in %.2fs (version=%s)"``). The
+    per-fixture ``predict``/``assemble`` seconds come back from
+    :func:`export_fixtures` via its ``timings`` out-dict; nothing else
+    is timed here.
 
     Args:
         argv: The argument list to parse (see :func:`parse_args`);
@@ -1002,6 +1235,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    run_started = time.perf_counter()
 
     if not (0.0 <= args.max_failure_fraction <= 1.0):
         raise ValueError(
@@ -1033,6 +1267,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     matches_df = evaluate.load_matches_table(output_dir, args.version)
     team_names = reshape.build_team_name_map(matches_df)
 
+    predictor_started = time.perf_counter()
     predictor = predict.Predictor(
         output_dir,
         args.version,
@@ -1040,18 +1275,60 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=args.seed,
         ci_level=args.ci_level,
     )
+    logger.info(
+        "predictor constructed in %.2fs (version=%s)",
+        time.perf_counter() - predictor_started,
+        args.version,
+    )
 
     model_version = model_provenance.read_model_version(
         output_dir, args.version
     )
 
+    timings: dict[str, float] = {}
     fixtures, failures, intervals_present = export_fixtures(
         predictor,
         specs,
         team_names,
         as_of_iso=as_of_iso,
         top_n=args.top_n,
+        timings=timings,
     )
+
+    null_maps = 0
+    total_maps = 0
+    for fixture in fixtures:
+        per_map = fixture["overall"]["per_map"]
+        total_maps += len(per_map)
+        null_maps += count_null_interval_maps(per_map)
+        diagnostic = coverage_diagnostic(fixture)
+        if diagnostic is None:
+            logger.info(
+                "coverage diagnostic %s: no coverage mass, skipped",
+                fixture["match_id"],
+            )
+        else:
+            logger.info(
+                "coverage diagnostic %s: mass=%.4f weighted=%.4f "
+                "overall=%.4f gap=%+.4f",
+                fixture["match_id"],
+                diagnostic.mass,
+                diagnostic.weighted,
+                diagnostic.overall,
+                diagnostic.gap,
+            )
+
+    if null_maps > 0:
+        logger.warning(
+            "%d of %d exported per_map entries carry null intervals; run "
+            "drivers/train_bootstrap_replicates.py to populate them",
+            null_maps,
+            total_maps,
+        )
+    elif total_maps > 0:
+        logger.info(
+            "all %d exported per_map entries carry intervals", total_maps
+        )
 
     attempted = stats.n_records - stats.n_dropped_past
     failed = stats.n_invalid + failures
@@ -1083,7 +1360,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     logger.info(
         "exported %d fixture(s) to %s (%s/%s): dropped_past=%d "
         "failed=%d intervals_present=%s model_version=%s "
-        "dataset_version=%s",
+        "dataset_version=%s null_interval_maps=%d/%d "
+        "predict_seconds=%.1f elapsed_seconds=%.1f",
         len(fixtures),
         artifact_path,
         output_dir,
@@ -1093,6 +1371,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         intervals_present,
         model_version,
         args.version,
+        null_maps,
+        total_maps,
+        timings.get("predict_seconds", 0.0),
+        time.perf_counter() - run_started,
     )
     return 0
 
