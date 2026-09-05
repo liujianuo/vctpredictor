@@ -14,6 +14,8 @@ the D4 structural (distinct-object, equal-field) containment check for
 CLI ``main()`` formula in ``drivers/predict.py``.
 """
 
+from dataclasses import dataclass
+
 import pytest
 
 from drivers.predict import (
@@ -89,7 +91,8 @@ def _make_ranked_veto(predicted_veto, *, veto_probability=0.1):
 
     Args:
         predicted_veto: The entry's veto action sequence (any iterable
-            of :class:`SimulatedVetoAction`).
+            of four-field action records, e.g.
+            :class:`SimulatedVetoAction`).
         veto_probability: The exact joint probability assigned to the
             entry.
 
@@ -137,6 +140,36 @@ def _veto_sequence(map_name):
         SimulatedVetoAction(0, "A", "ban", map_name),
         SimulatedVetoAction(6, None, "decider", "Sunset"),
     )
+
+
+@dataclass(frozen=True)
+class _SyntheticRankedAction:
+    """A richer action record than :class:`SimulatedVetoAction`.
+
+    A frozen dataclass carrying the four fields
+    :func:`presentation.derived.greedy_rank` projects onto plus an
+    extra sampler-only ``probability`` field. Two of these are never
+    ``==``-equal to a :class:`SimulatedVetoAction` with the same four
+    values (different class and an extra field), so a listing entry
+    built from them exercises the projection rather than plain
+    equality.
+
+    Attributes:
+        step_index: The 0-based position of this action in the veto
+            sequence.
+        team: The acting team's stable id, or ``None`` for a decider
+            action.
+        action: One of ``"ban"``, ``"pick"`` or ``"decider"``.
+        map_name: The chosen map's normalized name.
+        probability: The sampler-only joint probability the projection
+            deliberately drops.
+    """
+
+    step_index: int
+    team: str | None
+    action: str
+    map_name: str
+    probability: float
 
 
 def test_p_a_wins_series_hand_computed_vectors():
@@ -230,7 +263,9 @@ def test_coverage_mass_multi_entry_and_empty():
         _make_ranked_veto(_veto_sequence("Split"), veto_probability=0.2),
     )
     assert derived.coverage_mass(entries) == pytest.approx(0.5)
-    assert derived.coverage_mass(()) == 0.0
+    empty_mass = derived.coverage_mass(())
+    assert empty_mass == 0.0
+    assert isinstance(empty_mass, float)
 
 
 def test_favorite_flips_directions_and_boundaries():
@@ -276,6 +311,20 @@ def test_greedy_rank_matches_distinct_equal_objects():
     entry_actions = _veto_sequence("Haven")
     assert greedy[0] is not entry_actions[0]
     assert greedy[1] is not entry_actions[1]
+    top = (_make_ranked_veto(entry_actions),)
+    assert derived.greedy_rank(greedy, top) == 1
+
+
+def test_greedy_rank_projection_ignores_extra_fields_and_type():
+    # D4 projection: the ranked-entry side uses a richer action type
+    # (extra probability field, different class) with the same four
+    # projected values; plain == would fail (different class + extra
+    # field) but the four-field projection matches -> rank 1.
+    greedy = _veto_sequence("Haven")
+    entry_actions = (
+        _SyntheticRankedAction(0, "A", "ban", "Haven", 0.25),
+        _SyntheticRankedAction(6, None, "decider", "Sunset", 0.25),
+    )
     top = (_make_ranked_veto(entry_actions),)
     assert derived.greedy_rank(greedy, top) == 1
 

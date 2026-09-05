@@ -49,7 +49,9 @@ either.
   copies the same four fields via ``drivers/predict.py``'s action-copy
   helper, and both emit ``team=None`` for the decider step. A
   four-field projection is therefore equal across paths whenever the
-  sequences are the same, with zero dependency-graph cost.
+  sequences are the same, with zero dependency-graph cost. The
+  protocol declares its four members as read-only properties, so the
+  frozen action records both paths build conform to it.
 - **D5.** :func:`intervals_present` is an artifact-level boolean fed
   an *iterable* of per-map records: it returns ``True`` iff any entry
   carries a non-null ``interval_low`` **or** ``interval_high``. The
@@ -93,27 +95,42 @@ class VetoActionLike(Protocol):
     A local :class:`typing.Protocol` standing in for the action type
     the greedy simulator produces, so :func:`greedy_rank` can type its
     ``predicted_veto`` parameter and be statically checked without
-    importing that type across a layer boundary. The four attributes
+    importing that type across a layer boundary. The four members
     mirror the field shape of every action record in the veto result
     (``step_index``, ``team``, ``action``, ``map_name``), and any
-    object carrying exactly these four attributes — including the
+    object carrying exactly these four members — including the frozen
     dataclass instances both the greedy and enumerated paths build —
     satisfies the protocol structurally.
 
-    Attributes:
-        step_index: The 0-based position of this action in the veto
-            sequence.
-        team: The acting team's stable ``team_id``, or ``None`` for a
-            decider action (the last remaining map is forced, not
-            chosen, so no team is credited).
-        action: One of ``"ban"``, ``"pick"`` or ``"decider"``.
-        map_name: The chosen map's normalized name.
+    The members are declared as read-only properties (not settable
+    variable annotations), so a frozen action record — whose fields
+    are read-only — conforms to the protocol; a settable declaration
+    would reject every ``@dataclass(frozen=True)`` action type.
     """
 
-    step_index: int
-    team: str | None
-    action: str
-    map_name: str
+    @property
+    def step_index(self) -> int:
+        """The 0-based position of this action in the veto sequence."""
+        ...
+
+    @property
+    def team(self) -> str | None:
+        """The acting team's stable ``team_id``.
+
+        ``None`` for a decider action (the last remaining map is
+        forced, not chosen, so no team is credited).
+        """
+        ...
+
+    @property
+    def action(self) -> str:
+        """One of ``"ban"``, ``"pick"`` or ``"decider"``."""
+        ...
+
+    @property
+    def map_name(self) -> str:
+        """The chosen map's normalized name."""
+        ...
 
 
 def _veto_action_key(
@@ -183,12 +200,14 @@ def p_a_wins_series(series: SeriesPrediction) -> float:
             f"probabilities but {len(series.outcome_order)} "
             "outcome_order entries; they must be parallel"
         )
-    return sum(
-        probability
-        for probability, (a_wins, b_wins) in zip(
-            series.probabilities, series.outcome_order
+    return float(
+        sum(
+            probability
+            for probability, (a_wins, b_wins) in zip(
+                series.probabilities, series.outcome_order
+            )
+            if a_wins > b_wins
         )
-        if a_wins > b_wins
     )
 
 
@@ -216,9 +235,11 @@ def scoreline_labels(
         same order (length equal to ``len(outcome_order)``).
 
     Raises:
-        Nothing — any iterable of 2-tuples renders via the same
-            f-string, so malformed pairs would only produce a
-            non-numeric label string rather than raise.
+        ValueError: If an ``outcome_order`` entry is not exactly a
+            2-element pair (e.g. ``(1, 0, 2)``) — raised by the tuple
+            unpacking in the generator expression.
+        TypeError: If an ``outcome_order`` entry is not iterable
+            (e.g. a bare ``int``) — raised by the tuple unpacking.
     """
     return tuple(f"{a_wins}-{b_wins}" for a_wins, b_wins in outcome_order)
 
@@ -313,9 +334,10 @@ def coverage_mass(top_vetos: Sequence[RankedVetoPrediction]) -> float:
         an error).
 
     Raises:
-        Nothing — plain ``sum()`` over an empty sequence yields ``0.0``.
+        Nothing — an empty listing sums to ``0.0`` (the ``float``
+            coercion turns ``sum()``'s int ``0`` into ``0.0``).
     """
-    return sum(entry.veto_probability for entry in top_vetos)
+    return float(sum(entry.veto_probability for entry in top_vetos))
 
 
 def favorite_flips(
@@ -431,8 +453,11 @@ def intervals_present(per_map_entries: Iterable[PerMapPrediction]) -> bool:
         both null, or the iterable is empty.
 
     Raises:
-        Nothing — the predicate short-circuits on the first non-null
-            interval and an empty iterable simply yields ``False``.
+        AttributeError: If an entry lacks ``interval_low`` or
+            ``interval_high`` — propagated unchanged from the
+            attribute access (callers pass
+            :class:`drivers.predict.PerMapPrediction` records, so this
+            only surfaces a genuinely malformed input).
     """
     return any(
         entry.interval_low is not None or entry.interval_high is not None
