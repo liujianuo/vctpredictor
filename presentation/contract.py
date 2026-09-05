@@ -28,8 +28,9 @@ kept in lockstep with the Python side by a drift-guard test
   reshaping bug that accidentally re-includes either fails validation);
 - ``series_probabilities`` vectors are exactly ``best_of_int + 1``
   long (2/4/6 for Bo1/Bo3/Bo5) on both the overall result and every
-  ranked veto — enforced in the schema by a Fixture-level ``allOf``
-  of ``if``/``then`` clauses keyed on ``best_of_int``;
+  ranked veto, and ``outcome_order`` is exactly the same length —
+  both enforced in the schema by a Fixture-level ``allOf`` of
+  ``if``/``then`` clauses keyed on ``best_of_int``;
 - ``scoreline_labels`` is exactly parallel to ``outcome_order`` (same
   length) — enforced by :func:`validate_artifact` in Python, because
   draft-07 JSON Schema cannot express cross-field length parity.
@@ -282,7 +283,8 @@ class Fixture(TypedDict):
         team_a: Team A (id + display name).
         team_b: Team B (id + display name).
         outcome_order: The ``best_of + 1`` terminal ``(a_wins,
-            b_wins)`` scorelines, hoisted once per fixture (§4.5).
+            b_wins)`` scorelines, hoisted once per fixture (§4.5) —
+            length ``best_of_int + 1``, enforced by the schema.
         scoreline_labels: Derived display labels parallel to
             ``outcome_order`` (same length — enforced by
             :func:`validate_artifact`, not expressible in JSON Schema).

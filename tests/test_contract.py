@@ -479,6 +479,43 @@ def test_series_probabilities_wrong_length_rejected(
         contract.validate_artifact(artifact)
 
 
+@pytest.mark.parametrize(
+    ("best_of", "best_of_int", "expected"),
+    [("Bo1", 1, 2), ("Bo3", 3, 4), ("Bo5", 5, 6)],
+)
+def test_outcome_order_correct_length_validates(
+    best_of, best_of_int, expected
+):
+    # outcome_order must be exactly best_of_int + 1 long; a
+    # correct-length outcome_order validates for all three bo formats
+    # (the if/then mapping for outcome_order is right, not just Bo3).
+    artifact = _artifact_for_best_of(best_of, best_of_int)
+    assert len(artifact["fixtures"][0]["outcome_order"]) == expected
+    assert contract.validate_artifact(artifact) is None
+
+
+@pytest.mark.parametrize(
+    ("best_of", "best_of_int", "expected"),
+    [("Bo1", 1, 2), ("Bo3", 3, 4), ("Bo5", 5, 6)],
+)
+@pytest.mark.parametrize("delta", [-1, 1])
+def test_outcome_order_wrong_length_rejected(
+    best_of, best_of_int, expected, delta
+):
+    # outcome_order is pinned to best_of_int + 1 in the schema itself
+    # (not just via the scoreline_labels parity check): a vector one
+    # entry short or long is rejected for all three bo formats even
+    # when scoreline_labels is kept parallel to it, so the
+    # positional-index chain is closed at the hoisted end.
+    artifact = _artifact_for_best_of(best_of, best_of_int)
+    fixture = artifact["fixtures"][0]
+    bad = [[0, 0] for _ in range(expected + delta)]
+    fixture["outcome_order"] = bad
+    fixture["scoreline_labels"] = [str(i) for i in range(expected + delta)]
+    with pytest.raises(ValidationError):
+        contract.validate_artifact(artifact)
+
+
 def test_scoreline_labels_outcome_order_length_mismatch_rejected():
     # scoreline_labels must parallel outcome_order; JSON Schema cannot
     # express cross-field length parity, so validate_artifact checks it
