@@ -46,8 +46,20 @@ The rules enforced here:
   ``evaluation/`` (no ``utils/ -> evaluation``, ``features/ ->
   evaluation`` or ``models/ -> evaluation`` edges; the DAG stays
   rooted at ``utils/``).
+- One more rung above ``evaluation/``: the new ``presentation/``
+  package (roadmap P1). ``presentation/`` may depend downward on
+  ``utils/`` and may import exactly one ``drivers/`` edge — a
+  ``from drivers.predict import <allowed surface>`` statement whose
+  imported names are a subset of
+  :data:`ALLOWED_PRESENTATION_DRIVERS_IMPORT_NAMES` — but may not
+  import ``features/`` or ``models/`` at all. Nothing in ``utils/``,
+  ``features/``, ``models/`` or ``evaluation/`` may import
+  ``presentation/`` (only ``drivers/`` may, and ``drivers/`` is
+  deliberately left unscanned here — it is a directory of entry
+  points, not a DAG node). The DAG stays rooted at ``utils/``.
 """
 
+import re
 from pathlib import Path
 
 # The modules that live under utils/. Update this constant list whenever
@@ -126,6 +138,34 @@ EVALUATION_MODULES = (
     "veto_marginalized_series.py",
     "veto_evaluation.py",
 )
+
+# The modules that live under presentation/ (the new top-level DAG node
+# of roadmap P1 — the wire data contract plus, in later milestones, the
+# derived-quantity/reshaping/leverage libraries). Update this constant
+# list whenever a module is added to or removed from presentation/ so
+# the test's coverage stays legible and does not silently grow or
+# shrink with the filesystem.
+PRESENTATION_MODULES = (
+    "contract.py",
+)
+
+# The exact permitted surface presentation/ may import from
+# drivers.predict — the standing contract's own class/def names, spelled
+# exactly as drivers/predict.py defines them. The names matter (the
+# Conventions warning): a misspelling here is a rule that silently
+# matches nothing — there is no ``MapPrediction``, and the ranked entry
+# is ``RankedVetoPrediction``. ``make_top_vetos_fn`` is deliberately
+# excluded (it is a library-only factory, not part of the export's
+# standing surface).
+ALLOWED_PRESENTATION_DRIVERS_IMPORT_NAMES = frozenset({
+    "PerMapPrediction",
+    "PredictionResult",
+    "Predictor",
+    "RankedVetoPrediction",
+    "SeriesPrediction",
+    "VetoSensitivity",
+    "make_predictor",
+})
 
 
 def test_no_utils_module_imports_another_utils_module():
@@ -280,4 +320,120 @@ def test_evaluation_module_imports_only_features_models_and_utils():
         assert "import evaluation" not in source, (
             f"evaluation/{module} imports a sibling evaluation/ module; "
             "evaluation/ modules must stand alone laterally"
+        )
+
+
+def _imported_names(from_import_line):
+    """Extract the bare imported names from a ``from X import ...`` line.
+
+    Parses the text after the ``import`` keyword, strips any wrapping
+    parentheses, splits on commas, and drops any ``name as alias``
+    renaming (returning the local ``name``) so callers can check each
+    name's membership against an allowed-surface set. Assumes the
+    statement is a single physical source line — the repo convention
+    for these presentation-module imports; a parenthesized multi-line
+    ``from ... import`` would need the caller to first fold the
+    continuation lines.
+
+    Args:
+        from_import_line: A stripped source line beginning with
+            ``from <module> import``.
+
+    Returns:
+        A ``frozenset`` of the imported name strings, in no particular
+        order.
+
+    Raises:
+        Nothing — any line beginning with ``from ... import`` yields a
+            (possibly empty) set after splitting, so malformed text is
+            surfaced by the caller's membership assertion rather than
+            here.
+    """
+    body = from_import_line.split("import", 1)[1]
+    names = []
+    for part in body.strip().strip("()").split(","):
+        stripped = part.strip()
+        if stripped:
+            names.append(stripped.split(" as ")[0].strip())
+    return frozenset(names)
+
+
+def test_presentation_module_imports_only_allowed_drivers_predict_names():
+    # presentation/ may reach into drivers/ only via the one permitted
+    # edge: ``from drivers.predict import <allowed surface>``. Any other
+    # ``from drivers.*`` import, any whole-module ``import drivers`` /
+    # ``import drivers.predict`` (then reaching into privates), or any
+    # name outside the allowed surface is a boundary violation.
+    for module in PRESENTATION_MODULES:
+        source = Path("presentation", module).read_text(encoding="utf-8")
+        assert "import drivers" not in source, (
+            f"presentation/{module} imports a drivers/ module wholesale; "
+            "the only permitted drivers edge is a from-import of the "
+            "allowed predict.py surface"
+        )
+        for line in source.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith(("from drivers.", "from drivers ")):
+                continue
+            assert stripped.startswith("from drivers.predict import "), (
+                f"presentation/{module} has a drivers import other than "
+                f"from drivers.predict: {stripped!r}"
+            )
+            for name in _imported_names(stripped):
+                assert name in ALLOWED_PRESENTATION_DRIVERS_IMPORT_NAMES, (
+                    f"presentation/{module} imports {name!r} from "
+                    "drivers.predict, which is not in the allowed "
+                    "presentation surface"
+                )
+
+
+def test_no_presentation_module_imports_features_or_models():
+    # presentation/ may depend downward on utils/ (and the one permitted
+    # drivers.predict edge) only; anything it needs from features/ or
+    # models/ it must read off a PredictionResult, never import.
+    for module in PRESENTATION_MODULES:
+        source = Path("presentation", module).read_text(encoding="utf-8")
+        assert "from features" not in source and "import features" not in source, (
+            f"presentation/{module} imports features/; presentation/ "
+            "must not depend on features/"
+        )
+        assert "from models" not in source and "import models" not in source, (
+            f"presentation/{module} imports models/; presentation/ "
+            "must not depend on models/"
+        )
+
+
+def test_no_lower_layer_imports_presentation():
+    # Nothing may import presentation/ except drivers/ (and drivers/ is
+    # deliberately unscanned by this file — it is a directory of entry
+    # points, not a DAG node). utils/, features/, models/ and
+    # evaluation/ must never reach upward into presentation/.
+    for directory, modules in (
+        ("utils", UTILS_MODULES),
+        ("features", FEATURE_MODULES),
+        ("models", MODELS_MODULES),
+        ("evaluation", EVALUATION_MODULES),
+    ):
+        for module in modules:
+            source = Path(directory, module).read_text(encoding="utf-8")
+            assert "from presentation" not in source, (
+                f"{directory}/{module} imports from presentation/; "
+                f"{directory}/ must not depend on presentation/"
+            )
+            assert "import presentation" not in source, (
+                f"{directory}/{module} imports presentation/; "
+                f"{directory}/ must not depend on presentation/"
+            )
+
+
+def test_presentation_allowed_driver_names_exist_in_drivers_predict():
+    # The allowed-surface names must be spelled exactly as
+    # drivers/predict.py defines them — a misspelling in the constant
+    # above is a rule that silently matches nothing (the Conventions
+    # warning). Pin each name to a real class/def in the source.
+    source = Path("drivers", "predict.py").read_text(encoding="utf-8")
+    for name in sorted(ALLOWED_PRESENTATION_DRIVERS_IMPORT_NAMES):
+        assert re.search(rf"^(class|def) {name}\b", source, re.MULTILINE), (
+            f"{name!r} in ALLOWED_PRESENTATION_DRIVERS_IMPORT_NAMES is "
+            "not a class or def in drivers/predict.py; check the spelling"
         )

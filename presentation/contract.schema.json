@@ -1,0 +1,377 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Presentation artifact wire contract",
+  "description": "The wire data contract for a generated presentation artifact (presentation_layer.md §6), complete on day one per decision D: narrative and metrics are typed here and stubbed by the export driver (P5), not added at P20/P21a. Contract rules encoded mechanically: floats are always JSON numbers, never formatted strings; null means \"not computed\", never zero; structurally-constant fields are omitted, never shipped null (RankedVeto declares neither veto_sensitivity nor top_vetos and closes additionalProperties so a reshaping bug that re-includes either fails validation).",
+  "$ref": "#/definitions/Artifact",
+  "definitions": {
+    "Artifact": {
+      "type": "object",
+      "description": "Top-level artifact, written atomically by the export driver (§5.3).",
+      "required": [
+        "generated_at",
+        "model_version",
+        "dataset_version",
+        "knobs",
+        "intervals_present",
+        "fixtures",
+        "metrics"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "generated_at": {
+          "type": "string",
+          "description": "ISO-8601 export run time (== as_of_date)."
+        },
+        "model_version": {
+          "type": "string",
+          "description": "git SHA of the training run."
+        },
+        "dataset_version": {
+          "type": "string",
+          "description": "Dataset version, e.g. \"v1\"."
+        },
+        "knobs": { "$ref": "#/definitions/Knobs" },
+        "intervals_present": {
+          "type": "boolean",
+          "description": "Derived — did D10's auto-load find bootstrap replicates?"
+        },
+        "fixtures": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/Fixture" }
+        },
+        "metrics": { "$ref": "#/definitions/MetricsSummary" }
+      }
+    },
+    "Knobs": {
+      "type": "object",
+      "description": "The prediction knobs that produced this artifact, so a reader can tell what produced a number (self-describing artifact rule).",
+      "required": ["n_samples", "seed", "ci_level", "top_n"],
+      "additionalProperties": false,
+      "properties": {
+        "n_samples": { "type": "number" },
+        "seed": { "type": "number" },
+        "ci_level": { "type": "number" },
+        "top_n": { "type": "number" }
+      }
+    },
+    "MetricsSummary": {
+      "type": "object",
+      "description": "Headline evaluation numbers for the methodology page. Loosely-typed at P1 (decision D): P5 emits a stub object and P21a populates the real fields later without a schema change, so no properties are declared and additionalProperties is permitted."
+    },
+    "Fixture": {
+      "type": "object",
+      "description": "One upcoming fixture's self-contained prediction record (§6; self-contained so a future per-fixture-file split is mechanical).",
+      "required": [
+        "match_id",
+        "event",
+        "scheduled_at",
+        "best_of",
+        "best_of_int",
+        "bo5_unvalidated",
+        "team_a",
+        "team_b",
+        "outcome_order",
+        "scoreline_labels",
+        "overall",
+        "top_vetos",
+        "coverage_mass",
+        "map_leverage",
+        "narrative"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "match_id": { "type": "string" },
+        "event": { "type": "string" },
+        "scheduled_at": { "type": "string" },
+        "best_of": {
+          "type": "string",
+          "enum": ["Bo1", "Bo3", "Bo5"]
+        },
+        "best_of_int": {
+          "type": "integer",
+          "enum": [1, 3, 5]
+        },
+        "bo5_unvalidated": {
+          "type": "boolean",
+          "description": "Derived (§4.6) — Bo5 is structurally supported but empirically unvalidated at v1."
+        },
+        "team_a": { "$ref": "#/definitions/Team" },
+        "team_b": { "$ref": "#/definitions/Team" },
+        "outcome_order": {
+          "type": "array",
+          "description": "The best_of + 1 terminal (a_wins, b_wins) scorelines in canonical order, hoisted once per fixture (§4.5) rather than repeated per ranked entry.",
+          "items": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": { "type": "integer" }
+          }
+        },
+        "scoreline_labels": {
+          "type": "array",
+          "description": "Derived display labels, parallel to outcome_order (same length).",
+          "items": { "type": "string" }
+        },
+        "overall": { "$ref": "#/definitions/OverallResult" },
+        "top_vetos": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/RankedVeto" }
+        },
+        "coverage_mass": {
+          "type": "number",
+          "description": "Derived — Σ veto_probability over the top-N listing."
+        },
+        "map_leverage": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/MapLeverage" }
+        },
+        "narrative": {
+          "type": "string",
+          "description": "Deterministic template narrative (§10); P5 emits \"\" until P20/P21a fill it (decision D)."
+        }
+      }
+    },
+    "Team": {
+      "type": "object",
+      "description": "One side of a fixture: the stable team_id plus the derived display name.",
+      "required": ["id", "name"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" }
+      }
+    },
+    "OverallResult": {
+      "type": "object",
+      "description": "The top level of predict()'s PredictionResult, after §4.5 reshaping.",
+      "required": [
+        "series_probabilities",
+        "p_a_wins_series",
+        "veto_sensitivity",
+        "per_map",
+        "greedy_veto",
+        "greedy_rank"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "series_probabilities": {
+          "type": "array",
+          "description": "The best_of + 1 scoreline probabilities in outcome_order order (M31 sampled).",
+          "items": { "type": "number" }
+        },
+        "p_a_wins_series": {
+          "type": "number",
+          "description": "Derived — Σ where a_wins > b_wins."
+        },
+        "veto_sensitivity": { "$ref": "#/definitions/VetoSensitivity" },
+        "per_map": {
+          "type": "array",
+          "description": "The greedy veto's played maps, in play order.",
+          "items": { "$ref": "#/definitions/PerMap" }
+        },
+        "greedy_veto": {
+          "type": "array",
+          "description": "The 7-step greedy veto; not displayed by default (§2).",
+          "items": { "$ref": "#/definitions/VetoAction" }
+        },
+        "greedy_rank": {
+          "type": ["number", "null"],
+          "description": "Derived — the greedy veto's 1-based rank among top_vetos, or null when the greedy veto is not in the displayed top-N (or the alternative §2 display is not chosen). Accepts both number and null per §6."
+        }
+      }
+    },
+    "VetoSensitivity": {
+      "type": "object",
+      "description": "The structural (M37) spread summary across the sampled veto sequences.",
+      "required": [
+        "unweighted_band_low",
+        "unweighted_band_high",
+        "band_widths",
+        "mean_band_width",
+        "weighted_mean",
+        "weighted_variance"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "unweighted_band_low": {
+          "type": "array",
+          "items": { "type": "number" }
+        },
+        "unweighted_band_high": {
+          "type": "array",
+          "items": { "type": "number" }
+        },
+        "band_widths": {
+          "type": "array",
+          "items": { "type": "number" }
+        },
+        "mean_band_width": {
+          "type": "number",
+          "description": "The scalar headline: mean of band_widths."
+        },
+        "weighted_mean": {
+          "type": "array",
+          "items": { "type": "number" }
+        },
+        "weighted_variance": {
+          "type": "array",
+          "items": { "type": "number" }
+        }
+      }
+    },
+    "RankedVeto": {
+      "type": "object",
+      "description": "One entry of the top-N exact veto listing. Structurally-constant fields are omitted, not shipped null (§4.5/§6): this type declares neither veto_sensitivity (always null here, G6) nor a nested top_vetos (always [] here, G1), and additionalProperties is closed so a reshaping bug that re-includes either field fails validation.",
+      "required": [
+        "rank",
+        "veto_probability",
+        "actions",
+        "per_map",
+        "series_probabilities",
+        "p_a_wins_series",
+        "favorite_flips"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "rank": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Derived — 1-based position in the top-N listing."
+        },
+        "veto_probability": {
+          "type": "number",
+          "description": "Exact joint probability of this enumerated sequence."
+        },
+        "actions": {
+          "type": "array",
+          "description": "The 7 veto steps, in step order.",
+          "minItems": 7,
+          "maxItems": 7,
+          "items": { "$ref": "#/definitions/VetoAction" }
+        },
+        "per_map": {
+          "type": "array",
+          "description": "This veto's played maps, in play order.",
+          "items": { "$ref": "#/definitions/PerMap" }
+        },
+        "series_probabilities": {
+          "type": "array",
+          "description": "The exact M30 recursion scoreline distribution.",
+          "items": { "type": "number" }
+        },
+        "p_a_wins_series": {
+          "type": "number",
+          "description": "Derived — Σ where a_wins > b_wins."
+        },
+        "favorite_flips": {
+          "type": "boolean",
+          "description": "Derived — opposite side of 0.5 from the overall p_a_wins_series."
+        }
+      }
+    },
+    "VetoAction": {
+      "type": "object",
+      "description": "One step of a veto sequence.",
+      "required": ["step_index", "team", "team_name", "action", "map_name"],
+      "additionalProperties": false,
+      "properties": {
+        "step_index": {
+          "type": "integer",
+          "description": "0-based position in the veto sequence."
+        },
+        "team": {
+          "type": "string",
+          "description": "The acting team's stable team_id."
+        },
+        "team_name": {
+          "type": "string",
+          "description": "The acting team's derived display name (resolved by P3)."
+        },
+        "action": {
+          "type": "string",
+          "enum": ["ban", "pick", "decider"]
+        },
+        "map_name": {
+          "type": "string",
+          "description": "The chosen map's normalized name."
+        }
+      }
+    },
+    "PerMap": {
+      "type": "object",
+      "description": "One played map's prediction. Probability/interval vectors are exactly length 4 in fixed OUTCOME_LABELS order (A-regulation, A-OT, B-OT, B-regulation); a null interval means \"not computed\", never a fabricated [0,0,0,0].",
+      "required": [
+        "map_name",
+        "probabilities",
+        "interval_low",
+        "interval_high",
+        "n_games_backing",
+        "p_a_wins_map",
+        "p_overtime"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "map_name": { "type": "string" },
+        "probabilities": {
+          "type": "array",
+          "description": "The four temperature-scaled map-outcome probabilities in OUTCOME_LABELS order.",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": { "type": "number" }
+        },
+        "interval_low": {
+          "type": ["array", "null"],
+          "description": "The four per-category lower band endpoints in the same order; null means not computed (no bootstrap replicates), never zero.",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": { "type": "number" }
+        },
+        "interval_high": {
+          "type": ["array", "null"],
+          "description": "The four per-category upper band endpoints in the same order; null alongside interval_low.",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": { "type": "number" }
+        },
+        "n_games_backing": {
+          "type": "integer",
+          "description": "min(games_a, games_b) — the weaker side's as-of, map-specific game count."
+        },
+        "p_a_wins_map": {
+          "type": "number",
+          "description": "Derived — probabilities[0] + probabilities[1]."
+        },
+        "p_overtime": {
+          "type": "number",
+          "description": "Derived — probabilities[1] + probabilities[2]."
+        }
+      }
+    },
+    "MapLeverage": {
+      "type": "object",
+      "description": "One map's veto-leverage attribution (§5.4), ranked by |swing| × p_played.",
+      "required": [
+        "map_name",
+        "p_played",
+        "p_a_given_played",
+        "p_a_given_not",
+        "swing",
+        "flips_favorite",
+        "n_vetos_backing"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "map_name": { "type": "string" },
+        "p_played": { "type": "number" },
+        "p_a_given_played": { "type": "number" },
+        "p_a_given_not": { "type": "number" },
+        "swing": { "type": "number" },
+        "flips_favorite": { "type": "boolean" },
+        "n_vetos_backing": {
+          "type": "integer",
+          "description": "How many top-N entries played this map."
+        }
+      }
+    }
+  }
+}
