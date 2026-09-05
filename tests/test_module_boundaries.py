@@ -151,6 +151,7 @@ EVALUATION_MODULES = (
 PRESENTATION_MODULES = (
     "__init__.py",
     "contract.py",
+    "derived.py",
 )
 
 # The exact permitted surface presentation/ may import from
