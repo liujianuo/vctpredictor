@@ -152,6 +152,7 @@ PRESENTATION_MODULES = (
     "__init__.py",
     "contract.py",
     "derived.py",
+    "leverage.py",
     "reshape.py",
 )
 
